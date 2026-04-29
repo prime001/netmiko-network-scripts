@@ -1,0 +1,1 @@
+Waiting for permission to write the file. Once approved, the script `004_change_validation.py` will be created — a pre/post change validation tool that snapshots device state (show version, interfaces, routes, BGP, spanning-tree, recent logs) before and after a maintenance window, then diffs the outputs and exits non-zero if unexpected changes are detected.
