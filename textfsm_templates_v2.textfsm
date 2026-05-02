@@ -1,0 +1,308 @@
+```python
+"""
+Interface Error Rate Monitor
+============================
+Purpose:
+    Connect to a network device, sample interface error counters twice over a
+    configurable interval, and report per-interface deltas.  Flags any interface
+    whose CRC, input/output error, or queue-drop delta exceeds a threshold,
+    giving operators a quick CLI view of physical-layer degradation or
+    persistent congestion without requiring SNMP or a full NMS.
+
+Usage:
+    python 019_interface_error_monitor.py -d 192.168.1.1 -u admin -p secret
+    python 019_interface_error_monitor.py -d 192.168.1.1 -u admin \\
+        --interval 60 --crc-threshold 5 --drop-threshold 50
+    python 019_interface_error_monitor.py -d 192.168.1.1 -u admin \\
+        --device-type cisco_nxos --csv /tmp/errors.csv
+
+Prerequisites:
+    pip install netmiko
+    ntc-templates must be discoverable (install ntc-templates or set the
+    NET_TEXTFSM env var).  Device must support 'show interfaces'.
+"""
+
+import argparse
+import csv
+import getpass
+import logging
+import sys
+import time
+from dataclasses import dataclass
+from typing import Dict, List
+
+from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+SUPPORTED_DEVICE_TYPES = [
+    "cisco_ios",
+    "cisco_xe",
+    "cisco_nxos",
+    "arista_eos",
+    "juniper_junos",
+]
+
+
+@dataclass
+class InterfaceCounters:
+    name: str
+    input_errors: int = 0
+    output_errors: int = 0
+    crc: int = 0
+    input_drops: int = 0
+    output_drops: int = 0
+
+
+@dataclass
+class ErrorDelta:
+    interface: str
+    crc_delta: int
+    input_error_delta: int
+    output_error_delta: int
+    input_drop_delta: int
+    output_drop_delta: int
+    flagged: bool
+
+
+def _safe_int(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def collect_counters(conn) -> Dict[str, InterfaceCounters]:
+    output = conn.send_command("show interfaces", use_textfsm=True)
+    if isinstance(output, str):
+        log.warning("TextFSM parsing failed — raw string returned. Check ntc-templates.")
+        return {}
+
+    counters: Dict[str, InterfaceCounters] = {}
+    for row in output:
+        name = row.get("interface") or row.get("port") or ""
+        if not name:
+            continue
+        counters[name] = InterfaceCounters(
+            name=name,
+            input_errors=_safe_int(row.get("input_errors", 0)),
+            output_errors=_safe_int(row.get("output_errors", 0)),
+            crc=_safe_int(row.get("crc", 0)),
+            input_drops=_safe_int(
+                row.get("input_drops") or row.get("input_queue_drops", 0)
+            ),
+            output_drops=_safe_int(
+                row.get("output_drops") or row.get("output_queue_drops", 0)
+            ),
+        )
+    return counters
+
+
+def compute_deltas(
+    before: Dict[str, InterfaceCounters],
+    after: Dict[str, InterfaceCounters],
+    crc_thresh: int,
+    err_thresh: int,
+    drop_thresh: int,
+) -> List[ErrorDelta]:
+    deltas: List[ErrorDelta] = []
+    for name, post in after.items():
+        pre = before.get(name)
+        if pre is None:
+            continue
+        crc_d = max(0, post.crc - pre.crc)
+        in_err_d = max(0, post.input_errors - pre.input_errors)
+        out_err_d = max(0, post.output_errors - pre.output_errors)
+        in_drop_d = max(0, post.input_drops - pre.input_drops)
+        out_drop_d = max(0, post.output_drops - pre.output_drops)
+
+        if not any([crc_d, in_err_d, out_err_d, in_drop_d, out_drop_d]):
+            continue
+
+        flagged = (
+            crc_d >= crc_thresh
+            or in_err_d >= err_thresh
+            or out_err_d >= err_thresh
+            or in_drop_d >= drop_thresh
+            or out_drop_d >= drop_thresh
+        )
+        deltas.append(
+            ErrorDelta(
+                interface=name,
+                crc_delta=crc_d,
+                input_error_delta=in_err_d,
+                output_error_delta=out_err_d,
+                input_drop_delta=in_drop_d,
+                output_drop_delta=out_drop_d,
+                flagged=flagged,
+            )
+        )
+    return sorted(deltas, key=lambda d: d.flagged, reverse=True)
+
+
+def print_report(device: str, interval: int, deltas: List[ErrorDelta]) -> None:
+    sep = "=" * 72
+    print(f"\n{sep}")
+    print(f"  Interface Error Delta Report — {device}  ({interval}s interval)")
+    print(sep)
+    if not deltas:
+        print("  No counter changes detected.\n")
+        return
+
+    header = (
+        f"  {'Interface':<32} {'CRC':>5} {'InErr':>6} {'OutErr':>7}"
+        f" {'InDrop':>7} {'OutDrop':>8}"
+    )
+    flagged = [d for d in deltas if d.flagged]
+    clean = [d for d in deltas if not d.flagged]
+
+    def _row(d: ErrorDelta, mark: str = "") -> str:
+        return (
+            f"  {d.interface:<32} {d.crc_delta:>5} {d.input_error_delta:>6}"
+            f" {d.output_error_delta:>7} {d.input_drop_delta:>7}"
+            f" {d.output_drop_delta:>8}  {mark}"
+        )
+
+    if flagged:
+        print(f"\n  FLAGGED ({len(flagged)} interface{'s' if len(flagged) != 1 else ''}):")
+        print(header)
+        print("  " + "-" * 70)
+        for d in flagged:
+            print(_row(d, "!"))
+
+    if clean:
+        print(f"\n  Activity (below threshold):")
+        print(header)
+        print("  " + "-" * 70)
+        for d in clean:
+            print(_row(d))
+    print()
+
+
+def write_csv(path: str, device: str, deltas: List[ErrorDelta]) -> None:
+    with open(path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(
+            [
+                "device", "interface", "crc_delta", "input_error_delta",
+                "output_error_delta", "input_drop_delta", "output_drop_delta", "flagged",
+            ]
+        )
+        for d in deltas:
+            writer.writerow(
+                [
+                    device, d.interface, d.crc_delta, d.input_error_delta,
+                    d.output_error_delta, d.input_drop_delta, d.output_drop_delta,
+                    d.flagged,
+                ]
+            )
+    log.info("CSV written → %s", path)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Sample interface error counters twice and report deltas.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("-d", "--device", required=True, help="Device hostname or IP")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
+    parser.add_argument(
+        "--device-type", default="cisco_ios", choices=SUPPORTED_DEVICE_TYPES,
+        help="Netmiko device type",
+    )
+    parser.add_argument(
+        "--interval", type=int, default=30, metavar="SECONDS",
+        help="Seconds between the two counter samples",
+    )
+    parser.add_argument(
+        "--crc-threshold", type=int, default=1, metavar="N",
+        help="Flag interface when CRC delta >= N",
+    )
+    parser.add_argument(
+        "--error-threshold", type=int, default=10, metavar="N",
+        help="Flag interface when input/output error delta >= N",
+    )
+    parser.add_argument(
+        "--drop-threshold", type=int, default=50, metavar="N",
+        help="Flag interface when queue drop delta >= N",
+    )
+    parser.add_argument("--csv", metavar="FILE", help="Write results to CSV file")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    password = args.password or getpass.getpass(
+        f"Password for {args.username}@{args.device}: "
+    )
+
+    device_params = {
+        "device_type": args.device_type,
+        "host": args.device,
+        "username": args.username,
+        "password": password,
+        "timeout": 30,
+        "banner_timeout": 20,
+    }
+
+    log.info("Connecting to %s (%s)", args.device, args.device_type)
+    try:
+        with ConnectHandler(**device_params) as conn:
+            log.info("Sample 1 — collecting counters")
+            before = collect_counters(conn)
+            if not before:
+                log.error("No interface data parsed. Verify ntc-templates is installed.")
+                return 1
+
+            log.info("Waiting %ds before sample 2…", args.interval)
+            time.sleep(args.interval)
+
+            log.info("Sample 2 — collecting counters")
+            after = collect_counters(conn)
+
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.device)
+        return 1
+    except NetmikoTimeoutException:
+        log.error("Connection timed out: %s", args.device)
+        return 1
+    except Exception as exc:
+        log.error("Unexpected error: %s", exc)
+        return 1
+
+    deltas = compute_deltas(
+        before,
+        after,
+        crc_thresh=args.crc_threshold,
+        err_thresh=args.error_threshold,
+        drop_thresh=args.drop_threshold,
+    )
+
+    print_report(args.device, args.interval, deltas)
+
+    if args.csv:
+        write_csv(args.csv, args.device, deltas)
+
+    flagged_count = sum(1 for d in deltas if d.flagged)
+    if flagged_count:
+        log.warning(
+            "%d interface(s) exceeded thresholds — investigate physical layer or congestion",
+            flagged_count,
+        )
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
