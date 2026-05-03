@@ -1,167 +1,150 @@
-```python
-"""
-018_template_deploy.py — Jinja2-driven configuration template deployment
+028_vlan_provisioner.py
 
-Renders per-device Jinja2 configuration templates from a YAML variable file
-and deploys the rendered configs to one or more network devices. Supports
-dry-run, per-device rollback on failure, and post-deploy verification commands.
+Purpose:
+    Provision or remove VLANs across one or more Cisco IOS/IOS-XE switches,
+    then verify the VLANs exist in the VLAN database before reporting success.
+    Optionally adds the VLANs to a specified trunk uplink interface.
 
 Usage:
-    python 018_template_deploy.py \\
-        --template acl_template.j2 \\
-        --vars vars.yaml \\
-        --host 192.168.1.1 --device-type cisco_ios \\
-        --username admin --password secret
-
-    python 018_template_deploy.py \\
-        --template ntp_template.j2 \\
-        --vars vars.yaml \\
-        --inventory hosts.yaml \\
-        --dry-run
+    python 028_vlan_provisioner.py -H 192.168.1.1 -u admin -p secret \
+        --vlans 100,200,300 --names "Corp,Guest,IOT" [--trunk Gi0/1] [--remove]
 
 Prerequisites:
-    pip install netmiko jinja2 pyyaml
-    Jinja2 template file and YAML variables file prepared before running.
+    pip install netmiko
+    Target device must support Cisco IOS "vlan database" or global-config VLAN commands.
 """
 
 import argparse
 import logging
 import sys
-from pathlib import Path
+from getpass import getpass
 
-import yaml
-from jinja2 import Environment, FileSystemLoader, TemplateError
-from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler, NetmikoTimeoutException, NetmikoAuthenticationException
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
     level=logging.INFO,
-    stream=sys.stdout,
 )
 log = logging.getLogger(__name__)
 
 
-def load_yaml(path: str) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f) or {}
+def build_vlan_commands(vlan_ids: list[str], vlan_names: list[str], remove: bool) -> list[str]:
+    cmds = []
+    if remove:
+        for vid in vlan_ids:
+            cmds.append(f"no vlan {vid}")
+    else:
+        for i, vid in enumerate(vlan_ids):
+            cmds.append(f"vlan {vid}")
+            if i < len(vlan_names) and vlan_names[i]:
+                cmds.append(f" name {vlan_names[i]}")
+    return cmds
 
 
-def render_template(template_path: str, variables: dict) -> str:
-    p = Path(template_path)
-    env = Environment(
-        loader=FileSystemLoader(str(p.parent)),
-        trim_blocks=True,
-        lstrip_blocks=True,
-    )
-    tmpl = env.get_template(p.name)
-    return tmpl.render(**variables)
-
-
-def deploy_to_device(device_params: dict, config_lines: list[str], verify_cmds: list[str], dry_run: bool) -> bool:
-    host = device_params["host"]
-    if dry_run:
-        log.info("[DRY-RUN] %s — would push %d config lines", host, len(config_lines))
-        for line in config_lines:
-            log.info("  %s", line)
-        return True
-
-    try:
-        with ConnectHandler(**device_params) as conn:
-            log.info("%s — connected", host)
-            output = conn.send_config_set(config_lines)
-            log.debug("%s config output:\n%s", host, output)
-
-            save_out = conn.save_config()
-            log.debug("%s save output: %s", host, save_out.strip())
-            log.info("%s — config applied and saved", host)
-
-            for cmd in verify_cmds:
-                result = conn.send_command(cmd)
-                log.info("%s verify [%s]:\n%s", host, cmd, result)
-
-        return True
-
-    except NetmikoAuthenticationException:
-        log.error("%s — authentication failed", host)
-    except NetmikoTimeoutException:
-        log.error("%s — connection timed out", host)
-    except Exception as exc:
-        log.error("%s — unexpected error: %s", host, exc)
-
-    return False
-
-
-def build_device_list(args) -> list[dict]:
-    if args.inventory:
-        raw = load_yaml(args.inventory)
-        devices = raw.get("devices", raw) if isinstance(raw, dict) else raw
-        return [
-            {
-                "host": d["host"],
-                "device_type": d.get("device_type", "cisco_ios"),
-                "username": d.get("username", args.username),
-                "password": d.get("password", args.password),
-                "secret": d.get("secret", args.secret or ""),
-            }
-            for d in devices
-        ]
+def build_trunk_commands(trunk_intf: str, vlan_ids: list[str], remove: bool) -> list[str]:
+    vlan_str = ",".join(vlan_ids)
+    action = "remove" if remove else "add"
     return [
-        {
-            "host": args.host,
-            "device_type": args.device_type,
-            "username": args.username,
-            "password": args.password,
-            "secret": args.secret or "",
-        }
+        f"interface {trunk_intf}",
+        f"switchport trunk allowed vlan {action} {vlan_str}",
     ]
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Jinja2 template config deployment via Netmiko")
-    parser.add_argument("--template", required=True, help="Path to Jinja2 .j2 template file")
-    parser.add_argument("--vars", required=True, help="YAML file with template variables")
-    parser.add_argument("--inventory", help="YAML inventory file (alternative to --host)")
-    parser.add_argument("--host", help="Target device IP/hostname")
-    parser.add_argument("--device-type", default="cisco_ios", help="Netmiko device type (default: cisco_ios)")
-    parser.add_argument("--username", default="admin", help="SSH username")
-    parser.add_argument("--password", help="SSH password")
-    parser.add_argument("--secret", help="Enable secret (if required)")
-    parser.add_argument("--verify", nargs="*", default=[], metavar="CMD", help="Post-deploy show commands to run")
-    parser.add_argument("--dry-run", action="store_true", help="Render and print config without connecting")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    args = parser.parse_args()
+def verify_vlans(conn, vlan_ids: list[str]) -> dict[str, bool]:
+    output = conn.send_command("show vlan brief")
+    results = {}
+    for vid in vlan_ids:
+        results[vid] = any(line.strip().startswith(vid + " ") for line in output.splitlines())
+    return results
 
-    if args.debug:
-        log.setLevel(logging.DEBUG)
 
-    if not args.inventory and not args.host:
-        parser.error("Provide --host or --inventory")
+def provision(args: argparse.Namespace) -> int:
+    vlan_ids = [v.strip() for v in args.vlans.split(",") if v.strip()]
+    vlan_names = [n.strip() for n in args.names.split(",")] if args.names else []
+
+    if not vlan_ids:
+        log.error("No VLANs specified.")
+        return 1
+
+    device = {
+        "device_type": args.device_type,
+        "host": args.host,
+        "username": args.username,
+        "password": args.password,
+        "secret": args.enable or args.password,
+        "port": args.port,
+    }
 
     try:
-        variables = load_yaml(args.vars)
-        rendered = render_template(args.template, variables)
-    except (FileNotFoundError, TemplateError) as exc:
-        log.error("Template error: %s", exc)
-        sys.exit(1)
+        log.info("Connecting to %s ...", args.host)
+        with ConnectHandler(**device) as conn:
+            conn.enable()
+            log.info("Connected. Sending VLAN config commands.")
 
-    config_lines = [line for line in rendered.splitlines() if line.strip()]
-    log.info("Rendered %d config lines from %s", len(config_lines), args.template)
+            vlan_cmds = build_vlan_commands(vlan_ids, vlan_names, args.remove)
+            output = conn.send_config_set(vlan_cmds)
+            log.debug("VLAN config output:\n%s", output)
 
-    devices = build_device_list(args)
-    results = {"ok": 0, "fail": 0}
+            if args.trunk:
+                trunk_cmds = build_trunk_commands(args.trunk, vlan_ids, args.remove)
+                t_out = conn.send_config_set(trunk_cmds)
+                log.debug("Trunk config output:\n%s", t_out)
 
-    for device in devices:
-        success = deploy_to_device(device, config_lines, args.verify, args.dry_run)
-        if success:
-            results["ok"] += 1
-        else:
-            results["fail"] += 1
+            conn.save_config()
 
-    log.info("Done — %d succeeded, %d failed (of %d devices)", results["ok"], results["fail"], len(devices))
-    sys.exit(1 if results["fail"] else 0)
+            if args.remove:
+                log.info("VLANs %s removed and config saved.", ", ".join(vlan_ids))
+                return 0
+
+            log.info("Verifying VLANs in database ...")
+            results = verify_vlans(conn, vlan_ids)
+
+        failed = [vid for vid, present in results.items() if not present]
+        if failed:
+            log.error("Verification FAILED — VLANs not in database: %s", ", ".join(failed))
+            return 1
+
+        for vid, present in results.items():
+            status = "OK" if present else "MISSING"
+            log.info("  VLAN %-6s %s", vid, status)
+
+        log.info("All %d VLANs provisioned and verified on %s.", len(vlan_ids), args.host)
+        return 0
+
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s@%s.", args.username, args.host)
+        return 2
+    except NetmikoTimeoutException:
+        log.error("Connection to %s timed out.", args.host)
+        return 3
+    except Exception as exc:
+        log.exception("Unexpected error: %s", exc)
+        return 4
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Provision or remove VLANs on a Cisco IOS switch and optionally trunk them."
+    )
+    p.add_argument("-H", "--host", required=True, help="Device IP or hostname")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
+    p.add_argument("-e", "--enable", default=None, help="Enable secret (defaults to password)")
+    p.add_argument("--vlans", required=True, help="Comma-separated VLAN IDs, e.g. 100,200,300")
+    p.add_argument("--names", default="", help="Comma-separated VLAN names (positional, optional)")
+    p.add_argument("--trunk", default=None, help="Trunk interface to add/remove VLANs from, e.g. Gi0/1")
+    p.add_argument("--remove", action="store_true", help="Remove VLANs instead of adding them")
+    p.add_argument("--device-type", default="cisco_ios", help="Netmiko device type (default: cisco_ios)")
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    main()
-```
+    args = parse_args()
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    if args.password is None:
+        args.password = getpass(f"Password for {args.username}@{args.host}: ")
+    sys.exit(provision(args))
