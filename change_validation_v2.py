@@ -1,196 +1,183 @@
 ```python
 """
-014_pre_post_snapshot.py — Pre/Post Change Snapshot Comparator
+024_stp_change_guard.py — Spanning Tree Protocol Change Guard
 
-Captures device state before and after a maintenance window, then diffs the
-snapshots and flags critical changes (interface state flaps, route additions/
-removals, neighbor state changes).
+Purpose:
+    Captures STP topology baseline before a network change and compares
+    it afterward, flagging any unintended topology shifts (root changes,
+    port role flips, topology change counters incrementing).
 
 Usage:
-    # Capture pre-change baseline:
-    python 014_pre_post_snapshot.py --host 10.0.0.1 --user admin --pre
+    # Capture baseline before change:
+    python 024_stp_change_guard.py --host 10.0.0.1 --user admin --save-baseline baseline.json
 
-    # After the change, capture post and compare:
-    python 014_pre_post_snapshot.py --host 10.0.0.1 --user admin --post
+    # Validate after change:
+    python 024_stp_change_guard.py --host 10.0.0.1 --user admin --compare baseline.json
 
-    # Compare two existing snapshot files explicitly:
-    python 014_pre_post_snapshot.py --compare pre.json post.json
+    # Check specific VLAN:
+    python 024_stp_change_guard.py --host 10.0.0.1 --user admin --vlan 100 --compare baseline.json
 
 Prerequisites:
     pip install netmiko
-    Python 3.8+
+    Tested against: Cisco IOS, IOS-XE (device_type=cisco_ios)
 """
 
 import argparse
 import json
 import logging
+import re
 import sys
 from datetime import datetime
 from getpass import getpass
-from pathlib import Path
 
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler
+from netmiko.exceptions import AuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
     level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-SNAPSHOT_COMMANDS = [
-    "show interfaces status",
-    "show ip route summary",
-    "show ip bgp summary",
-    "show spanning-tree summary",
-    "show ip ospf neighbor",
-    "show version",
-]
 
-CRITICAL_KEYWORDS = {"down", "err-disabled", "idle", "active", "notconnect"}
+def parse_stp_output(raw: str) -> dict:
+    """Extract root bridge, port roles, and TC counter from 'show spanning-tree' output."""
+    state = {"root": {}, "ports": {}, "topology_changes": 0}
+
+    root_match = re.search(r"Root ID\s+Priority\s+(\d+)\s+Address\s+([\w.]+)", raw)
+    if root_match:
+        state["root"] = {"priority": int(root_match.group(1)), "address": root_match.group(2)}
+
+    tc_match = re.search(r"Number of topology changes\s+(\d+)", raw)
+    if tc_match:
+        state["topology_changes"] = int(tc_match.group(1))
+
+    # Port block: Interface + Role + Sts columns
+    port_pattern = re.compile(
+        r"^(\S+)\s+(Root|Desg|Altn|Back|Mstr)\s+(FWD|BLK|LIS|LRN|DIS)\s+(\d+)\s+",
+        re.MULTILINE,
+    )
+    for m in port_pattern.finditer(raw):
+        state["ports"][m.group(1)] = {"role": m.group(2), "state": m.group(3), "cost": int(m.group(4))}
+
+    return state
 
 
-def connect(host: str, user: str, password: str, device_type: str = "cisco_ios"):
-    log.info("Connecting to %s as %s", host, user)
-    try:
-        conn = ConnectHandler(
-            device_type=device_type,
-            host=host,
-            username=user,
-            password=password,
-            timeout=20,
+def collect_baseline(conn, vlan: str | None) -> dict:
+    cmd = f"show spanning-tree vlan {vlan}" if vlan else "show spanning-tree"
+    log.info("Collecting STP state: %s", cmd)
+    raw = conn.send_command(cmd, read_timeout=30)
+    return {
+        "timestamp": datetime.utcnow().isoformat(),
+        "command": cmd,
+        "parsed": parse_stp_output(raw),
+        "raw": raw,
+    }
+
+
+def compare_states(before: dict, after: dict) -> list[str]:
+    diffs = []
+    b, a = before["parsed"], after["parsed"]
+
+    if b["root"] != a["root"]:
+        diffs.append(
+            f"ROOT BRIDGE CHANGED: {b['root']} -> {a['root']}"
         )
-        log.info("Connected — %s", conn.find_prompt())
-        return conn
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", user, host)
+
+    tc_delta = a["topology_changes"] - b["topology_changes"]
+    if tc_delta > 0:
+        diffs.append(f"TOPOLOGY CHANGES incremented by {tc_delta} during the change window")
+
+    all_ports = set(b["ports"]) | set(a["ports"])
+    for port in sorted(all_ports):
+        bp = b["ports"].get(port)
+        ap = a["ports"].get(port)
+        if bp is None:
+            diffs.append(f"PORT APPEARED:  {port} role={ap['role']} state={ap['state']}")
+        elif ap is None:
+            diffs.append(f"PORT VANISHED:  {port} was role={bp['role']} state={bp['state']}")
+        else:
+            if bp["role"] != ap["role"]:
+                diffs.append(f"ROLE CHANGED:   {port}  {bp['role']} -> {ap['role']}")
+            if bp["state"] != ap["state"]:
+                diffs.append(f"STATE CHANGED:  {port}  {bp['state']} -> {ap['state']}")
+
+    return diffs
+
+
+def build_connection(args) -> dict:
+    return {
+        "device_type": args.device_type,
+        "host": args.host,
+        "username": args.user,
+        "password": args.password,
+        "port": args.port,
+        "timeout": 20,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="STP change guard — baseline capture and post-change comparison"
+    )
+    parser.add_argument("--host", required=True, help="Device IP or hostname")
+    parser.add_argument("--user", required=True, help="SSH username")
+    parser.add_argument("--password", help="SSH password (prompted if omitted)")
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument("--device-type", default="cisco_ios", help="Netmiko device type")
+    parser.add_argument("--vlan", help="Limit scope to a specific VLAN ID")
+    parser.add_argument("--save-baseline", metavar="FILE", help="Capture baseline and save to FILE")
+    parser.add_argument("--compare", metavar="FILE", help="Compare current state against saved FILE")
+    args = parser.parse_args()
+
+    if not args.save_baseline and not args.compare:
+        parser.error("Specify --save-baseline FILE or --compare FILE (or both)")
+
+    if not args.password:
+        args.password = getpass(f"Password for {args.user}@{args.host}: ")
+
+    try:
+        log.info("Connecting to %s:%d", args.host, args.port)
+        conn = ConnectHandler(**build_connection(args))
+    except AuthenticationException:
+        log.error("Authentication failed for %s@%s", args.user, args.host)
         sys.exit(1)
     except NetmikoTimeoutException:
-        log.error("Timeout connecting to %s", host)
+        log.error("Connection timed out to %s", args.host)
         sys.exit(1)
 
+    current = collect_baseline(conn, args.vlan)
+    conn.disconnect()
 
-def capture_snapshot(conn, commands: list[str]) -> dict:
-    snapshot = {"timestamp": datetime.utcnow().isoformat(), "outputs": {}}
-    for cmd in commands:
-        log.info("Running: %s", cmd)
-        try:
-            output = conn.send_command(cmd, read_timeout=30)
-            snapshot["outputs"][cmd] = output
-        except Exception as exc:
-            log.warning("Command failed (%s): %s", cmd, exc)
-            snapshot["outputs"][cmd] = f"ERROR: {exc}"
-    return snapshot
+    if args.save_baseline:
+        with open(args.save_baseline, "w") as fh:
+            json.dump(current, fh, indent=2)
+        log.info("Baseline saved to %s", args.save_baseline)
+        root = current["parsed"].get("root", {})
+        ports = current["parsed"]["ports"]
+        log.info(
+            "Snapshot: root=%s priority=%s  ports=%d",
+            root.get("address", "unknown"),
+            root.get("priority", "?"),
+            len(ports),
+        )
 
-
-def save_snapshot(snapshot: dict, path: Path) -> None:
-    path.write_text(json.dumps(snapshot, indent=2))
-    log.info("Snapshot saved → %s", path)
-
-
-def load_snapshot(path: Path) -> dict:
-    if not path.exists():
-        log.error("Snapshot file not found: %s", path)
-        sys.exit(1)
-    return json.loads(path.read_text())
-
-
-def diff_outputs(pre_text: str, post_text: str) -> list[str]:
-    pre_lines = set(pre_text.splitlines())
-    post_lines = set(post_text.splitlines())
-    removed = [f"  - {l}" for l in sorted(pre_lines - post_lines) if l.strip()]
-    added = [f"  + {l}" for l in sorted(post_lines - pre_lines) if l.strip()]
-    return removed + added
-
-
-def flag_critical(diff_lines: list[str]) -> list[str]:
-    return [l for l in diff_lines if any(kw in l.lower() for kw in CRITICAL_KEYWORDS)]
-
-
-def compare_snapshots(pre: dict, post: dict) -> int:
-    print(f"\n{'='*60}")
-    print(f"PRE  snapshot: {pre['timestamp']}")
-    print(f"POST snapshot: {post['timestamp']}")
-    print(f"{'='*60}\n")
-
-    critical_total = 0
-    commands = set(pre["outputs"]) | set(post["outputs"])
-
-    for cmd in sorted(commands):
-        pre_out = pre["outputs"].get(cmd, "(missing)")
-        post_out = post["outputs"].get(cmd, "(missing)")
-        diff = diff_outputs(pre_out, post_out)
-        if not diff:
-            print(f"[OK] {cmd}")
-            continue
-
-        critical = flag_critical(diff)
-        critical_total += len(critical)
-        marker = "[CRITICAL]" if critical else "[CHANGED]"
-        print(f"\n{marker} {cmd}")
-        for line in diff:
-            print(f"    {line}")
-
-    print(f"\n{'='*60}")
-    if critical_total:
-        print(f"RESULT: FAIL — {critical_total} critical change(s) detected")
-    else:
-        print("RESULT: PASS — no critical state changes")
-    print(f"{'='*60}\n")
-    return 1 if critical_total else 0
-
-
-def snapshot_path(host: str, phase: str) -> Path:
-    safe = host.replace(".", "_")
-    return Path(f"{safe}_{phase}_snapshot.json")
-
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Pre/post change snapshot comparator")
-    p.add_argument("--host", help="Device IP or hostname")
-    p.add_argument("--user", help="SSH username")
-    p.add_argument("--device-type", default="cisco_ios", help="Netmiko device type")
-    p.add_argument("--pre", action="store_true", help="Capture pre-change snapshot")
-    p.add_argument("--post", action="store_true", help="Capture post-change snapshot and compare")
-    p.add_argument("--compare", nargs=2, metavar=("PRE", "POST"),
-                   help="Compare two existing snapshot files")
-    p.add_argument("--commands", nargs="+", metavar="CMD",
-                   help="Override default show commands")
-    return p.parse_args()
+    if args.compare:
+        with open(args.compare) as fh:
+            baseline = json.load(fh)
+        log.info("Comparing against baseline from %s", baseline["timestamp"])
+        diffs = compare_states(baseline, current)
+        if diffs:
+            print(f"\n[FAIL] {len(diffs)} STP difference(s) detected:\n")
+            for d in diffs:
+                print(f"  ! {d}")
+            print()
+            sys.exit(2)
+        else:
+            print("\n[PASS] STP topology unchanged — change validated.\n")
 
 
 if __name__ == "__main__":
-    args = parse_args()
-
-    if args.compare:
-        pre_snap = load_snapshot(Path(args.compare[0]))
-        post_snap = load_snapshot(Path(args.compare[1]))
-        sys.exit(compare_snapshots(pre_snap, post_snap))
-
-    if not args.pre and not args.post:
-        log.error("Specify --pre, --post, or --compare PRE POST")
-        sys.exit(1)
-
-    if not args.host:
-        log.error("--host is required for live capture")
-        sys.exit(1)
-
-    user = args.user or input("Username: ")
-    password = getpass("Password: ")
-    commands = args.commands or SNAPSHOT_COMMANDS
-
-    conn = connect(args.host, user, password, args.device_type)
-    try:
-        snapshot = capture_snapshot(conn, commands)
-    finally:
-        conn.disconnect()
-
-    phase = "pre" if args.pre else "post"
-    out_path = snapshot_path(args.host, phase)
-    save_snapshot(snapshot, out_path)
-
-    if args.post:
-        pre_path = snapshot_path(args.host, "pre")
-        pre_snap = load_snapshot(pre_path)
-        sys.exit(compare_snapshots(pre_snap, snapshot))
+    main()
 ```
