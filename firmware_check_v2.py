@@ -1,202 +1,190 @@
+The working directory is `/opt/NetAutoCommitter` (a different project). The netmiko scripts live in a separate portfolio repo — I'll write the script content directly as requested, targeting `023_firmware_check.py`.
+
 ```python
 """
-firmware_compliance_audit.py — Audit device firmware versions against a policy baseline.
+023_firmware_check.py — Multi-vendor firmware compliance checker.
 
-Purpose:
-    Connect to one or more network devices, retrieve the running firmware version,
-    and compare it against a minimum-required version defined in a policy file.
-    Exits non-zero when any device is out of compliance, making it CI/CD-friendly.
+Connects to network devices via SSH, retrieves the running OS version, and
+compares it against a minimum acceptable version defined in policy. Produces
+a per-device pass/fail compliance report and exits non-zero when any device
+is out of compliance or unreachable.
 
 Usage:
     # Single device
-    python firmware_compliance_audit.py \\
-        --host 192.168.1.1 --device-type cisco_ios \\
-        --username admin --password secret \\
-        --min-version 15.2(7)E3
+    python 023_firmware_check.py -H 10.0.0.1 -u admin -p secret \
+        --device-type cisco_ios --min-version "15.9(3)M6"
 
-    # Inventory file (CSV: host,device_type,min_version)
-    python firmware_compliance_audit.py \\
-        --inventory devices.csv \\
-        --username admin --password secret \\
-        --report audit_report.csv
+    # CSV inventory  (columns: host, device_type, min_version)
+    python 023_firmware_check.py --inventory devices.csv -u admin -p secret
+
+    # JSON output
+    python 023_firmware_check.py --inventory devices.csv -u admin -p secret --json
 
 Prerequisites:
     pip install netmiko
-    CSV columns (when using --inventory): host, device_type, min_version
-    Supported device_type values: cisco_ios, cisco_nxos, cisco_xr, juniper_junos
+    Read-only (privilege level ≥ 1) SSH credentials on each device.
+
+Supported device types: cisco_ios, cisco_xe, cisco_nxos, cisco_xr
 """
 
 import argparse
 import csv
+import json
 import logging
 import re
 import sys
-from dataclasses import dataclass, field
-from datetime import datetime
-from pathlib import Path
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
-from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
-    level=logging.INFO,
     format="%(asctime)s %(levelname)-8s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
 )
 log = logging.getLogger(__name__)
 
-
-VERSION_COMMANDS = {
+_SHOW_CMD = {
     "cisco_ios": "show version",
-    "cisco_ios_xe": "show version",
+    "cisco_xe": "show version",
     "cisco_nxos": "show version",
-    "cisco_xr": "show version",
-    "juniper_junos": "show version",
+    "cisco_xr": "show version brief",
 }
 
-VERSION_PATTERNS = {
-    "cisco_ios":    r"(?:IOS Software.*?Version\s+|Version\s+)([^\s,]+)",
-    "cisco_ios_xe": r"(?:IOS-XE Software.*?Version\s+|Cisco IOS XE Software, Version\s+)([^\s,]+)",
-    "cisco_nxos":   r"NXOS:\s+version\s+(\S+)",
-    "cisco_xr":     r"Cisco IOS XR Software, Version\s+(\S+)",
-    "juniper_junos": r"Junos:\s+(\S+)",
+_VERSION_RE = {
+    "cisco_ios": re.compile(r"Cisco IOS Software.*?Version\s+(\S+),", re.DOTALL),
+    "cisco_xe": re.compile(r"Cisco IOS XE Software.*?Version\s+(\S+)", re.DOTALL),
+    "cisco_nxos": re.compile(r"(?:NXOS|system):\s+version\s+(\S+)", re.IGNORECASE),
+    "cisco_xr": re.compile(r"Cisco IOS XR Software.*?Version\s+(\S+)", re.DOTALL),
 }
+
+
+def _version_key(v: str) -> tuple:
+    """Decompose a version string into a sortable tuple of ints and strings."""
+    return tuple(int(p) if p.isdigit() else p for p in re.split(r"[.()\-]", v) if p)
 
 
 @dataclass
-class DeviceResult:
+class Result:
     host: str
     device_type: str
     min_version: str
-    running_version: str = ""
+    running_version: Optional[str] = None
     compliant: Optional[bool] = None
-    error: str = ""
-    duration_s: float = 0.0
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    error: Optional[str] = None
+    checked_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
 
 
-def _version_tuple(version_str: str) -> tuple:
-    """Convert version string to comparable tuple of ints/strings."""
-    parts = re.split(r"[.()\[\]]", version_str)
-    result = []
-    for p in parts:
-        if p == "":
-            continue
-        try:
-            result.append(int(p))
-        except ValueError:
-            result.append(p.lower())
-    return tuple(result)
+def _fetch_version(conn, device_type: str) -> Optional[str]:
+    output = conn.send_command(_SHOW_CMD[device_type])
+    m = _VERSION_RE[device_type].search(output)
+    return m.group(1).rstrip(",") if m else None
 
 
-def is_compliant(running: str, minimum: str) -> bool:
-    return _version_tuple(running) >= _version_tuple(minimum)
-
-
-def extract_version(output: str, device_type: str) -> str:
-    pattern = VERSION_PATTERNS.get(device_type)
-    if not pattern:
-        raise ValueError(f"No version pattern defined for device_type '{device_type}'")
-    match = re.search(pattern, output, re.IGNORECASE)
-    if not match:
-        raise ValueError(f"Version string not found in output (pattern: {pattern})")
-    return match.group(1)
-
-
-def audit_device(host: str, device_type: str, username: str, password: str,
-                 min_version: str, port: int = 22, timeout: int = 30) -> DeviceResult:
-    result = DeviceResult(host=host, device_type=device_type, min_version=min_version)
-    start = datetime.utcnow()
+def check_device(
+    host: str,
+    username: str,
+    password: str,
+    device_type: str,
+    min_version: str,
+    port: int = 22,
+    timeout: int = 30,
+) -> Result:
+    result = Result(host=host, device_type=device_type, min_version=min_version)
+    params = {
+        "device_type": device_type,
+        "host": host,
+        "username": username,
+        "password": password,
+        "port": port,
+        "timeout": timeout,
+    }
     try:
-        log.info("[%s] Connecting (%s)", host, device_type)
-        with ConnectHandler(
-            device_type=device_type,
-            host=host,
-            port=port,
-            username=username,
-            password=password,
-            timeout=timeout,
-            session_log=None,
-        ) as conn:
-            command = VERSION_COMMANDS.get(device_type, "show version")
-            output = conn.send_command(command)
-
-        result.running_version = extract_version(output, device_type)
-        result.compliant = is_compliant(result.running_version, min_version)
-        status = "COMPLIANT" if result.compliant else "NON-COMPLIANT"
-        log.info("[%s] %s — running=%s  min=%s", host, status,
-                 result.running_version, min_version)
-
+        log.info("Connecting to %s (%s) …", host, device_type)
+        with ConnectHandler(**params) as conn:
+            running = _fetch_version(conn, device_type)
+        if running is None:
+            result.error = "Version string not found in output"
+            log.warning("%s: %s", host, result.error)
+            return result
+        result.running_version = running
+        result.compliant = _version_key(running) >= _version_key(min_version)
+        badge = "PASS" if result.compliant else "FAIL"
+        log.info("%s  running=%s  min=%s  [%s]", host, running, min_version, badge)
     except NetmikoAuthenticationException:
-        result.error = "authentication failure"
-        log.error("[%s] Authentication failure", host)
+        result.error = "Authentication failed"
+        log.error("%s: %s", host, result.error)
     except NetmikoTimeoutException:
-        result.error = "connection timeout"
-        log.error("[%s] Connection timed out", host)
-    except ValueError as exc:
+        result.error = "Connection timed out"
+        log.error("%s: %s", host, result.error)
+    except Exception as exc:
         result.error = str(exc)
-        log.error("[%s] Parse error: %s", host, exc)
-    except Exception as exc:  # noqa: BLE001
-        result.error = str(exc)
-        log.error("[%s] Unexpected error: %s", host, exc)
-    finally:
-        result.duration_s = (datetime.utcnow() - start).total_seconds()
-
+        log.error("%s: %s", host, exc)
     return result
 
 
-def load_inventory(path: str) -> list[dict]:
-    rows = []
+def load_inventory(path: str) -> list:
     with open(path, newline="") as fh:
-        reader = csv.DictReader(fh)
-        required = {"host", "device_type", "min_version"}
-        if not required.issubset(set(reader.fieldnames or [])):
-            raise ValueError(f"Inventory CSV must contain columns: {required}")
-        for row in reader:
-            rows.append(row)
-    return rows
+        return [{k.strip(): v.strip() for k, v in row.items()} for row in csv.DictReader(fh)]
 
 
-def write_report(results: list[DeviceResult], path: str) -> None:
-    fieldnames = ["host", "device_type", "min_version", "running_version",
-                  "compliant", "error", "duration_s", "timestamp"]
-    with open(path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
-        writer.writeheader()
-        for r in results:
-            writer.writerow({
-                "host": r.host,
-                "device_type": r.device_type,
-                "min_version": r.min_version,
-                "running_version": r.running_version,
-                "compliant": r.compliant,
-                "error": r.error,
-                "duration_s": f"{r.duration_s:.2f}",
-                "timestamp": r.timestamp,
-            })
-    log.info("Report written to %s", path)
+def print_table(results: list) -> None:
+    col = {"host": 22, "running": 20, "min": 20, "status": 30}
+    hdr = (
+        f"{'HOST':<{col['host']}}  {'RUNNING':<{col['running']}}"
+        f"  {'MIN REQUIRED':<{col['min']}}  STATUS"
+    )
+    bar = "─" * (len(hdr) + 4)
+    print(f"\n{bar}\n{hdr}\n{bar}")
+    for r in results:
+        if r.error:
+            status = f"ERROR — {r.error}"
+        elif r.compliant:
+            status = "PASS"
+        else:
+            status = "FAIL"
+        running = r.running_version or "—"
+        print(
+            f"{r.host:<{col['host']}}  {running:<{col['running']}}"
+            f"  {r.min_version:<{col['min']}}  {status}"
+        )
+    print(f"{bar}\n")
+    total = len(results)
+    passed = sum(1 for r in results if r.compliant)
+    failed = sum(1 for r in results if r.compliant is False)
+    errors = sum(1 for r in results if r.error)
+    print(f"Summary: {total} devices  |  {passed} pass  |  {failed} fail  |  {errors} error\n")
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Audit network device firmware against minimum version policy."
+        description="Check firmware versions against a minimum-version compliance policy.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    single = p.add_argument_group("single-device mode")
-    single.add_argument("--host", help="Device IP or hostname")
-    single.add_argument("--device-type", default="cisco_ios",
-                        choices=list(VERSION_COMMANDS.keys()),
-                        help="Netmiko device type (default: cisco_ios)")
-    single.add_argument("--min-version", help="Minimum acceptable firmware version")
+    single = p.add_argument_group("single device")
+    single.add_argument("-H", "--host", metavar="HOST")
+    single.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        choices=list(_SHOW_CMD),
+        metavar="TYPE",
+        help="cisco_ios | cisco_xe | cisco_nxos | cisco_xr  (default: cisco_ios)",
+    )
+    single.add_argument("--min-version", metavar="VER", help="Minimum acceptable version string")
 
     inv = p.add_argument_group("inventory mode")
-    inv.add_argument("--inventory", help="CSV file with columns: host,device_type,min_version")
+    inv.add_argument("--inventory", metavar="FILE", help="CSV file: host,device_type,min_version")
 
-    p.add_argument("--username", required=True)
-    p.add_argument("--password", required=True)
+    p.add_argument("-u", "--username", required=True)
+    p.add_argument("-p", "--password", required=True)
     p.add_argument("--port", type=int, default=22)
-    p.add_argument("--timeout", type=int, default=30)
-    p.add_argument("--report", help="Write CSV compliance report to this path")
+    p.add_argument("--timeout", type=int, default=30, metavar="SEC")
+    p.add_argument("--json", dest="json_out", action="store_true", help="Emit JSON report")
+    p.add_argument("-v", "--verbose", action="store_true")
     return p
 
 
@@ -204,50 +192,35 @@ if __name__ == "__main__":
     parser = build_parser()
     args = parser.parse_args()
 
-    if not args.inventory and not (args.host and args.min_version):
-        parser.error("Provide --inventory OR both --host and --min-version")
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    if args.inventory and not Path(args.inventory).is_file():
-        parser.error(f"Inventory file not found: {args.inventory}")
-
-    devices = []
     if args.inventory:
-        try:
-            devices = load_inventory(args.inventory)
-        except (OSError, ValueError) as exc:
-            log.error("Failed to load inventory: %s", exc)
-            sys.exit(2)
+        inventory = load_inventory(args.inventory)
+    elif args.host and args.min_version:
+        inventory = [
+            {"host": args.host, "device_type": args.device_type, "min_version": args.min_version}
+        ]
     else:
-        devices = [{"host": args.host, "device_type": args.device_type,
-                    "min_version": args.min_version}]
+        parser.error("Provide --host + --min-version for a single device, or --inventory for bulk.")
 
-    results: list[DeviceResult] = []
-    for dev in devices:
-        r = audit_device(
-            host=dev["host"],
-            device_type=dev["device_type"],
+    results = [
+        check_device(
+            host=entry["host"],
             username=args.username,
             password=args.password,
-            min_version=dev["min_version"],
+            device_type=entry.get("device_type", "cisco_ios"),
+            min_version=entry["min_version"],
             port=args.port,
             timeout=args.timeout,
         )
-        results.append(r)
+        for entry in inventory
+    ]
 
-    if args.report:
-        write_report(results, args.report)
+    if args.json_out:
+        print(json.dumps([asdict(r) for r in results], indent=2))
+    else:
+        print_table(results)
 
-    non_compliant = [r for r in results if not r.compliant]
-    errors = [r for r in results if r.error]
-
-    print(f"\nSummary: {len(results)} device(s) checked — "
-          f"{len(results) - len(non_compliant) - len(errors)} compliant, "
-          f"{len(non_compliant)} non-compliant, {len(errors)} error(s)")
-
-    for r in non_compliant:
-        print(f"  NON-COMPLIANT  {r.host:<20} running={r.running_version}  min={r.min_version}")
-    for r in errors:
-        print(f"  ERROR          {r.host:<20} {r.error}")
-
-    sys.exit(1 if non_compliant or errors else 0)
+    sys.exit(0 if all(r.compliant for r in results) else 1)
 ```
