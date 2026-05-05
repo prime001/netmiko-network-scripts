@@ -1,188 +1,254 @@
 ```python
 """
-Port Bounce with Pre/Post State Verification
-=============================================
-Bounces one or more switchports and verifies interface state before and after.
-Captures MAC address table entries and error-disabled status to confirm
-the port came back clean. Designed for field use during client site visits
-or remote troubleshooting sessions.
+Port Bounce with Pre/Post State Validation
+==========================================
+Bounces one or more switch interfaces and verifies recovery by comparing
+pre/post MAC table entries, error counters, and operational state.
 
-Usage:
-    python 021_port_bounce.py -H 10.0.0.1 -u admin -p secret -i GigabitEthernet0/1
-    python 021_port_bounce.py -H 10.0.0.1 -u admin -p secret -i Gi0/1 Gi0/2 Gi0/3
-    python 021_port_bounce.py -H 10.0.0.1 -u admin -p secret -i Gi0/1 --delay 10 --dry-run
+Use case: Clearing stuck MACs, resetting PoE devices, forcing LACP
+renegotiation — anywhere a simple shutdown/no-shutdown isn't enough
+and you need evidence the port actually recovered.
 
 Prerequisites:
     pip install netmiko
-    Tested against: Cisco IOS, IOS-XE
-    Requires privilege level 15 (enable access or direct priv-exec login)
+
+Usage:
+    python 031_port_bounce.py -H 192.168.1.1 -u admin -p secret \
+        -i GigabitEthernet0/1 GigabitEthernet0/2 \
+        --device-type cisco_ios --wait 10 --timeout 30
+
+    # Bounce multiple ports from a file (one interface per line)
+    python 031_port_bounce.py -H 192.168.1.1 -u admin -p secret \
+        --interface-file ports.txt --wait 5
+
+Supported device types: cisco_ios, cisco_nxos, cisco_xe, cisco_xr
 """
 
 import argparse
 import logging
-import re
 import sys
 import time
-from getpass import getpass
+from dataclasses import dataclass, field
+from typing import Optional
 
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
     level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
 
-def parse_interface_state(output: str, interface: str) -> dict:
-    """Extract link status and protocol state from 'show interface' output."""
-    state = {"line": "unknown", "protocol": "unknown", "err_disabled": False}
-    pattern = re.compile(
-        r"^\S.*?is\s+(\S+(?:\s+\S+)?),\s+line protocol is\s+(\S+)", re.MULTILINE
+@dataclass
+class PortState:
+    name: str
+    status: str = ""
+    err_input: int = 0
+    err_output: int = 0
+    mac_count: int = 0
+    raw_counters: str = ""
+    raw_mac: str = ""
+    error: str = ""
+    recovered: Optional[bool] = None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Bounce switch ports with pre/post state validation"
     )
-    match = pattern.search(output)
-    if match:
-        state["line"] = match.group(1).strip(",")
-        state["protocol"] = match.group(2).strip(",")
-        state["err_disabled"] = "err-disabled" in match.group(1).lower()
+    parser.add_argument("-H", "--host", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", required=True)
+    parser.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        choices=["cisco_ios", "cisco_nxos", "cisco_xe", "cisco_xr"],
+    )
+    parser.add_argument(
+        "-i", "--interfaces", nargs="+", metavar="IFACE", help="Interface(s) to bounce"
+    )
+    parser.add_argument(
+        "--interface-file",
+        metavar="FILE",
+        help="File with one interface name per line",
+    )
+    parser.add_argument(
+        "--wait",
+        type=int,
+        default=8,
+        help="Seconds to wait between shutdown and no shutdown (default: 8)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=30,
+        help="Seconds to wait for port to return UP after bounce (default: 30)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Collect pre-state and print commands without executing",
+    )
+    return parser.parse_args()
+
+
+def load_interfaces(args: argparse.Namespace) -> list[str]:
+    ifaces: list[str] = []
+    if args.interfaces:
+        ifaces.extend(args.interfaces)
+    if args.interface_file:
+        try:
+            with open(args.interface_file) as fh:
+                ifaces.extend(
+                    line.strip() for line in fh if line.strip() and not line.startswith("#")
+                )
+        except OSError as exc:
+            log.error("Cannot read interface file: %s", exc)
+            sys.exit(1)
+    if not ifaces:
+        log.error("No interfaces specified. Use -i or --interface-file.")
+        sys.exit(1)
+    return ifaces
+
+
+def capture_state(conn, iface: str) -> PortState:
+    state = PortState(name=iface)
+    try:
+        status_out = conn.send_command(
+            f"show interfaces {iface} status", use_textfsm=False
+        )
+        state.status = "connected" if "connected" in status_out.lower() else "notconnect"
+
+        counters_out = conn.send_command(f"show interfaces {iface} counters errors")
+        state.raw_counters = counters_out
+        for line in counters_out.splitlines():
+            parts = line.split()
+            if "input" in line.lower() and len(parts) >= 2:
+                try:
+                    state.err_input = int(parts[-1].replace(",", ""))
+                except ValueError:
+                    pass
+            if "output" in line.lower() and len(parts) >= 2:
+                try:
+                    state.err_output = int(parts[-1].replace(",", ""))
+                except ValueError:
+                    pass
+
+        mac_out = conn.send_command(f"show mac address-table interface {iface}")
+        state.raw_mac = mac_out
+        state.mac_count = sum(
+            1 for line in mac_out.splitlines()
+            if line.strip() and not line.startswith("Mac") and not line.startswith("-") and not line.startswith("Vlan")
+        )
+    except Exception as exc:
+        state.error = str(exc)
+        log.warning("[%s] State capture error: %s", iface, exc)
     return state
 
 
-def get_mac_count(connection, interface: str) -> int:
-    """Return number of MACs learned on the interface."""
-    output = connection.send_command(
-        f"show mac address-table interface {interface}",
-        expect_string=r"#",
-    )
-    lines = [
-        l for l in output.splitlines()
-        if re.match(r"\s+\d+\s+[0-9a-f.]{14}", l, re.IGNORECASE)
+def bounce_port(conn, iface: str, wait: int, dry_run: bool) -> None:
+    commands = [
+        f"interface {iface}",
+        "shutdown",
     ]
-    return len(lines)
+    log.info("[%s] Sending shutdown...", iface)
+    if not dry_run:
+        conn.send_config_set(commands)
+        time.sleep(wait)
+    else:
+        log.info("[%s] DRY-RUN: would sleep %ds then send no shutdown", iface, wait)
+        return
+
+    commands_up = [f"interface {iface}", "no shutdown"]
+    log.info("[%s] Sending no shutdown...", iface)
+    conn.send_config_set(commands_up)
 
 
-def bounce_interface(connection, interface: str, delay: int, dry_run: bool) -> bool:
-    """Shut/no-shut the interface. Returns True if post-state is up/up."""
-    log.info("[%s] Capturing pre-bounce state ...", interface)
-    pre_output = connection.send_command(f"show interface {interface}")
-    pre_state = parse_interface_state(pre_output, interface)
-    pre_macs = get_mac_count(connection, interface)
+def wait_for_recovery(conn, iface: str, timeout: int) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        out = conn.send_command(f"show interfaces {iface} status")
+        if "connected" in out.lower():
+            return True
+        time.sleep(2)
+    return False
 
+
+def print_summary(pre: PortState, post: PortState) -> None:
+    delta_in = post.err_input - pre.err_input
+    delta_out = post.err_output - pre.err_output
+    mac_diff = post.mac_count - pre.mac_count
+
+    status_icon = "OK" if post.recovered else "FAIL"
     log.info(
-        "[%s] PRE  — line: %s  protocol: %s  MACs: %d%s",
-        interface,
-        pre_state["line"],
-        pre_state["protocol"],
-        pre_macs,
-        "  [ERR-DISABLED]" if pre_state["err_disabled"] else "",
+        "[%s] %s | status=%s | new_errs_in=%d new_errs_out=%d | "
+        "mac_delta=%+d (%d->%d)",
+        post.name, status_icon, post.status,
+        delta_in, delta_out,
+        mac_diff, pre.mac_count, post.mac_count,
     )
-
-    if dry_run:
-        log.info("[%s] DRY-RUN: skipping shut/no-shut", interface)
-        return True
-
-    log.info("[%s] Sending: shutdown", interface)
-    connection.send_config_set([f"interface {interface}", "shutdown"])
-    time.sleep(2)
-
-    log.info("[%s] Sending: no shutdown (delay: %ds)", interface, delay)
-    connection.send_config_set([f"interface {interface}", "no shutdown"])
-    time.sleep(delay)
-
-    log.info("[%s] Capturing post-bounce state ...", interface)
-    post_output = connection.send_command(f"show interface {interface}")
-    post_state = parse_interface_state(post_output, interface)
-    post_macs = get_mac_count(connection, interface)
-
-    success = (
-        post_state["line"] in ("up", "connected")
-        and post_state["protocol"] in ("up", "connected")
-        and not post_state["err_disabled"]
-    )
-
-    log.info(
-        "[%s] POST — line: %s  protocol: %s  MACs: %d  result: %s",
-        interface,
-        post_state["line"],
-        post_state["protocol"],
-        post_macs,
-        "OK" if success else "FAIL",
-    )
-
-    if post_state["err_disabled"]:
-        log.error("[%s] Port is still err-disabled after bounce.", interface)
-
-    return success
+    if delta_in > 0 or delta_out > 0:
+        log.warning("[%s] New errors detected after bounce — investigate.", post.name)
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Bounce switchport(s) with pre/post state verification."
-    )
-    parser.add_argument("-H", "--host", required=True, help="Device IP or hostname")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
-    parser.add_argument(
-        "-i", "--interfaces", nargs="+", required=True,
-        metavar="INTF", help="Interface(s) to bounce, e.g. Gi0/1 Gi0/2",
-    )
-    parser.add_argument(
-        "--delay", type=int, default=5,
-        help="Seconds to wait after no-shut before verifying (default: 5)",
-    )
-    parser.add_argument(
-        "--device-type", default="cisco_ios",
-        help="Netmiko device type (default: cisco_ios)",
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Show pre-state only; skip the actual shut/no-shut",
-    )
-    args = parser.parse_args()
-
-    password = args.password or getpass(f"Password for {args.username}@{args.host}: ")
+def main() -> int:
+    args = parse_args()
+    interfaces = load_interfaces(args)
 
     device = {
         "device_type": args.device_type,
         "host": args.host,
         "username": args.username,
-        "password": password,
-        "timeout": 30,
+        "password": args.password,
+        "timeout": 20,
     }
 
     try:
-        log.info("Connecting to %s ...", args.host)
-        with ConnectHandler(**device) as conn:
-            conn.enable()
-            log.info("Connected. Hostname: %s", conn.find_prompt().rstrip("#>"))
-
-            results = {}
-            for intf in args.interfaces:
-                results[intf] = bounce_interface(conn, intf, args.delay, args.dry_run)
-
-        log.info("--- Summary ---")
-        all_ok = True
-        for intf, ok in results.items():
-            status = "OK" if ok else "FAIL"
-            log.info("  %-30s %s", intf, status)
-            if not ok:
-                all_ok = False
-
-        sys.exit(0 if all_ok else 1)
-
+        log.info("Connecting to %s (%s)...", args.host, args.device_type)
+        conn = ConnectHandler(**device)
     except NetmikoAuthenticationException:
         log.error("Authentication failed for %s@%s", args.username, args.host)
-        sys.exit(2)
+        return 1
     except NetmikoTimeoutException:
         log.error("Connection timed out to %s", args.host)
-        sys.exit(2)
-    except Exception as exc:
-        log.error("Unexpected error: %s", exc)
-        sys.exit(2)
+        return 1
+
+    pre_states: list[PortState] = []
+    post_states: list[PortState] = []
+    overall_ok = True
+
+    try:
+        for iface in interfaces:
+            log.info("[%s] Capturing pre-bounce state...", iface)
+            pre = capture_state(conn, iface)
+            pre_states.append(pre)
+
+        for pre in pre_states:
+            bounce_port(conn, pre.name, args.wait, args.dry_run)
+
+        if not args.dry_run:
+            for pre in pre_states:
+                log.info("[%s] Waiting up to %ds for recovery...", pre.name, args.timeout)
+                recovered = wait_for_recovery(conn, pre.name, args.timeout)
+                if not recovered:
+                    log.error("[%s] Port did not return to connected state.", pre.name)
+                    overall_ok = False
+
+                post = capture_state(conn, pre.name)
+                post.recovered = recovered
+                post_states.append(post)
+                print_summary(pre, post)
+        else:
+            log.info("Dry-run complete. No changes made.")
+    finally:
+        conn.disconnect()
+
+    return 0 if overall_ok else 2
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 ```
