@@ -1,33 +1,29 @@
 ```python
 """
-022_config_checkpoint_rollback.py — Checkpoint-based config rollback with diff verification.
+032_config_rollback.py — Checkpoint-based config rollback with diff verification.
 
-Saves a timestamped running-config checkpoint before any change window, then
-restores it line-by-line if needed. Shows a unified diff between the live
-config and the checkpoint so operators can confirm exactly what will be
-reverted before committing.
+Saves a named configuration checkpoint before a change window, then rolls back
+to that checkpoint on demand. Post-rollback diff confirms the device reached the
+expected state. Supports Cisco IOS, IOS-XE, and NX-OS.
 
 Usage:
-    # Save a checkpoint before maintenance:
-    python 022_config_checkpoint_rollback.py --host 10.0.0.1 --user admin \
-        --password secret --action checkpoint --out backups/core1_pre.txt
+    Save checkpoint:
+        python 032_config_rollback.py --host 10.0.0.1 --user admin --save pre_change
 
-    # Review what would be reverted (dry-run):
-    python 022_config_checkpoint_rollback.py --host 10.0.0.1 --user admin \
-        --password secret --action diff --checkpoint backups/core1_pre.txt
+    Roll back to checkpoint:
+        python 032_config_rollback.py --host 10.0.0.1 --user admin --rollback pre_change
 
-    # Perform the rollback:
-    python 022_config_checkpoint_rollback.py --host 10.0.0.1 --user admin \
-        --password secret --action rollback --checkpoint backups/core1_pre.txt
+    List saved checkpoints:
+        python 032_config_rollback.py --list
 
 Prerequisites:
     pip install netmiko
-    Tested against Cisco IOS / IOS-XE. Device type defaults to cisco_ios;
-    pass --device-type for other platforms (e.g. cisco_nxos, arista_eos).
+    Checkpoint files are saved to ./checkpoints/<hostname>/<name>.cfg
 """
 
 import argparse
 import difflib
+import getpass
 import logging
 import os
 import sys
@@ -36,160 +32,161 @@ from pathlib import Path
 
 from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+CHECKPOINT_DIR = Path("./checkpoints")
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 log = logging.getLogger(__name__)
 
 
-def fetch_running_config(conn) -> list[str]:
-    log.info("Fetching running-config from device")
-    raw = conn.send_command("show running-config", read_timeout=60)
-    lines = [l.rstrip() for l in raw.splitlines()]
-    # Strip the header lines that change on every capture (timestamp, etc.)
-    return [l for l in lines if not l.startswith("! Last config") and l != "!"]
+def checkpoint_path(hostname: str, name: str) -> Path:
+    return CHECKPOINT_DIR / hostname / f"{name}.cfg"
 
 
-def save_checkpoint(conn, outfile: Path) -> None:
-    lines = fetch_running_config(conn)
-    outfile.parent.mkdir(parents=True, exist_ok=True)
-    outfile.write_text("\n".join(lines) + "\n")
-    log.info("Checkpoint saved → %s (%d lines)", outfile, len(lines))
+def save_checkpoint(connection, hostname: str, name: str) -> Path:
+    log.info("Fetching running config from %s", hostname)
+    output = connection.send_command("show running-config")
+
+    path = checkpoint_path(hostname, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(output)
+    log.info("Checkpoint '%s' saved to %s (%d bytes)", name, path, len(output))
+    return path
 
 
-def load_checkpoint(checkpoint: Path) -> list[str]:
-    if not checkpoint.exists():
-        log.error("Checkpoint file not found: %s", checkpoint)
+def load_checkpoint(hostname: str, name: str) -> str:
+    path = checkpoint_path(hostname, name)
+    if not path.exists():
+        log.error("Checkpoint '%s' not found at %s", name, path)
         sys.exit(1)
-    lines = [l.rstrip() for l in checkpoint.read_text().splitlines()]
-    log.info("Loaded checkpoint: %s (%d lines)", checkpoint, len(lines))
-    return lines
+    return path.read_text()
 
 
-def compute_diff(current: list[str], target: list[str]) -> list[str]:
-    return list(
-        difflib.unified_diff(
-            current,
-            target,
-            fromfile="running-config (live)",
-            tofile="checkpoint (target)",
-            lineterm="",
-        )
-    )
-
-
-def apply_rollback(conn, target_lines: list[str], dry_run: bool = False) -> None:
-    """Send the checkpoint config line-by-line inside a config session."""
-    config_lines = [
-        l for l in target_lines
-        if l and not l.startswith("!")
+def rollback(connection, hostname: str, name: str, device_type: str) -> bool:
+    saved_config = load_checkpoint(hostname, name)
+    lines = [
+        line for line in saved_config.splitlines()
+        if line.strip()
+        and not line.startswith("!")
+        and not line.lower().startswith("building configuration")
+        and not line.lower().startswith("current configuration")
     ]
-    if dry_run:
-        log.info("Dry-run: would send %d config lines — no changes applied", len(config_lines))
-        return
 
-    log.info("Applying rollback (%d config lines) …", len(config_lines))
-    output = conn.send_config_set(
-        config_lines,
-        read_timeout=120,
-        cmd_verify=False,
-    )
-    if conn.check_config_mode():
-        conn.exit_config_mode()
+    log.info("Fetching pre-rollback running config for diff baseline")
+    pre_rollback = connection.send_command("show running-config")
 
-    error_keywords = ("invalid input", "incomplete command", "ambiguous command")
-    errors = [l for l in output.splitlines() if any(k in l.lower() for k in error_keywords)]
-    if errors:
-        log.warning("Config errors detected during rollback:")
-        for e in errors:
-            log.warning("  %s", e)
+    log.info("Pushing %d config lines to %s", len(lines), hostname)
+    try:
+        connection.send_config_set(lines)
+    except Exception as exc:
+        log.error("Config push failed: %s", exc)
+        return False
+
+    if "nxos" not in device_type:
+        log.info("Saving config to startup")
+        connection.save_config()
+
+    log.info("Fetching post-rollback running config")
+    post_rollback = connection.send_command("show running-config")
+
+    diff = list(difflib.unified_diff(
+        pre_rollback.splitlines(),
+        post_rollback.splitlines(),
+        fromfile="before-rollback",
+        tofile="after-rollback",
+        lineterm="",
+    ))
+
+    if diff:
+        log.info("Rollback diff (%d lines changed):", len(diff))
+        for line in diff[:60]:
+            print(line)
+        if len(diff) > 60:
+            print(f"... ({len(diff) - 60} more lines)")
     else:
-        log.info("Rollback applied cleanly")
+        log.info("No diff detected — device config already matched checkpoint")
 
-    conn.save_config()
-    log.info("Running-config saved to startup-config")
-
-
-def build_connection(args) -> dict:
-    return {
-        "device_type": args.device_type,
-        "host": args.host,
-        "port": args.port,
-        "username": args.user,
-        "password": args.password,
-        "secret": args.enable or args.password,
-        "global_delay_factor": 2,
-    }
+    return True
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Checkpoint-based config rollback with diff preview",
+def list_checkpoints():
+    if not CHECKPOINT_DIR.exists():
+        print("No checkpoints directory found.")
+        return
+    found = False
+    for cfg in sorted(CHECKPOINT_DIR.rglob("*.cfg")):
+        mtime = datetime.fromtimestamp(cfg.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        size = cfg.stat().st_size
+        print(f"  {cfg.relative_to(CHECKPOINT_DIR)}  [{size} bytes, {mtime}]")
+        found = True
+    if not found:
+        print("No checkpoints saved yet.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Checkpoint-based config rollback tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--host", required=True, help="Device IP or hostname")
-    parser.add_argument("--user", required=True, help="SSH username")
-    parser.add_argument("--password", required=True, help="SSH password")
-    parser.add_argument("--enable", default=None, help="Enable secret (defaults to password)")
-    parser.add_argument("--port", type=int, default=22)
-    parser.add_argument("--device-type", default="cisco_ios", dest="device_type")
-    parser.add_argument(
-        "--action",
-        choices=["checkpoint", "diff", "rollback"],
-        required=True,
-        help="checkpoint=save snapshot  diff=preview changes  rollback=restore snapshot",
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        default=None,
-        help="Path to checkpoint file (required for diff/rollback actions)",
-    )
-    parser.add_argument(
-        "--out",
-        type=Path,
-        default=None,
-        help="Output path for checkpoint action (auto-named if omitted)",
-    )
+    p.add_argument("--host", help="Device IP or hostname")
+    p.add_argument("--user", help="SSH username")
+    p.add_argument("--password", help="SSH password (prompted if omitted)")
+    p.add_argument("--device-type", default="cisco_ios",
+                   choices=["cisco_ios", "cisco_xe", "cisco_nxos"],
+                   help="Netmiko device type (default: cisco_ios)")
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("--save", metavar="NAME", help="Save current running config as checkpoint NAME")
+    p.add_argument("--rollback", metavar="NAME", help="Roll back to checkpoint NAME")
+    p.add_argument("--list", action="store_true", help="List all saved checkpoints and exit")
+    p.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    return p
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
-    if args.action in ("diff", "rollback") and not args.checkpoint:
-        parser.error("--checkpoint is required for diff and rollback actions")
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    if args.action == "checkpoint" and args.out is None:
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.out = Path(f"backups/{args.host}_{stamp}.txt")
+    if args.list:
+        list_checkpoints()
+        return
 
-    params = build_connection(args)
+    if not args.save and not args.rollback:
+        parser.error("Specify --save NAME, --rollback NAME, or --list")
 
+    if not args.host:
+        parser.error("--host is required")
+    if not args.user:
+        parser.error("--user is required")
+
+    password = args.password or getpass.getpass(f"Password for {args.user}@{args.host}: ")
+
+    device = {
+        "device_type": args.device_type,
+        "host": args.host,
+        "username": args.user,
+        "password": password,
+        "port": args.port,
+        "session_log": f"/tmp/netmiko_{args.host}.log",
+    }
+
+    log.info("Connecting to %s (%s)", args.host, args.device_type)
     try:
-        log.info("Connecting to %s:%d as %s", args.host, args.port, args.user)
-        with ConnectHandler(**params) as conn:
-            conn.enable()
+        with ConnectHandler(**device) as conn:
+            hostname = conn.find_prompt().strip("#>")
+            log.info("Connected — prompt: %s", hostname)
 
-            if args.action == "checkpoint":
-                save_checkpoint(conn, args.out)
+            if args.save:
+                save_checkpoint(conn, hostname, args.save)
 
-            elif args.action == "diff":
-                current = fetch_running_config(conn)
-                target = load_checkpoint(args.checkpoint)
-                diff = compute_diff(current, target)
-                if not diff:
-                    log.info("No differences — live config matches checkpoint")
-                else:
-                    print("\n".join(diff))
-                    log.info("%d diff lines (+ adds to live, - removes from live)", len(diff))
-
-            elif args.action == "rollback":
-                current = fetch_running_config(conn)
-                target = load_checkpoint(args.checkpoint)
-                diff = compute_diff(current, target)
-                if not diff:
-                    log.info("Live config already matches checkpoint — nothing to do")
-                    return
-                log.info("Diff summary: %d lines changed", len(diff))
-                apply_rollback(conn, target)
+            if args.rollback:
+                success = rollback(conn, hostname, args.rollback, args.device_type)
+                if not success:
+                    log.error("Rollback failed")
+                    sys.exit(1)
+                log.info("Rollback to '%s' complete", args.rollback)
 
     except NetmikoAuthenticationException:
         log.error("Authentication failed for %s@%s", args.user, args.host)
