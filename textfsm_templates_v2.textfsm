@@ -1,222 +1,232 @@
-Interface Error and Utilization Analyzer using Netmiko.
+The request is for a standalone script to be output directly, not written into this repo. Here it is:
+
+```python
+"""
+mac_lookup.py — MAC address table query and port-finder for network switches.
 
 Purpose:
-    Connects to network devices, collects interface statistics, and identifies
-    problematic interfaces based on error counts and bandwidth utilization.
-    Generates a JSON report of interfaces requiring attention.
+    Connects to a network switch and queries the MAC address table to locate
+    specific hosts by MAC address, or dumps the full table for auditing.
+    Optionally cross-references the ARP table to correlate IP addresses with
+    switch port locations. Supports bulk lookup from a file.
 
 Usage:
-    python interface_analyzer.py --host 192.168.1.1 --device-type cisco_ios \
-        --username admin --password secret --error-threshold 100 \
-        --timeout 30
+    # Locate a single MAC address
+    python mac_lookup.py -d 192.168.1.1 -u admin -p secret -m aa:bb:cc:dd:ee:ff
+
+    # Dump the full MAC table
+    python mac_lookup.py -d 192.168.1.1 -u admin -p secret --all
+
+    # Bulk lookup from file (one MAC per line), with ARP correlation
+    python mac_lookup.py -d 192.168.1.1 -u admin -p secret -f macs.txt --arp
+
+    # Export to CSV, filter to VLAN 10
+    python mac_lookup.py -d 192.168.1.1 -u admin -p secret --all --vlan 10 --output table.csv
 
 Prerequisites:
-    - netmiko >= 4.0.0
-    - Device SSH access with appropriate credentials
-    - Interface statistics available via 'show interfaces' command
-    - Tested on Cisco IOS, IOS-XE, IOS-XR
-
-Author: Network Automation Portfolio
+    pip install netmiko ntc-templates
+    NTC-templates provides the TextFSM templates consumed by netmiko's
+    use_textfsm=True; install instructions at github.com/networktocode/ntc-templates
 """
 
 import argparse
+import csv
 import logging
-import json
+import re
 import sys
 from datetime import datetime
+
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoTimeoutException, NetmikoAuthenticationException
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
 
-def setup_logging(log_level=logging.INFO):
-    """Configure logging for the script."""
-    logging.basicConfig(
-        level=log_level,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler('interface_analyzer.log'),
-            logging.StreamHandler()
-        ]
+def normalize_mac(mac: str) -> str:
+    """Return MAC as lowercase Cisco dotted-quad (xxxx.xxxx.xxxx)."""
+    digits = re.sub(r"[:\-\.]", "", mac).lower()
+    if len(digits) != 12:
+        raise ValueError(f"Invalid MAC address: {mac!r}")
+    return f"{digits[:4]}.{digits[4:8]}.{digits[8:]}"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Query switch MAC address table to locate hosts by port."
     )
-    return logging.getLogger(__name__)
+    parser.add_argument("-d", "--device", required=True, help="Switch IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
+    parser.add_argument(
+        "-t", "--device-type", default="cisco_ios",
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--secret", default="", help="Enable secret")
+
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("-m", "--mac", metavar="MAC", help="Single MAC address to find")
+    target.add_argument(
+        "-f", "--file", metavar="FILE",
+        help="File of MAC addresses to look up (one per line, # comments OK)",
+    )
+    target.add_argument("--all", action="store_true", help="Dump full MAC address table")
+
+    parser.add_argument("--arp", action="store_true",
+                        help="Cross-reference ARP table to include IP addresses")
+    parser.add_argument("--vlan", type=int, metavar="ID",
+                        help="Restrict results to a specific VLAN")
+    parser.add_argument("--output", metavar="FILE", help="Write results to CSV")
+    return parser.parse_args()
 
 
-def connect_device(device_params):
-    """Establish SSH connection to network device."""
-    logger = logging.getLogger(__name__)
-    try:
-        logger.info(f"Connecting to {device_params['host']}")
-        device = ConnectHandler(**device_params)
-        logger.info(f"Successfully connected to {device_params['host']}")
-        return device
-    except NetmikoAuthenticationException as e:
-        logger.error(f"Authentication failed for {device_params['host']}: {e}")
-        raise
-    except NetmikoTimeoutException as e:
-        logger.error(f"Connection timeout for {device_params['host']}: {e}")
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error connecting to {device_params['host']}: {e}")
-        raise
+def get_mac_table(conn):
+    log.info("Querying MAC address table...")
+    rows = conn.send_command("show mac address-table", use_textfsm=True)
+    if not isinstance(rows, list):
+        log.error("TextFSM parsing failed; verify ntc-templates is installed.")
+        sys.exit(1)
+    return rows
 
 
-def parse_interface_stats(output):
-    """Parse interface statistics from 'show interfaces' output."""
-    interfaces = {}
-    lines = output.split('\n')
-    current_iface = None
-    
-    for line in lines:
-        iface_keywords = ('Ethernet', 'FastEthernet', 'GigabitEthernet', 
-                         'TenGigabitEthernet', 'Port-channel', 'Serial', 'Tunnel')
-        
-        if any(line.startswith(kw) for kw in iface_keywords):
-            parts = line.split()
-            current_iface = parts[0]
-            status = parts[1].lower() if len(parts) > 1 else 'unknown'
-            interfaces[current_iface] = {
-                'status': status,
-                'input_errors': 0,
-                'output_errors': 0,
-                'input_drops': 0,
-                'output_drops': 0,
-            }
-        
-        elif current_iface and 'errors' in line.lower():
+def get_arp_table(conn):
+    log.info("Querying ARP table for IP correlation...")
+    rows = conn.send_command("show ip arp", use_textfsm=True)
+    if not isinstance(rows, list):
+        return {}
+    result = {}
+    for r in rows:
+        raw_mac = r.get("mac") or r.get("hardware_addr", "")
+        if raw_mac:
             try:
-                for part in line.split(','):
-                    part = part.strip()
-                    if 'input errors' in part:
-                        interfaces[current_iface]['input_errors'] = int(part.split()[0])
-                    elif 'output errors' in part:
-                        interfaces[current_iface]['output_errors'] = int(part.split()[0])
-            except (ValueError, IndexError):
+                result[normalize_mac(raw_mac)] = r.get("address", r.get("ip", ""))
+            except ValueError:
                 pass
-        
-        elif current_iface and 'dropped' in line.lower():
+    return result
+
+
+def filter_rows(rows, targets=None, vlan=None):
+    out = []
+    for row in rows:
+        if vlan and str(row.get("vlan", "")).strip() != str(vlan):
+            continue
+        if targets:
+            raw = row.get("destination_address") or row.get("mac", "")
             try:
-                for part in line.split(','):
-                    part = part.strip()
-                    if 'input dropped' in part:
-                        interfaces[current_iface]['input_drops'] = int(part.split()[0])
-                    elif 'output dropped' in part:
-                        interfaces[current_iface]['output_drops'] = int(part.split()[0])
-            except (ValueError, IndexError):
-                pass
-    
-    return interfaces
+                if normalize_mac(raw) not in targets:
+                    continue
+            except ValueError:
+                continue
+        out.append(row)
+    return out
 
 
-def analyze_interfaces(device, error_threshold):
-    """Analyze interface statistics and identify problematic interfaces."""
-    logger = logging.getLogger(__name__)
-    problematic = []
-    
-    try:
-        output = device.send_command('show interfaces')
-        interfaces = parse_interface_stats(output)
-        
-        for iface, stats in interfaces.items():
-            total_errors = stats['input_errors'] + stats['output_errors']
-            total_drops = stats['input_drops'] + stats['output_drops']
-            
-            if total_errors > error_threshold or total_drops > error_threshold:
-                problematic.append({
-                    'interface': iface,
-                    'status': stats['status'],
-                    'input_errors': stats['input_errors'],
-                    'output_errors': stats['output_errors'],
-                    'input_drops': stats['input_drops'],
-                    'output_drops': stats['output_drops'],
-                    'total_errors': total_errors,
-                    'total_drops': total_drops,
-                })
-                logger.warning(
-                    f"{iface}: {total_errors} errors, {total_drops} drops"
-                )
-        
-        logger.info(f"Analyzed {len(interfaces)} interfaces, "
-                   f"found {len(problematic)} problematic")
-        return problematic, len(interfaces)
-        
-    except Exception as e:
-        logger.error(f"Error analyzing interfaces: {e}")
-        raise
+def print_table(rows, arp_map, device):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n=== MAC Address Table — {device}  [{ts}] ===")
+    print(f"{'VLAN':<6} {'MAC Address':<18} {'Type':<10} {'Port':<24} {'IP Address'}")
+    print("-" * 78)
+    for row in rows:
+        raw_mac = row.get("destination_address") or row.get("mac", "")
+        try:
+            mac = normalize_mac(raw_mac)
+        except ValueError:
+            mac = raw_mac
+        vlan = row.get("vlan", "")
+        entry_type = row.get("type") or row.get("destination_type", "")
+        port = row.get("destination_port") or row.get("interface", "")
+        ip = arp_map.get(mac, "")
+        print(f"{vlan:<6} {mac:<18} {entry_type:<10} {port:<24} {ip}")
+    print(f"\n  Entries shown: {len(rows)}")
 
 
-def generate_report(host, problematic_interfaces, total_interfaces):
-    """Generate analysis report and save to file."""
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    report = {
-        'timestamp': timestamp,
-        'device': host,
-        'total_interfaces': total_interfaces,
-        'problematic_count': len(problematic_interfaces),
-        'interfaces': problematic_interfaces
-    }
-    
-    filename = f"interface_report_{host.replace('.', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    
-    with open(filename, 'w') as f:
-        json.dump(report, f, indent=2)
-    
-    return filename
+def write_csv(rows, arp_map, filepath):
+    fields = ["vlan", "mac", "type", "port", "ip"]
+    with open(filepath, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            raw_mac = row.get("destination_address") or row.get("mac", "")
+            try:
+                mac = normalize_mac(raw_mac)
+            except ValueError:
+                mac = raw_mac
+            writer.writerow({
+                "vlan": row.get("vlan", ""),
+                "mac": mac,
+                "type": row.get("type") or row.get("destination_type", ""),
+                "port": row.get("destination_port") or row.get("interface", ""),
+                "ip": arp_map.get(mac, ""),
+            })
+    log.info("Results written to %s", filepath)
 
 
 def main():
-    """Main execution function."""
-    parser = argparse.ArgumentParser(
-        description='Analyze network device interface statistics and errors'
-    )
-    parser.add_argument('--host', required=True, help='Device IP address or hostname')
-    parser.add_argument('--device-type', required=True, 
-                       help='Device type (e.g., cisco_ios, cisco_xr)')
-    parser.add_argument('--username', required=True, help='SSH username')
-    parser.add_argument('--password', required=True, help='SSH password')
-    parser.add_argument('--port', type=int, default=22, help='SSH port (default: 22)')
-    parser.add_argument('--error-threshold', type=int, default=100,
-                       help='Error/drop count threshold (default: 100)')
-    parser.add_argument('--timeout', type=int, default=30, 
-                       help='Connection timeout in seconds (default: 30)')
-    
-    args = parser.parse_args()
-    logger = setup_logging()
-    logger.info("Starting Interface Error Analyzer")
-    
+    args = parse_args()
+
+    targets = set()
+    if args.mac:
+        try:
+            targets.add(normalize_mac(args.mac))
+        except ValueError as exc:
+            log.error("%s", exc)
+            sys.exit(1)
+    elif args.file:
+        try:
+            with open(args.file) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        try:
+                            targets.add(normalize_mac(line))
+                        except ValueError:
+                            log.warning("Skipping invalid MAC: %s", line)
+        except FileNotFoundError:
+            log.error("MAC list file not found: %s", args.file)
+            sys.exit(1)
+
     device_params = {
-        'device_type': args.device_type,
-        'host': args.host,
-        'username': args.username,
-        'password': args.password,
-        'port': args.port,
-        'timeout': args.timeout,
-        'secret': args.password,
+        "device_type": args.device_type,
+        "host": args.device,
+        "username": args.username,
+        "password": args.password,
+        "port": args.port,
+        "secret": args.secret,
     }
-    
-    device = None
+
     try:
-        device = connect_device(device_params)
-        problematic, total = analyze_interfaces(device, args.error_threshold)
-        report_file = generate_report(args.host, problematic, total)
-        
-        logger.info(f"Report saved to: {report_file}")
-        
-        if problematic:
-            print(f"\n⚠️  {len(problematic)} problematic interface(s) found:")
-            for iface in problematic:
-                print(f"  {iface['interface']}: {iface['total_errors']} errors, "
-                      f"{iface['total_drops']} drops")
-        else:
-            print(f"\n✓ All {total} interfaces healthy")
-        
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        log.info("Connecting to %s (%s)...", args.device, args.device_type)
+        with ConnectHandler(**device_params) as conn:
+            if args.secret:
+                conn.enable()
+            rows = get_mac_table(conn)
+            arp_map = get_arp_table(conn) if args.arp else {}
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.device)
         sys.exit(1)
-    finally:
-        if device:
-            device.disconnect()
-            logger.info("Disconnected from device")
+    except NetmikoTimeoutException:
+        log.error("Connection timed out to %s", args.device)
+        sys.exit(1)
+    except Exception as exc:
+        log.error("Connection error: %s", exc)
+        sys.exit(1)
+
+    results = filter_rows(rows, targets or None, args.vlan)
+
+    if not results:
+        log.warning("No matching entries found.")
+    else:
+        print_table(results, arp_map, args.device)
+
+    if args.output:
+        write_csv(results, arp_map, args.output)
 
 
 if __name__ == "__main__":
     main()
+```
