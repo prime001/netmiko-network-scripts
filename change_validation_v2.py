@@ -1,180 +1,175 @@
-```python
-"""
-Pre/Post Change Snapshot Diff Validator
-========================================
-Captures a device state snapshot before a maintenance window, then compares
-it against the live device after changes are applied to surface regressions.
+BGP Session State Validator
+
+Captures BGP neighbor state snapshots before/after a network change and
+compares them to detect session drops or unexpected prefix count changes.
 
 Usage:
     # Capture pre-change baseline
-    python 034_pre_post_change_diff.py --host 10.0.0.1 --username admin \
-        --password secret --mode snapshot --output pre_change.json
+    python bgp_state_monitor.py --host 10.0.0.1 --username admin --password secret \
+        --device-type cisco_ios --snapshot pre-change.json
 
     # Validate post-change state against baseline
-    python 034_pre_post_change_diff.py --host 10.0.0.1 --username admin \
-        --password secret --mode diff --baseline pre_change.json
+    python bgp_state_monitor.py --host 10.0.0.1 --username admin --password secret \
+        --device-type cisco_ios --compare pre-change.json
+
+Exit codes:
+    0 — all sessions nominal (or snapshot saved successfully)
+    1 — session drop, missing peer, or prefix count regression detected
+    2 — usage error or connection failure
 
 Prerequisites:
     pip install netmiko
-    Tested against Cisco IOS / IOS-XE. Adjust commands for other vendors.
 """
 
 import argparse
 import json
 import logging
+import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
-from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-SNAPSHOT_COMMANDS = [
-    "show ip interface brief",
-    "show ip bgp summary",
-    "show ip route summary",
-    "show spanning-tree summary",
-    "show interfaces status",
-    "show cdp neighbors",
-]
+BGP_COMMANDS = {
+    "cisco_ios": "show ip bgp summary",
+    "cisco_xe": "show ip bgp summary",
+    "cisco_nxos": "show bgp ipv4 unicast summary",
+    "arista_eos": "show bgp summary",
+    "juniper_junos": "show bgp summary",
+}
+
+# Matches neighbor lines: peer-IP  ... uptime  state-or-prefixcount
+_PEER_RE = re.compile(
+    r"^(\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\S+\s+(\S+)",
+    re.MULTILINE,
+)
 
 
-def connect(host, username, password, device_type, port):
-    params = {
-        "device_type": device_type,
-        "host": host,
-        "username": username,
-        "password": password,
-        "port": port,
-        "timeout": 30,
-        "session_log": None,
-    }
-    try:
-        conn = ConnectHandler(**params)
-        log.info("Connected to %s", host)
-        return conn
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", username, host)
-        sys.exit(1)
-    except NetmikoTimeoutException:
-        log.error("Timed out connecting to %s", host)
-        sys.exit(1)
-
-
-def capture_snapshot(conn, host):
-    snapshot = {
-        "host": host,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "commands": {},
-    }
-    for cmd in SNAPSHOT_COMMANDS:
-        log.info("Running: %s", cmd)
+def parse_bgp_output(output: str) -> dict:
+    peers = {}
+    for m in _PEER_RE.finditer(output):
+        peer, state = m.group(1), m.group(2)
         try:
-            output = conn.send_command(cmd, read_timeout=20)
-            snapshot["commands"][cmd] = output
-        except Exception as exc:
-            log.warning("Command failed (%s): %s", cmd, exc)
-            snapshot["commands"][cmd] = f"ERROR: {exc}"
-    return snapshot
+            peers[peer] = {"established": True, "prefixes": int(state)}
+        except ValueError:
+            peers[peer] = {"established": False, "state": state, "prefixes": 0}
+    return peers
 
 
-def write_snapshot(snapshot, path):
-    with open(path, "w") as fh:
-        json.dump(snapshot, fh, indent=2)
-    log.info("Snapshot saved to %s", path)
+def collect(conn, device_type: str) -> dict:
+    cmd = BGP_COMMANDS.get(device_type, "show ip bgp summary")
+    log.info("Sending: %s", cmd)
+    output = conn.send_command(cmd)
+    peers = parse_bgp_output(output)
+    if not peers:
+        log.warning("No BGP neighbors parsed — check device type or BGP config")
+    else:
+        log.info("Parsed %d neighbor(s)", len(peers))
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "host": conn.host,
+        "device_type": device_type,
+        "peers": peers,
+    }
 
 
-def load_snapshot(path):
-    try:
-        with open(path) as fh:
-            return json.load(fh)
-    except FileNotFoundError:
-        log.error("Baseline file not found: %s", path)
-        sys.exit(1)
+def compare(pre: dict, post: dict) -> int:
+    pre_peers, post_peers = pre["peers"], post["peers"]
+    issues = 0
 
-
-def diff_snapshots(before, after):
-    issues = []
-    for cmd in SNAPSHOT_COMMANDS:
-        pre = before["commands"].get(cmd, "")
-        post = after["commands"].get(cmd, "")
-        if pre == post:
+    for peer, ps in pre_peers.items():
+        if peer not in post_peers:
+            log.error("PEER MISSING post-change: %s", peer)
+            issues += 1
             continue
-        pre_lines = set(pre.splitlines())
-        post_lines = set(post.splitlines())
-        removed = pre_lines - post_lines
-        added = post_lines - pre_lines
-        if removed or added:
-            issues.append({
-                "command": cmd,
-                "removed": sorted(removed),
-                "added": sorted(added),
-            })
-    return issues
+
+        cs = post_peers[peer]
+        if ps["established"] and not cs["established"]:
+            log.error("SESSION DOWN: %s  was=Established  now=%s", peer, cs.get("state", "?"))
+            issues += 1
+        elif ps["established"] and cs["established"]:
+            delta = cs["prefixes"] - ps["prefixes"]
+            if delta < 0:
+                log.warning(
+                    "PREFIX DROP: %s  pre=%d  post=%d  delta=%d",
+                    peer, ps["prefixes"], cs["prefixes"], delta,
+                )
+                issues += 1
+            else:
+                log.info(
+                    "OK: %s  pre=%d  post=%d  delta=+%d",
+                    peer, ps["prefixes"], cs["prefixes"], delta,
+                )
+        else:
+            log.info("STILL DOWN (pre+post): %s  state=%s", peer, cs.get("state", "?"))
+
+    for peer in post_peers:
+        if peer not in pre_peers:
+            log.info("NEW PEER (not in baseline): %s", peer)
+
+    if issues:
+        log.error("%d issue(s) found — change validation FAILED", issues)
+    else:
+        log.info("All BGP sessions nominal — change validation PASSED")
+
+    return 1 if issues else 0
 
 
-def print_diff_report(before, after, issues):
-    print("\n" + "=" * 60)
-    print(f"  Change Validation Report")
-    print(f"  Host    : {after['host']}")
-    print(f"  Before  : {before['timestamp']}")
-    print(f"  After   : {after['timestamp']}")
-    print("=" * 60)
-    if not issues:
-        print("  PASS — no differences detected\n")
-        return True
-    print(f"  FAIL — {len(issues)} command(s) show differences\n")
-    for issue in issues:
-        print(f"  [{issue['command']}]")
-        for line in issue["removed"]:
-            if line.strip():
-                print(f"    - {line}")
-        for line in issue["added"]:
-            if line.strip():
-                print(f"    + {line}")
-        print()
-    return False
-
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Pre/post change snapshot diff for network devices")
+def build_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="BGP session state validator (pre/post change)")
     p.add_argument("--host", required=True, help="Device IP or hostname")
-    p.add_argument("--username", required=True, help="SSH username")
-    p.add_argument("--password", required=True, help="SSH password")
-    p.add_argument("--device-type", default="cisco_ios", help="Netmiko device type (default: cisco_ios)")
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument("--mode", required=True, choices=["snapshot", "diff"],
-                   help="snapshot: capture baseline; diff: compare against baseline")
-    p.add_argument("--output", default="snapshot.json", help="Output file for snapshot mode")
-    p.add_argument("--baseline", help="Baseline JSON file for diff mode")
+    p.add_argument("--username", required=True)
+    p.add_argument("--password", required=True)
+    p.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        choices=list(BGP_COMMANDS.keys()),
+        metavar="TYPE",
+        help="Netmiko device type (default: cisco_ios). Choices: " + ", ".join(BGP_COMMANDS),
+    )
+    p.add_argument("--port", type=int, default=22)
+    p.add_argument("--snapshot", metavar="FILE", help="Capture current state to FILE (pre-change)")
+    p.add_argument("--compare", metavar="FILE", help="Compare current state against FILE (post-change)")
     return p.parse_args()
 
 
 if __name__ == "__main__":
-    args = parse_args()
+    args = build_args()
 
-    if args.mode == "diff" and not args.baseline:
-        log.error("--baseline is required for diff mode")
-        sys.exit(1)
+    if not args.snapshot and not args.compare:
+        log.error("Provide --snapshot FILE to capture baseline or --compare FILE to validate.")
+        sys.exit(2)
 
-    conn = connect(args.host, args.username, args.password, args.device_type, args.port)
+    device = {
+        "device_type": args.device_type,
+        "host": args.host,
+        "username": args.username,
+        "password": args.password,
+        "port": args.port,
+    }
+
     try:
-        current = capture_snapshot(conn, args.host)
-    finally:
-        conn.disconnect()
+        log.info("Connecting to %s as %s", args.host, args.username)
+        with ConnectHandler(**device) as conn:
+            snapshot = collect(conn, args.device_type)
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed: %s", args.host)
+        sys.exit(2)
+    except NetmikoTimeoutException:
+        log.error("Connection timed out: %s", args.host)
+        sys.exit(2)
 
-    if args.mode == "snapshot":
-        write_snapshot(current, args.output)
-        log.info("Snapshot complete.")
+    if args.snapshot:
+        with open(args.snapshot, "w") as fh:
+            json.dump(snapshot, fh, indent=2)
+        log.info("Baseline saved to %s  (%d peer(s))", args.snapshot, len(snapshot["peers"]))
         sys.exit(0)
 
-    baseline = load_snapshot(args.baseline)
-    issues = diff_snapshots(baseline, current)
-    passed = print_diff_report(baseline, current, issues)
-    sys.exit(0 if passed else 2)
-```
+    with open(args.compare) as fh:
+        baseline = json.load(fh)
+
+    log.info("Baseline timestamp: %s", baseline.get("timestamp", "unknown"))
+    sys.exit(compare(baseline, snapshot))
