@@ -1,34 +1,41 @@
+The repo context is for the portfolio; I just need to output the script. Here it is:
+
 ```python
 """
-Port Bounce with Pre/Post State Validation
-==========================================
-Bounces one or more switch interfaces and verifies recovery by comparing
-pre/post MAC table entries, error counters, and operational state.
+mac_locator.py - MAC Address Table Lookup and Port Finder
 
-Use case: Clearing stuck MACs, resetting PoE devices, forcing LACP
-renegotiation — anywhere a simple shutdown/no-shutdown isn't enough
-and you need evidence the port actually recovered.
+Purpose:
+    Query the MAC address table on one or more switches to find which port(s)
+    a given MAC address (or list of MACs) is currently learned on. Useful for
+    quickly tracing end-device connectivity during incidents or audits.
+
+Usage:
+    # Locate a single MAC on one device
+    python mac_locator.py --host 10.0.0.1 --username admin --mac aa:bb:cc:dd:ee:ff
+
+    # Locate multiple MACs (comma-separated)
+    python mac_locator.py --host 10.0.0.1 --mac aa:bb:cc:dd:ee:ff,11:22:33:44:55:66
+
+    # Query all MACs in a file against a multi-device CSV inventory
+    python mac_locator.py --inventory switches.csv --mac-file macs.txt
+
+    # Dump the full MAC table with no filter
+    python mac_locator.py --host 10.0.0.1 --dump
+
+    Inventory CSV columns: host, username, password[, device_type, port, secret]
 
 Prerequisites:
     pip install netmiko
-
-Usage:
-    python 031_port_bounce.py -H 192.168.1.1 -u admin -p secret \
-        -i GigabitEthernet0/1 GigabitEthernet0/2 \
-        --device-type cisco_ios --wait 10 --timeout 30
-
-    # Bounce multiple ports from a file (one interface per line)
-    python 031_port_bounce.py -H 192.168.1.1 -u admin -p secret \
-        --interface-file ports.txt --wait 5
-
-Supported device types: cisco_ios, cisco_nxos, cisco_xe, cisco_xr
+    Supported device types: cisco_ios, cisco_nxos, arista_eos
 """
 
 import argparse
+import csv
+import getpass
 import logging
+import re
 import sys
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from netmiko import ConnectHandler
@@ -37,216 +44,204 @@ from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutExc
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
 
+MAC_COMMANDS = {
+    "cisco_ios": "show mac address-table",
+    "cisco_nxos": "show mac address-table",
+    "arista_eos": "show mac address-table",
+}
+
+# Matches: vlan  mac  type  [flags...]  port
+# Handles Cisco dotted (xxxx.xxxx.xxxx) and colon-delimited formats.
+_MAC_RE = re.compile(
+    r"^\s*\*?\s*(?P<vlan>\d+)\s+"
+    r"(?P<mac>"
+    r"[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}"
+    r"|(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}"
+    r")\s+\S+"
+    r"(?:\s+\S+)*?\s+"
+    r"(?P<port>(?:Gi|Fa|Te|Fo|Hu|Et|Po|Vl|Eth|TwG)\S+)"
+)
+
+
 @dataclass
-class PortState:
-    name: str
-    status: str = ""
-    err_input: int = 0
-    err_output: int = 0
-    mac_count: int = 0
-    raw_counters: str = ""
-    raw_mac: str = ""
-    error: str = ""
-    recovered: Optional[bool] = None
+class MacEntry:
+    device: str
+    vlan: str
+    mac: str
+    port: str
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Bounce switch ports with pre/post state validation"
+@dataclass
+class DeviceConfig:
+    host: str
+    username: str
+    password: str
+    device_type: str = "cisco_ios"
+    ssh_port: int = 22
+    secret: str = ""
+
+
+def normalize_mac(mac: str) -> str:
+    """Return MAC in Cisco dotted-hex form (aabb.ccdd.eeff)."""
+    digits = re.sub(r"[^0-9a-fA-F]", "", mac).lower()
+    if len(digits) != 12:
+        raise ValueError(f"Invalid MAC address: {mac!r}")
+    return f"{digits[0:4]}.{digits[4:8]}.{digits[8:12]}"
+
+
+def parse_mac_table(output: str, device_host: str) -> list[MacEntry]:
+    entries = []
+    for line in output.splitlines():
+        m = _MAC_RE.search(line)
+        if m:
+            entries.append(MacEntry(
+                device=device_host,
+                vlan=m.group("vlan"),
+                mac=normalize_mac(m.group("mac")),
+                port=m.group("port"),
+            ))
+    return entries
+
+
+def query_device(
+    device: DeviceConfig, target_macs: Optional[set[str]] = None
+) -> list[MacEntry]:
+    cmd = MAC_COMMANDS.get(device.device_type, "show mac address-table")
+    params = {
+        "device_type": device.device_type,
+        "host": device.host,
+        "username": device.username,
+        "password": device.password,
+        "port": device.ssh_port,
+    }
+    if device.secret:
+        params["secret"] = device.secret
+
+    try:
+        log.info("Connecting to %s (%s)", device.host, device.device_type)
+        with ConnectHandler(**params) as conn:
+            if device.secret:
+                conn.enable()
+            output = conn.send_command(cmd, read_timeout=30)
+        entries = parse_mac_table(output, device.host)
+        log.info("%s: %d entries parsed", device.host, len(entries))
+        if target_macs is not None:
+            entries = [e for e in entries if e.mac in target_macs]
+        return entries
+    except NetmikoAuthenticationException:
+        log.error("%s: authentication failed", device.host)
+    except NetmikoTimeoutException:
+        log.error("%s: connection timed out", device.host)
+    except Exception as exc:
+        log.error("%s: %s", device.host, exc)
+    return []
+
+
+def load_inventory(path: str) -> list[DeviceConfig]:
+    devices = []
+    with open(path, newline="") as fh:
+        for row in csv.DictReader(fh):
+            devices.append(DeviceConfig(
+                host=row["host"],
+                username=row["username"],
+                password=row["password"],
+                device_type=row.get("device_type", "cisco_ios"),
+                ssh_port=int(row.get("port", 22)),
+                secret=row.get("secret", ""),
+            ))
+    return devices
+
+
+def print_results(entries: list[MacEntry]) -> None:
+    if not entries:
+        print("No matching MAC entries found.")
+        return
+    col = (18, 6, 18, 24)
+    header = f"{'Device':<{col[0]}} {'VLAN':<{col[1]}} {'MAC':<{col[2]}} {'Port':<{col[3]}}"
+    print(header)
+    print("-" * len(header))
+    for e in sorted(entries, key=lambda x: (x.device, x.vlan, x.mac)):
+        print(f"{e.device:<{col[0]}} {e.vlan:<{col[1]}} {e.mac:<{col[2]}} {e.port:<{col[3]}}")
+    print(f"\n{len(entries)} entr{'y' if len(entries) == 1 else 'ies'} found.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Locate MAC addresses in switch MAC address tables.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Example: python mac_locator.py --host 10.0.0.1 --mac aabb.ccdd.eeff",
     )
-    parser.add_argument("-H", "--host", required=True, help="Device IP or hostname")
-    parser.add_argument("-u", "--username", required=True)
-    parser.add_argument("-p", "--password", required=True)
-    parser.add_argument(
+    p.add_argument("--host", help="Single device IP or hostname")
+    p.add_argument("--username", default="admin", help="SSH username")
+    p.add_argument("--password", default="", help="SSH password (prompted if omitted)")
+    p.add_argument("--secret", default="", help="Enable secret (Cisco)")
+    p.add_argument(
         "--device-type",
         default="cisco_ios",
-        choices=["cisco_ios", "cisco_nxos", "cisco_xe", "cisco_xr"],
+        choices=list(MAC_COMMANDS.keys()),
+        help="Netmiko device type (default: cisco_ios)",
     )
-    parser.add_argument(
-        "-i", "--interfaces", nargs="+", metavar="IFACE", help="Interface(s) to bounce"
-    )
-    parser.add_argument(
-        "--interface-file",
-        metavar="FILE",
-        help="File with one interface name per line",
-    )
-    parser.add_argument(
-        "--wait",
-        type=int,
-        default=8,
-        help="Seconds to wait between shutdown and no shutdown (default: 8)",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=30,
-        help="Seconds to wait for port to return UP after bounce (default: 30)",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Collect pre-state and print commands without executing",
-    )
-    return parser.parse_args()
-
-
-def load_interfaces(args: argparse.Namespace) -> list[str]:
-    ifaces: list[str] = []
-    if args.interfaces:
-        ifaces.extend(args.interfaces)
-    if args.interface_file:
-        try:
-            with open(args.interface_file) as fh:
-                ifaces.extend(
-                    line.strip() for line in fh if line.strip() and not line.startswith("#")
-                )
-        except OSError as exc:
-            log.error("Cannot read interface file: %s", exc)
-            sys.exit(1)
-    if not ifaces:
-        log.error("No interfaces specified. Use -i or --interface-file.")
-        sys.exit(1)
-    return ifaces
-
-
-def capture_state(conn, iface: str) -> PortState:
-    state = PortState(name=iface)
-    try:
-        status_out = conn.send_command(
-            f"show interfaces {iface} status", use_textfsm=False
-        )
-        state.status = "connected" if "connected" in status_out.lower() else "notconnect"
-
-        counters_out = conn.send_command(f"show interfaces {iface} counters errors")
-        state.raw_counters = counters_out
-        for line in counters_out.splitlines():
-            parts = line.split()
-            if "input" in line.lower() and len(parts) >= 2:
-                try:
-                    state.err_input = int(parts[-1].replace(",", ""))
-                except ValueError:
-                    pass
-            if "output" in line.lower() and len(parts) >= 2:
-                try:
-                    state.err_output = int(parts[-1].replace(",", ""))
-                except ValueError:
-                    pass
-
-        mac_out = conn.send_command(f"show mac address-table interface {iface}")
-        state.raw_mac = mac_out
-        state.mac_count = sum(
-            1 for line in mac_out.splitlines()
-            if line.strip() and not line.startswith("Mac") and not line.startswith("-") and not line.startswith("Vlan")
-        )
-    except Exception as exc:
-        state.error = str(exc)
-        log.warning("[%s] State capture error: %s", iface, exc)
-    return state
-
-
-def bounce_port(conn, iface: str, wait: int, dry_run: bool) -> None:
-    commands = [
-        f"interface {iface}",
-        "shutdown",
-    ]
-    log.info("[%s] Sending shutdown...", iface)
-    if not dry_run:
-        conn.send_config_set(commands)
-        time.sleep(wait)
-    else:
-        log.info("[%s] DRY-RUN: would sleep %ds then send no shutdown", iface, wait)
-        return
-
-    commands_up = [f"interface {iface}", "no shutdown"]
-    log.info("[%s] Sending no shutdown...", iface)
-    conn.send_config_set(commands_up)
-
-
-def wait_for_recovery(conn, iface: str, timeout: int) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        out = conn.send_command(f"show interfaces {iface} status")
-        if "connected" in out.lower():
-            return True
-        time.sleep(2)
-    return False
-
-
-def print_summary(pre: PortState, post: PortState) -> None:
-    delta_in = post.err_input - pre.err_input
-    delta_out = post.err_output - pre.err_output
-    mac_diff = post.mac_count - pre.mac_count
-
-    status_icon = "OK" if post.recovered else "FAIL"
-    log.info(
-        "[%s] %s | status=%s | new_errs_in=%d new_errs_out=%d | "
-        "mac_delta=%+d (%d->%d)",
-        post.name, status_icon, post.status,
-        delta_in, delta_out,
-        mac_diff, pre.mac_count, post.mac_count,
-    )
-    if delta_in > 0 or delta_out > 0:
-        log.warning("[%s] New errors detected after bounce — investigate.", post.name)
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("--inventory", help="CSV inventory file for multi-device lookups")
+    p.add_argument("--mac", help="MAC address(es) to locate, comma-separated")
+    p.add_argument("--mac-file", help="File containing one MAC per line")
+    p.add_argument("--dump", action="store_true", help="Dump full MAC table (no filter)")
+    p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    return p
 
 
 def main() -> int:
-    args = parse_args()
-    interfaces = load_interfaces(args)
+    args = build_parser().parse_args()
 
-    device = {
-        "device_type": args.device_type,
-        "host": args.host,
-        "username": args.username,
-        "password": args.password,
-        "timeout": 20,
-    }
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    try:
-        log.info("Connecting to %s (%s)...", args.host, args.device_type)
-        conn = ConnectHandler(**device)
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.host)
-        return 1
-    except NetmikoTimeoutException:
-        log.error("Connection timed out to %s", args.host)
+    if not args.host and not args.inventory:
+        print("ERROR: --host or --inventory is required.", file=sys.stderr)
         return 1
 
-    pre_states: list[PortState] = []
-    post_states: list[PortState] = []
-    overall_ok = True
+    target_macs: Optional[set[str]] = None
+    if not args.dump:
+        raw: list[str] = []
+        if args.mac:
+            raw.extend(m.strip() for m in args.mac.split(",") if m.strip())
+        if args.mac_file:
+            with open(args.mac_file) as fh:
+                raw.extend(line.strip() for line in fh if line.strip())
+        if not raw:
+            print("ERROR: provide --mac, --mac-file, or --dump.", file=sys.stderr)
+            return 1
+        try:
+            target_macs = {normalize_mac(m) for m in raw}
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        log.info("Looking for: %s", ", ".join(sorted(target_macs)))
 
-    try:
-        for iface in interfaces:
-            log.info("[%s] Capturing pre-bounce state...", iface)
-            pre = capture_state(conn, iface)
-            pre_states.append(pre)
+    if args.inventory:
+        devices = load_inventory(args.inventory)
+    else:
+        pw = args.password or getpass.getpass(f"Password for {args.host}: ")
+        devices = [DeviceConfig(
+            host=args.host,
+            username=args.username,
+            password=pw,
+            device_type=args.device_type,
+            ssh_port=args.port,
+            secret=args.secret,
+        )]
 
-        for pre in pre_states:
-            bounce_port(conn, pre.name, args.wait, args.dry_run)
+    all_entries: list[MacEntry] = []
+    for dev in devices:
+        all_entries.extend(query_device(dev, target_macs))
 
-        if not args.dry_run:
-            for pre in pre_states:
-                log.info("[%s] Waiting up to %ds for recovery...", pre.name, args.timeout)
-                recovered = wait_for_recovery(conn, pre.name, args.timeout)
-                if not recovered:
-                    log.error("[%s] Port did not return to connected state.", pre.name)
-                    overall_ok = False
-
-                post = capture_state(conn, pre.name)
-                post.recovered = recovered
-                post_states.append(post)
-                print_summary(pre, post)
-        else:
-            log.info("Dry-run complete. No changes made.")
-    finally:
-        conn.disconnect()
-
-    return 0 if overall_ok else 2
+    print_results(all_entries)
+    return 0 if all_entries else 2
 
 
 if __name__ == "__main__":
