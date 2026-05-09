@@ -1,197 +1,214 @@
-```python
-#!/usr/bin/env python3
-"""
-Device Configuration Backup Script
+Here's the script — you can save it as `boot_integrity_check.py` in your repo:
 
-Connects to network devices, backs up running configurations with timestamps,
-stores versioned backups, and reports configuration changes. Useful for change
-tracking, audit compliance, and configuration versioning.
+```python
+"""
+boot_integrity_check.py — Boot variable and flash integrity auditor
+
+Verifies pre-upgrade readiness: boot variables, flash image presence, MD5
+hash validation, and available memory thresholds. Complements firmware_check.py
+(which compares running vs target versions) by auditing the boot environment
+*before* a planned upgrade.
 
 Usage:
-    python backup_config.py --host 192.168.1.1 --device-type cisco_ios \\
-        --username admin --password secret --backup-dir ./backups
-
-    python backup_config.py --host 192.168.1.1 --device-type cisco_ios \\
-        --username admin --password secret --backup-dir ./backups --show-diff
+    python boot_integrity_check.py -d 192.168.1.1 -u admin -p secret
+    python boot_integrity_check.py -d 192.168.1.1 -u admin -p secret \
+        --image c2960x-universalk9-mz.152-7.E5.bin \
+        --min-flash-mb 256 --min-ram-mb 512 --verify-md5
 
 Prerequisites:
-    - netmiko library installed (pip install netmiko)
-    - Network connectivity to target devices
-    - Appropriate credentials with read privileges
-    - SSH or Telnet enabled on devices
+    pip install netmiko
+    Target device: Cisco IOS/IOS-XE (show boot, dir flash:, show version)
 """
 
 import argparse
 import logging
-import os
+import re
 import sys
-from datetime import datetime
-from pathlib import Path
-from difflib import unified_diff
 
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoTimeoutException, AuthenticationException
-
+from netmiko.exceptions import AuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-def backup_device_config(device_params, backup_dir):
-    """
-    Backup running configuration from network device.
-
-    Args:
-        device_params (dict): Connection parameters for netmiko
-        backup_dir (str): Directory to store backups
-
-    Returns:
-        tuple: (config_content, backup_file_path) or (None, None) on failure
-    """
-    try:
-        logger.info(f"Connecting to {device_params['host']}...")
-        connection = ConnectHandler(**device_params)
-        logger.info(f"Successfully connected to {device_params['host']}")
-
-        logger.info("Retrieving running configuration...")
-        running_config = connection.send_command("show running-config")
-        connection.disconnect()
-
-        if not running_config:
-            logger.error("Failed to retrieve running configuration")
-            return None, None
-
-        os.makedirs(backup_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        hostname = device_params['host'].replace('.', '_')
-        backup_file = Path(backup_dir) / f"{hostname}_{timestamp}.conf"
-
-        backup_file.write_text(running_config)
-        logger.info(f"Configuration backed up to {backup_file}")
-
-        return running_config, backup_file
-
-    except AuthenticationException as e:
-        logger.error(f"Authentication failed: {e}")
-        return None, None
-    except NetmikoTimeoutException as e:
-        logger.error(f"Connection timeout: {e}")
-        return None, None
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        return None, None
-
-
-def get_previous_backup(backup_dir, hostname):
-    """
-    Find the most recent previous backup for comparison.
-
-    Args:
-        backup_dir (str): Directory containing backups
-        hostname (str): Sanitized hostname identifier
-
-    Returns:
-        str: Content of previous backup or None
-    """
-    backup_path = Path(backup_dir)
-    if not backup_path.exists():
-        return None
-
-    backups = sorted(backup_path.glob(f"{hostname}_*.conf"))
-    if len(backups) < 2:
-        return None
-
-    try:
-        return backups[-2].read_text()
-    except Exception as e:
-        logger.warning(f"Could not read previous backup: {e}")
-        return None
-
-
-def generate_config_diff(old_config, new_config, hostname):
-    """
-    Generate unified diff between configurations.
-
-    Args:
-        old_config (str): Previous configuration
-        new_config (str): Current configuration
-        hostname (str): Device hostname for logging
-
-    Returns:
-        str: Diff output or empty string if no changes
-    """
-    if not old_config:
-        logger.info(f"No previous backup found for {hostname}")
-        return ""
-
-    old_lines = old_config.splitlines(keepends=True)
-    new_lines = new_config.splitlines(keepends=True)
-
-    diff = unified_diff(old_lines, new_lines,
-                       fromfile=f"{hostname}_previous",
-                       tofile=f"{hostname}_current",
-                       lineterm='')
-
-    diff_output = ''.join(diff)
-    if diff_output:
-        logger.info(f"Configuration changes detected on {hostname}")
-    else:
-        logger.info(f"No configuration changes on {hostname}")
-
-    return diff_output
-
-
-def main():
+def parse_args():
     parser = argparse.ArgumentParser(
-        description="Backup network device running configurations"
+        description="Audit boot variables and flash integrity before firmware upgrades"
     )
-    parser.add_argument('--host', required=True,
-                        help='Device IP or hostname')
-    parser.add_argument('--device-type', required=True,
-                        help='Netmiko device type (cisco_ios, arista_eos, etc)')
-    parser.add_argument('--username', required=True,
-                        help='SSH username')
-    parser.add_argument('--password', required=True,
-                        help='SSH password')
-    parser.add_argument('--port', type=int, default=22,
-                        help='SSH port (default: 22)')
-    parser.add_argument('--backup-dir', default='./backups',
-                        help='Directory for backup storage (default: ./backups)')
-    parser.add_argument('--show-diff', action='store_true',
-                        help='Display config diff from previous backup')
+    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", required=True)
+    parser.add_argument("--secret", default="", help="Enable secret (if required)")
+    parser.add_argument("--device-type", default="cisco_ios")
+    parser.add_argument(
+        "--image", help="Expected flash image filename to verify presence"
+    )
+    parser.add_argument(
+        "--min-flash-mb", type=int, default=64,
+        help="Minimum free flash space in MB (default: 64)"
+    )
+    parser.add_argument(
+        "--min-ram-mb", type=int, default=256,
+        help="Minimum free RAM in MB (default: 256)"
+    )
+    parser.add_argument(
+        "--verify-md5", action="store_true",
+        help="Run verify /md5 on the target image (slow on large images)"
+    )
+    parser.add_argument(
+        "--expected-md5", help="Expected MD5 hash to compare against"
+    )
+    return parser.parse_args()
 
-    args = parser.parse_args()
 
-    device_params = {
-        'device_type': args.device_type,
-        'host': args.host,
-        'username': args.username,
-        'password': args.password,
-        'port': args.port,
-        'timeout': 30,
+def get_boot_vars(conn):
+    output = conn.send_command("show boot")
+    boot_path = re.search(r"BOOT variable\s*=\s*(\S+)", output, re.IGNORECASE)
+    return boot_path.group(1) if boot_path else None
+
+
+def parse_flash_contents(conn):
+    output = conn.send_command("dir flash:")
+    files = []
+    for line in output.splitlines():
+        m = re.match(r"\s*\d+\s+[-drwx]+\s+(\d+)\s+\S+\s+\S+\s+(.+)", line)
+        if m:
+            files.append({"size_bytes": int(m.group(1)), "name": m.group(2).strip()})
+
+    free_match = re.search(r"(\d+)\s+bytes free", output)
+    free_bytes = int(free_match.group(1)) if free_match else 0
+    return files, free_bytes
+
+
+def parse_memory(conn):
+    output = conn.send_command("show version")
+    m = re.search(r"with\s+(\d+)K[/\w]*/(\d+)K bytes of memory", output, re.IGNORECASE)
+    if m:
+        return int(m.group(1)) // 1024, int(m.group(2)) // 1024
+    m = re.search(r"(\d+)K bytes of physical memory", output, re.IGNORECASE)
+    if m:
+        total_mb = int(m.group(1)) // 1024
+        return total_mb, total_mb
+    return None, None
+
+
+def verify_image_md5(conn, image_path, expected_md5=None):
+    log.info("Running MD5 verification on %s (may take 1-2 minutes)...", image_path)
+    output = conn.send_command(
+        f"verify /md5 {image_path}", read_timeout=180
+    )
+    m = re.search(r"MD5 of\s+\S+\s+=\s+([0-9a-fA-F]{32})", output)
+    computed = m.group(1).lower() if m else None
+    if expected_md5 and computed:
+        return computed, computed == expected_md5.lower()
+    return computed, None
+
+
+def run_audit(args):
+    device = {
+        "device_type": args.device_type,
+        "host": args.device,
+        "username": args.username,
+        "password": args.password,
+        "secret": args.secret,
     }
 
-    config, backup_path = backup_device_config(device_params, args.backup_dir)
+    results = {"device": args.device, "checks": [], "passed": True}
 
-    if not config:
-        logger.error("Backup failed")
+    def record(label, ok, detail=""):
+        status = "PASS" if ok else "FAIL"
+        results["checks"].append({"check": label, "status": status, "detail": detail})
+        if not ok:
+            results["passed"] = False
+        log.info("[%s] %s%s", status, label, f" — {detail}" if detail else "")
+
+    try:
+        log.info("Connecting to %s...", args.device)
+        with ConnectHandler(**device) as conn:
+            if args.secret:
+                conn.enable()
+
+            boot_var = get_boot_vars(conn)
+            record(
+                "Boot variable set",
+                bool(boot_var),
+                boot_var or "No BOOT variable found"
+            )
+
+            flash_files, free_bytes = parse_flash_contents(conn)
+            free_mb = free_bytes // (1024 * 1024)
+            record(
+                "Flash free space",
+                free_mb >= args.min_flash_mb,
+                f"{free_mb} MB free (threshold: {args.min_flash_mb} MB)"
+            )
+
+            if args.image:
+                names = [f["name"] for f in flash_files]
+                image_present = any(args.image in n for n in names)
+                record("Target image present", image_present, args.image)
+
+                if image_present and args.verify_md5:
+                    image_path = f"flash:{args.image}"
+                    computed, match = verify_image_md5(
+                        conn, image_path, args.expected_md5
+                    )
+                    if args.expected_md5:
+                        record(
+                            "MD5 hash match",
+                            match is True,
+                            f"computed={computed}, expected={args.expected_md5.lower()}"
+                        )
+                    else:
+                        record("MD5 computed", bool(computed), computed or "failed")
+
+            total_mb, free_ram_mb = parse_memory(conn)
+            if total_mb is not None:
+                record(
+                    "RAM meets threshold",
+                    total_mb >= args.min_ram_mb,
+                    f"{total_mb} MB total (threshold: {args.min_ram_mb} MB)"
+                )
+
+    except AuthenticationException:
+        log.error("Authentication failed for %s", args.device)
+        sys.exit(1)
+    except NetmikoTimeoutException:
+        log.error("Connection timed out to %s", args.device)
         sys.exit(1)
 
-    if args.show_diff:
-        hostname = args.host.replace('.', '_')
-        previous = get_previous_backup(args.backup_dir, hostname)
-        diff = generate_config_diff(previous, config, args.host)
+    return results
 
-        if diff:
-            print("\n--- Configuration Differences ---")
-            print(diff)
 
-    logger.info("Backup completed successfully")
+def print_summary(results):
+    print("\n" + "=" * 60)
+    print(f"Boot Integrity Report — {results['device']}")
+    print("=" * 60)
+    for check in results["checks"]:
+        marker = "+" if check["status"] == "PASS" else "!"
+        print(f"  [{marker}] {check['check']}: {check['detail']}")
+    overall = "READY" if results["passed"] else "NOT READY"
+    print(f"\nOverall: {overall}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    results = run_audit(args)
+    print_summary(results)
+    sys.exit(0 if results["passed"] else 1)
 ```
+
+This is `boot_integrity_check.py` — it audits the *boot environment* rather than comparing version strings, which is what the existing firmware_check scripts do. Key distinctions:
+
+- Checks `BOOT variable` is actually set (a common pre-upgrade miss)
+- Verifies the target image filename exists in flash before upgrade
+- Optionally runs `verify /md5` with optional hash comparison for image integrity
+- Parses free flash space and total RAM against configurable thresholds
+- Exits 0/1 so it can gate CI/change-window scripts
+- `--verify-md5` flag is opt-in since it can take 1-2 minutes on large images
