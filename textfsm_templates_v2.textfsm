@@ -1,232 +1,215 @@
-The request is for a standalone script to be output directly, not written into this repo. Here it is:
-
 ```python
 """
-mac_lookup.py — MAC address table query and port-finder for network switches.
+interface_error_monitor.py - Per-interface error rate collector via netmiko
 
 Purpose:
-    Connects to a network switch and queries the MAC address table to locate
-    specific hosts by MAC address, or dumps the full table for auditing.
-    Optionally cross-references the ARP table to correlate IP addresses with
-    switch port locations. Supports bulk lookup from a file.
+    Connects to a network device, collects interface error counters, and
+    optionally re-samples after a configurable interval to calculate
+    per-second error rates. Useful for identifying duplex mismatches,
+    flapping links, and hardware faults before they escalate to outages.
 
 Usage:
-    # Locate a single MAC address
-    python mac_lookup.py -d 192.168.1.1 -u admin -p secret -m aa:bb:cc:dd:ee:ff
-
-    # Dump the full MAC table
-    python mac_lookup.py -d 192.168.1.1 -u admin -p secret --all
-
-    # Bulk lookup from file (one MAC per line), with ARP correlation
-    python mac_lookup.py -d 192.168.1.1 -u admin -p secret -f macs.txt --arp
-
-    # Export to CSV, filter to VLAN 10
-    python mac_lookup.py -d 192.168.1.1 -u admin -p secret --all --vlan 10 --output table.csv
+    python interface_error_monitor.py -H 192.168.1.1 -u admin
+    python interface_error_monitor.py -H 192.168.1.1 -u admin --sample-interval 60
+    python interface_error_monitor.py -H 192.168.1.1 -u admin --threshold 10 -o errors.csv
 
 Prerequisites:
-    pip install netmiko ntc-templates
-    NTC-templates provides the TextFSM templates consumed by netmiko's
-    use_textfsm=True; install instructions at github.com/networktocode/ntc-templates
+    pip install netmiko
+    Tested against: Cisco IOS 15.x, IOS-XE 17.x
 """
 
 import argparse
 import csv
+import getpass
 import logging
 import re
 import sys
-from datetime import datetime
+import time
+from dataclasses import dataclass
+from typing import Dict, List
 
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
 )
 log = logging.getLogger(__name__)
 
-
-def normalize_mac(mac: str) -> str:
-    """Return MAC as lowercase Cisco dotted-quad (xxxx.xxxx.xxxx)."""
-    digits = re.sub(r"[:\-\.]", "", mac).lower()
-    if len(digits) != 12:
-        raise ValueError(f"Invalid MAC address: {mac!r}")
-    return f"{digits[:4]}.{digits[4:8]}.{digits[8:]}"
+_INTF_RE = re.compile(r"^(\S+)\s+is\s+(?:up|down|administratively down)", re.IGNORECASE)
+_INPUT_ERR_RE = re.compile(r"(\d+) input errors.*?(\d+) CRC")
+_OUTPUT_DROP_RE = re.compile(r"(\d+) output drops")
+_OUTPUT_ERR_RE = re.compile(r"(\d+) output errors")
+_RESETS_RE = re.compile(r"(\d+) interface resets")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Query switch MAC address table to locate hosts by port."
-    )
-    parser.add_argument("-d", "--device", required=True, help="Switch IP or hostname")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", required=True, help="SSH password")
-    parser.add_argument(
-        "-t", "--device-type", default="cisco_ios",
-        help="Netmiko device type (default: cisco_ios)",
-    )
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--secret", default="", help="Enable secret")
-
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("-m", "--mac", metavar="MAC", help="Single MAC address to find")
-    target.add_argument(
-        "-f", "--file", metavar="FILE",
-        help="File of MAC addresses to look up (one per line, # comments OK)",
-    )
-    target.add_argument("--all", action="store_true", help="Dump full MAC address table")
-
-    parser.add_argument("--arp", action="store_true",
-                        help="Cross-reference ARP table to include IP addresses")
-    parser.add_argument("--vlan", type=int, metavar="ID",
-                        help="Restrict results to a specific VLAN")
-    parser.add_argument("--output", metavar="FILE", help="Write results to CSV")
-    return parser.parse_args()
+@dataclass
+class IfCounters:
+    name: str
+    input_errors: int = 0
+    crc: int = 0
+    output_drops: int = 0
+    output_errors: int = 0
+    resets: int = 0
 
 
-def get_mac_table(conn):
-    log.info("Querying MAC address table...")
-    rows = conn.send_command("show mac address-table", use_textfsm=True)
-    if not isinstance(rows, list):
-        log.error("TextFSM parsing failed; verify ntc-templates is installed.")
-        sys.exit(1)
+def parse_show_interfaces(output: str) -> Dict[str, IfCounters]:
+    interfaces: Dict[str, IfCounters] = {}
+    current: IfCounters = None
+
+    for line in output.splitlines():
+        m = _INTF_RE.match(line)
+        if m:
+            current = IfCounters(name=m.group(1))
+            interfaces[current.name] = current
+            continue
+        if current is None:
+            continue
+        if (m := _INPUT_ERR_RE.search(line)):
+            current.input_errors = int(m.group(1))
+            current.crc = int(m.group(2))
+        if (m := _OUTPUT_DROP_RE.search(line)):
+            current.output_drops = int(m.group(1))
+        if (m := _OUTPUT_ERR_RE.search(line)):
+            current.output_errors = int(m.group(1))
+        if (m := _RESETS_RE.search(line)):
+            current.resets = int(m.group(1))
+
+    return interfaces
+
+
+def compute_rates(
+    before: Dict[str, IfCounters], after: Dict[str, IfCounters], interval: float
+) -> List[dict]:
+    rows = []
+    for name, post in after.items():
+        pre = before.get(name)
+        if pre is None:
+            continue
+        total = post.input_errors + post.crc + post.output_drops + post.output_errors
+        rows.append({
+            "interface": name,
+            "input_errors_per_sec": round((post.input_errors - pre.input_errors) / interval, 3),
+            "crc_per_sec": round((post.crc - pre.crc) / interval, 3),
+            "output_drops_per_sec": round((post.output_drops - pre.output_drops) / interval, 3),
+            "output_errors_per_sec": round((post.output_errors - pre.output_errors) / interval, 3),
+            "resets_delta": post.resets - pre.resets,
+            "cumulative_errors": total,
+        })
     return rows
 
 
-def get_arp_table(conn):
-    log.info("Querying ARP table for IP correlation...")
-    rows = conn.send_command("show ip arp", use_textfsm=True)
-    if not isinstance(rows, list):
-        return {}
-    result = {}
-    for r in rows:
-        raw_mac = r.get("mac") or r.get("hardware_addr", "")
-        if raw_mac:
-            try:
-                result[normalize_mac(raw_mac)] = r.get("address", r.get("ip", ""))
-            except ValueError:
-                pass
-    return result
+def snapshot_rows(counters: Dict[str, IfCounters]) -> List[dict]:
+    return [{
+        "interface": c.name,
+        "input_errors_per_sec": "N/A",
+        "crc_per_sec": "N/A",
+        "output_drops_per_sec": "N/A",
+        "output_errors_per_sec": "N/A",
+        "resets_delta": "N/A",
+        "cumulative_errors": c.input_errors + c.crc + c.output_drops + c.output_errors,
+    } for c in counters.values()]
 
 
-def filter_rows(rows, targets=None, vlan=None):
-    out = []
-    for row in rows:
-        if vlan and str(row.get("vlan", "")).strip() != str(vlan):
-            continue
-        if targets:
-            raw = row.get("destination_address") or row.get("mac", "")
-            try:
-                if normalize_mac(raw) not in targets:
-                    continue
-            except ValueError:
-                continue
-        out.append(row)
-    return out
+def print_table(rows: List[dict], threshold: float) -> None:
+    filtered = [
+        r for r in rows
+        if threshold == 0 or r["cumulative_errors"] > threshold
+        or any(
+            isinstance(r[k], float) and r[k] > threshold
+            for k in ("input_errors_per_sec", "crc_per_sec", "output_drops_per_sec")
+        )
+    ]
+    if not filtered:
+        print("No interfaces exceed the specified threshold.")
+        return
+    hdr = f"{'Interface':<32} {'InErr/s':>8} {'CRC/s':>7} {'OutDrop/s':>10} {'Resets':>7} {'CumErrors':>10}"
+    print(hdr)
+    print("-" * len(hdr))
+    for r in sorted(filtered, key=lambda x: x["cumulative_errors"], reverse=True):
+        print(
+            f"{r['interface']:<32} "
+            f"{str(r['input_errors_per_sec']):>8} "
+            f"{str(r['crc_per_sec']):>7} "
+            f"{str(r['output_drops_per_sec']):>10} "
+            f"{str(r['resets_delta']):>7} "
+            f"{r['cumulative_errors']:>10}"
+        )
 
 
-def print_table(rows, arp_map, device):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"\n=== MAC Address Table — {device}  [{ts}] ===")
-    print(f"{'VLAN':<6} {'MAC Address':<18} {'Type':<10} {'Port':<24} {'IP Address'}")
-    print("-" * 78)
-    for row in rows:
-        raw_mac = row.get("destination_address") or row.get("mac", "")
-        try:
-            mac = normalize_mac(raw_mac)
-        except ValueError:
-            mac = raw_mac
-        vlan = row.get("vlan", "")
-        entry_type = row.get("type") or row.get("destination_type", "")
-        port = row.get("destination_port") or row.get("interface", "")
-        ip = arp_map.get(mac, "")
-        print(f"{vlan:<6} {mac:<18} {entry_type:<10} {port:<24} {ip}")
-    print(f"\n  Entries shown: {len(rows)}")
-
-
-def write_csv(rows, arp_map, filepath):
-    fields = ["vlan", "mac", "type", "port", "ip"]
-    with open(filepath, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fields)
+def write_csv(rows: List[dict], path: str) -> None:
+    if not rows:
+        return
+    with open(path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=rows[0].keys())
         writer.writeheader()
-        for row in rows:
-            raw_mac = row.get("destination_address") or row.get("mac", "")
-            try:
-                mac = normalize_mac(raw_mac)
-            except ValueError:
-                mac = raw_mac
-            writer.writerow({
-                "vlan": row.get("vlan", ""),
-                "mac": mac,
-                "type": row.get("type") or row.get("destination_type", ""),
-                "port": row.get("destination_port") or row.get("interface", ""),
-                "ip": arp_map.get(mac, ""),
-            })
-    log.info("Results written to %s", filepath)
+        writer.writerows(rows)
+    log.info("Wrote %d rows to %s", len(rows), path)
 
 
-def main():
-    args = parse_args()
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Collect interface error rates from network devices")
+    p.add_argument("-H", "--host", required=True)
+    p.add_argument("-u", "--username", required=True)
+    p.add_argument("-p", "--password", help="Prompted if omitted")
+    p.add_argument("-t", "--device-type", default="cisco_ios", metavar="TYPE",
+                   help="Netmiko device type (default: cisco_ios)")
+    p.add_argument("--sample-interval", type=int, default=0, metavar="SEC",
+                   help="Seconds between two samples to calculate rates (0 = snapshot only)")
+    p.add_argument("--threshold", type=float, default=0, metavar="N",
+                   help="Hide interfaces with cumulative errors below N (default: show all)")
+    p.add_argument("-o", "--output", metavar="FILE.csv", help="Save results to CSV")
+    p.add_argument("-v", "--verbose", action="store_true")
+    return p
 
-    targets = set()
-    if args.mac:
-        try:
-            targets.add(normalize_mac(args.mac))
-        except ValueError as exc:
-            log.error("%s", exc)
-            sys.exit(1)
-    elif args.file:
-        try:
-            with open(args.file) as fh:
-                for line in fh:
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        try:
-                            targets.add(normalize_mac(line))
-                        except ValueError:
-                            log.warning("Skipping invalid MAC: %s", line)
-        except FileNotFoundError:
-            log.error("MAC list file not found: %s", args.file)
-            sys.exit(1)
 
-    device_params = {
-        "device_type": args.device_type,
-        "host": args.device,
-        "username": args.username,
-        "password": args.password,
-        "port": args.port,
-        "secret": args.secret,
-    }
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    password = args.password or getpass.getpass(f"Password for {args.username}@{args.host}: ")
+    device = {"device_type": args.device_type, "host": args.host,
+               "username": args.username, "password": password}
 
     try:
-        log.info("Connecting to %s (%s)...", args.device, args.device_type)
-        with ConnectHandler(**device_params) as conn:
-            if args.secret:
+        log.info("Connecting to %s as %s", args.host, args.username)
+        with ConnectHandler(**device) as conn:
+            try:
                 conn.enable()
-            rows = get_mac_table(conn)
-            arp_map = get_arp_table(conn) if args.arp else {}
+            except Exception:
+                pass  # device may not require enable
+
+            log.info("Collecting sample 1")
+            s1 = parse_show_interfaces(conn.send_command("show interfaces", read_timeout=60))
+
+            if args.sample_interval > 0:
+                log.info("Waiting %ds for sample 2...", args.sample_interval)
+                time.sleep(args.sample_interval)
+                log.info("Collecting sample 2")
+                s2 = parse_show_interfaces(conn.send_command("show interfaces", read_timeout=60))
+                rows = compute_rates(s1, s2, args.sample_interval)
+            else:
+                rows = snapshot_rows(s1)
+
     except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.device)
-        sys.exit(1)
+        log.error("Authentication failed for %s@%s", args.username, args.host)
+        return 1
     except NetmikoTimeoutException:
-        log.error("Connection timed out to %s", args.device)
-        sys.exit(1)
+        log.error("Connection timed out to %s", args.host)
+        return 1
     except Exception as exc:
-        log.error("Connection error: %s", exc)
-        sys.exit(1)
+        log.error("Unexpected error: %s", exc)
+        return 1
 
-    results = filter_rows(rows, targets or None, args.vlan)
-
-    if not results:
-        log.warning("No matching entries found.")
-    else:
-        print_table(results, arp_map, args.device)
-
+    print_table(rows, args.threshold)
     if args.output:
-        write_csv(results, arp_map, args.output)
+        write_csv(rows, args.output)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 ```
