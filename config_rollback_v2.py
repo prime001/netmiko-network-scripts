@@ -1,37 +1,39 @@
-The output is the script content itself:
-
 ```python
 """
-interface_error_monitor.py - Interface Error Rate Monitor
+interface_stats.py - Interface Error Counter Monitor
 
-Connects to a Cisco IOS/IOS-XE device via SSH, samples interface error counters
-twice across a configurable interval, calculates per-second error rates, and
-reports any interface exceeding defined thresholds.
-
-Useful for post-change validation, overnight baselining, or triage when users
-report intermittent packet loss without a clear fault source.
+Purpose:
+    Polls interface error counters (CRC, input errors, output drops, interface
+    resets) from Cisco IOS/IOS-XE/NX-OS devices and reports interfaces that
+    exceed configured thresholds. Useful for identifying degraded physical links
+    before they cause outages or SLA violations.
 
 Usage:
-    python interface_error_monitor.py -H 192.168.1.1 -u admin -p secret
-    python interface_error_monitor.py -H 192.168.1.1 -u admin -p secret \\
-        --device-type cisco_ios --interval 60 --samples 3 \\
-        --in-err-threshold 5 --out-err-threshold 5 --crc-threshold 1
+    # Flag interfaces with any CRC errors
+    python interface_stats.py --host 10.0.0.1 -u admin -p secret
+
+    # Custom thresholds
+    python interface_stats.py --host 10.0.0.1 -u admin -p secret \
+        --threshold-crc 5 --threshold-drops 50
+
+    # Report all interfaces as JSON (useful for piping to monitoring systems)
+    python interface_stats.py --host 10.0.0.1 -u admin -p secret --all --json
 
 Prerequisites:
     pip install netmiko
-    SSH must be enabled on the target device.
-    Credentials require at minimum privilege-1 (show access).
+    Device must support 'show interfaces' (tested on IOS 15.x, IOS-XE 17.x, NX-OS 9.x)
 """
 
 import argparse
+import json
 import logging
 import re
 import sys
-import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
 
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,199 +44,187 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class InterfaceCounters:
+class InterfaceStats:
     name: str
+    status: str = "unknown"
+    crc_errors: int = 0
     input_errors: int = 0
-    output_errors: int = 0
-    crc: int = 0
-    input_drops: int = 0
     output_drops: int = 0
+    resets: int = 0
+    violations: list = field(default_factory=list)
 
 
-def parse_show_interfaces(output: str) -> Dict[str, InterfaceCounters]:
-    """Parse 'show interfaces' output into per-interface counter snapshots."""
-    counters: Dict[str, InterfaceCounters] = {}
-    current: Optional[str] = None
+def parse_show_interfaces(output: str) -> list:
+    interfaces = []
+    current = None
 
-    iface_re = re.compile(r"^(\S+) is (?:up|down|administratively down)")
-    in_err_re = re.compile(r"(\d+) input errors.*?(\d+) CRC", re.IGNORECASE)
-    out_err_re = re.compile(r"(\d+) output errors", re.IGNORECASE)
-    in_drop_re = re.compile(r"Input queue: \d+/\d+/(\d+)/", re.IGNORECASE)
-    out_drop_re = re.compile(r"Total output drops: (\d+)", re.IGNORECASE)
+    intf_re = re.compile(r"^(\S+) is (up|down|administratively down)")
+    crc_re = re.compile(r"(\d+) CRC")
+    input_err_re = re.compile(r"(\d+) input errors")
+    output_drop_re = re.compile(r"(\d+) output drops")
+    reset_re = re.compile(r"(\d+) resets")
 
     for line in output.splitlines():
-        m = iface_re.match(line)
+        m = intf_re.match(line)
         if m:
-            current = m.group(1)
-            counters[current] = InterfaceCounters(name=current)
+            if current:
+                interfaces.append(current)
+            current = InterfaceStats(name=m.group(1), status=m.group(2))
             continue
 
         if current is None:
             continue
 
-        m = in_err_re.search(line)
-        if m:
-            counters[current].input_errors = int(m.group(1))
-            counters[current].crc = int(m.group(2))
-            continue
+        for pattern, attr in [
+            (crc_re, "crc_errors"),
+            (input_err_re, "input_errors"),
+            (output_drop_re, "output_drops"),
+            (reset_re, "resets"),
+        ]:
+            m = pattern.search(line)
+            if m:
+                setattr(current, attr, int(m.group(1)))
 
-        m = out_err_re.search(line)
-        if m:
-            counters[current].output_errors = int(m.group(1))
-            continue
+    if current:
+        interfaces.append(current)
 
-        m = in_drop_re.search(line)
-        if m:
-            counters[current].input_drops = int(m.group(1))
-            continue
-
-        m = out_drop_re.search(line)
-        if m:
-            counters[current].output_drops = int(m.group(1))
-
-    return counters
+    return interfaces
 
 
-def delta_rate(before: int, after: int, elapsed: float) -> float:
-    """Return per-second rate, treating counter wraps as zero-delta."""
-    diff = after - before
-    if diff < 0:
-        return 0.0
-    return diff / elapsed if elapsed > 0 else 0.0
-
-
-def collect_samples(
-    connection,
-    samples: int,
-    interval: float,
-) -> List[Tuple[float, Dict[str, InterfaceCounters]]]:
-    """Collect multiple counter snapshots separated by interval seconds."""
-    snapshots = []
-    for i in range(samples):
-        if i > 0:
-            logger.info("Waiting %ds before next sample (%d/%d)...", int(interval), i + 1, samples)
-            time.sleep(interval)
-        ts = time.monotonic()
-        raw = connection.send_command("show interfaces", read_timeout=60)
-        snapshot = parse_show_interfaces(raw)
-        snapshots.append((ts, snapshot))
-        logger.info("Sample %d collected — %d interfaces parsed", i + 1, len(snapshot))
-    return snapshots
-
-
-def analyze(
-    snapshots: List[Tuple[float, Dict[str, InterfaceCounters]]],
-    in_err_threshold: float,
-    out_err_threshold: float,
-    crc_threshold: float,
-) -> List[dict]:
-    """Compare first and last snapshots; return flagged interfaces."""
-    if len(snapshots) < 2:
-        logger.warning("Need at least 2 samples to compute rates; skipping analysis.")
-        return []
-
-    t0, snap0 = snapshots[0]
-    t1, snap1 = snapshots[-1]
-    elapsed = t1 - t0
-
+def check_thresholds(stats: list, thresholds: dict) -> list:
     flagged = []
-    for iface, after in snap1.items():
-        before = snap0.get(iface)
-        if before is None:
-            continue
-
-        rates = {
-            "in_err_rate": delta_rate(before.input_errors, after.input_errors, elapsed),
-            "out_err_rate": delta_rate(before.output_errors, after.output_errors, elapsed),
-            "crc_rate": delta_rate(before.crc, after.crc, elapsed),
-            "in_drop_rate": delta_rate(before.input_drops, after.input_drops, elapsed),
-            "out_drop_rate": delta_rate(before.output_drops, after.output_drops, elapsed),
-        }
-
-        breached = (
-            rates["in_err_rate"] > in_err_threshold
-            or rates["out_err_rate"] > out_err_threshold
-            or rates["crc_rate"] > crc_threshold
-        )
-
-        if breached:
-            flagged.append({"interface": iface, "elapsed_s": round(elapsed, 1), **rates})
-
+    for intf in stats:
+        violations = []
+        checks = [
+            ("crc_errors", "crc", "CRC"),
+            ("input_errors", "input_errors", "input_errors"),
+            ("output_drops", "output_drops", "output_drops"),
+            ("resets", "resets", "resets"),
+        ]
+        for attr, key, label in checks:
+            value = getattr(intf, attr)
+            limit = thresholds[key]
+            if value >= limit:
+                violations.append(f"{label}={value} (threshold={limit})")
+        if violations:
+            intf.violations = violations
+            flagged.append(intf)
     return flagged
 
 
-def print_report(host: str, flagged: List[dict]) -> None:
-    if not flagged:
-        print(f"\n[OK] {host}: no interfaces exceeded error thresholds.")
-        return
-
-    print(f"\n[ALERT] {host}: {len(flagged)} interface(s) exceeded thresholds:\n")
-    header = f"  {'Interface':<30} {'InErr/s':>8} {'OutErr/s':>9} {'CRC/s':>7} {'InDrop/s':>9} {'OutDrop/s':>10}"
-    print(header)
-    print("  " + "-" * (len(header) - 2))
-    for r in sorted(flagged, key=lambda x: x["interface"]):
-        print(
-            f"  {r['interface']:<30} {r['in_err_rate']:>8.3f} {r['out_err_rate']:>9.3f} "
-            f"{r['crc_rate']:>7.3f} {r['in_drop_rate']:>9.3f} {r['out_drop_rate']:>10.3f}"
-        )
-    print()
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Sample interface error counters and report rates exceeding thresholds.",
-    )
-    parser.add_argument("-H", "--host", required=True, help="Device hostname or IP")
-    parser.add_argument("-u", "--username", required=True)
-    parser.add_argument("-p", "--password", required=True)
-    parser.add_argument("--enable-secret", default=None, help="Enable/secret password if needed")
-    parser.add_argument("--device-type", default="cisco_ios", help="Netmiko device type (default: cisco_ios)")
-    parser.add_argument("--port", type=int, default=22)
-    parser.add_argument("--interval", type=float, default=30.0, help="Seconds between samples (default: 30)")
-    parser.add_argument("--samples", type=int, default=2, help="Number of samples to collect (default: 2)")
-    parser.add_argument("--in-err-threshold", type=float, default=1.0, dest="in_err_threshold",
-                        help="Input error rate (per-sec) to flag (default: 1.0)")
-    parser.add_argument("--out-err-threshold", type=float, default=1.0, dest="out_err_threshold",
-                        help="Output error rate (per-sec) to flag (default: 1.0)")
-    parser.add_argument("--crc-threshold", type=float, default=0.1, dest="crc_threshold",
-                        help="CRC error rate (per-sec) to flag (default: 0.1)")
-    parser.add_argument("--verbose", action="store_true")
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
+def collect_stats(args: argparse.Namespace):
     device = {
         "device_type": args.device_type,
         "host": args.host,
         "username": args.username,
         "password": args.password,
         "port": args.port,
+        "timeout": 30,
     }
-    if args.enable_secret:
-        device["secret"] = args.enable_secret
+    if args.enable_password:
+        device["secret"] = args.enable_password
 
-    logger.info("Connecting to %s (%s)...", args.host, args.device_type)
     try:
+        logger.info("Connecting to %s", args.host)
         with ConnectHandler(**device) as conn:
-            if args.enable_secret:
+            if args.enable_password:
                 conn.enable()
-            logger.info("Connected. Collecting %d sample(s) with %ds interval.", args.samples, int(args.interval))
-            snapshots = collect_samples(conn, args.samples, args.interval)
+            output = conn.send_command("show interfaces")
+        logger.info("Disconnected from %s", args.host)
     except NetmikoAuthenticationException:
-        logger.error("Authentication failed for %s@%s", args.username, args.host)
-        sys.exit(1)
+        logger.error("Authentication failed for %s", args.host)
+        return None
     except NetmikoTimeoutException:
-        logger.error("Connection timed out reaching %s", args.host)
-        sys.exit(1)
+        logger.error("Connection timed out for %s", args.host)
+        return None
     except Exception as exc:
-        logger.error("Unexpected error: %s", exc)
-        sys.exit(1)
+        logger.error("Unexpected error for %s: %s", args.host, exc)
+        return None
 
-    flagged = analyze(snapshots, args.in_err_threshold, args.out_err_threshold, args.crc_threshold)
-    print_report(args.host, flagged)
-    sys.exit(1 if flagged else 0)
+    return parse_show_interfaces(output)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Monitor interface error counters on Cisco devices",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--host", required=True, help="Device IP or hostname")
+    p.add_argument("--username", "-u", required=True, help="SSH username")
+    p.add_argument("--password", "-p", required=True, help="SSH password")
+    p.add_argument("--enable-password", "-e", default="", help="Enable password")
+    p.add_argument("--port", type=int, default=22)
+    p.add_argument(
+        "--device-type", default="cisco_ios",
+        choices=["cisco_ios", "cisco_xe", "cisco_nxos"],
+    )
+    p.add_argument("--threshold-crc", type=int, default=1, metavar="N",
+                   help="Flag interfaces with CRC errors >= N")
+    p.add_argument("--threshold-input-errors", type=int, default=1, metavar="N",
+                   help="Flag interfaces with input errors >= N")
+    p.add_argument("--threshold-output-drops", type=int, default=1, metavar="N",
+                   help="Flag interfaces with output drops >= N")
+    p.add_argument("--threshold-resets", type=int, default=1, metavar="N",
+                   help="Flag interfaces with resets >= N")
+    p.add_argument("--all", action="store_true",
+                   help="Report all interfaces, not just violations")
+    p.add_argument("--json", action="store_true", dest="json_output",
+                   help="Output results as JSON")
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+
+    thresholds = {
+        "crc": args.threshold_crc,
+        "input_errors": args.threshold_input_errors,
+        "output_drops": args.threshold_output_drops,
+        "resets": args.threshold_resets,
+    }
+
+    stats = collect_stats(args)
+    if stats is None:
+        return 1
+
+    flagged = check_thresholds(stats, thresholds)
+    report_set = stats if args.all else flagged
+
+    if args.json_output:
+        data = {
+            "host": args.host,
+            "total_interfaces": len(stats),
+            "violation_count": len(flagged),
+            "interfaces": [
+                {
+                    "name": s.name,
+                    "status": s.status,
+                    "crc_errors": s.crc_errors,
+                    "input_errors": s.input_errors,
+                    "output_drops": s.output_drops,
+                    "resets": s.resets,
+                    "violations": s.violations,
+                }
+                for s in report_set
+            ],
+        }
+        print(json.dumps(data, indent=2))
+    else:
+        print(f"\nInterface Error Report — {args.host}")
+        print(f"Total interfaces: {len(stats)}   Violations: {len(flagged)}\n")
+        if not report_set:
+            print("No violations found.")
+        for s in report_set:
+            flag = " [VIOLATION]" if s.violations else ""
+            print(f"  {s.name} ({s.status}){flag}")
+            print(f"    CRC={s.crc_errors}  input_errors={s.input_errors}  "
+                  f"output_drops={s.output_drops}  resets={s.resets}")
+            for v in s.violations:
+                print(f"    ! {v}")
+
+    return 1 if flagged else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 ```
