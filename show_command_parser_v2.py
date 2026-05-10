@@ -1,25 +1,23 @@
-The user's instructions say "Output ONLY the script content" — this overrides the brainstorming design gate. Writing the script directly.
-
-```
+```python
 """
-interface_error_monitor.py - Interface error counter monitor for network devices.
+interface_error_audit.py - Interface Error Threshold Auditor
 
 Purpose:
-    Collects interface error counters (input errors, output errors, CRC, runts,
-    giants, resets, input/output drops) from a network device and reports any
-    interfaces exceeding a configurable threshold. Useful for identifying degraded
-    links, duplex mismatches, and oversubscribed uplinks before they cause outages.
+    Connects to a network device via Netmiko, collects per-interface error
+    counters (input errors, output errors, CRC, resets, drops), and flags
+    any interface exceeding configurable thresholds. Designed for proactive
+    fault detection before error accumulation causes outages or SLA breaches.
 
 Usage:
-    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret
-    python interface_error_monitor.py -d 10.0.0.1 -u admin --threshold 100
-    python interface_error_monitor.py -d 10.0.0.1 -u admin -i Gi0/0,Gi0/1
-    python interface_error_monitor.py -d 10.0.0.1 -u admin --json > errors.json
+    python interface_error_audit.py -d 192.168.1.1 -u admin -p secret
+    python interface_error_audit.py -d 10.0.0.1 -u admin -p secret \\
+        --device-type cisco_ios --crc-threshold 100 --error-threshold 500 \\
+        --output results.json --flagged-only
 
 Prerequisites:
     pip install netmiko
-    SSH access with at least read-only privileges on the target device.
-    Tested against Cisco IOS/IOS-XE; arista_eos and cisco_nxos partially supported.
+    SSH must be enabled on the target device. Read-only credentials suffice.
+    Tested against: cisco_ios, cisco_nxos, arista_eos
 """
 
 import argparse
@@ -27,168 +25,209 @@ import json
 import logging
 import re
 import sys
-from getpass import getpass
+from dataclasses import asdict, dataclass
+from typing import Optional
 
-from netmiko import ConnectHandler
-from netmiko.exceptions import AuthenticationException, NetMikoTimeoutException
+from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
-    level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
 )
 log = logging.getLogger(__name__)
 
-_COUNTERS = [
-    ("input_errors",  r"(\d+) input errors"),
-    ("output_errors", r"(\d+) output errors"),
-    ("crc",           r"(\d+) CRC"),
-    ("runts",         r"(\d+) runts"),
-    ("giants",        r"(\d+) giants"),
-    ("resets",        r"(\d+) interface resets"),
-    ("input_drops",   r"(\d+) input drops"),
-    ("output_drops",  r"(\d+) output drops"),
-]
+SHOW_COMMANDS = {
+    "cisco_ios": "show interfaces",
+    "cisco_nxos": "show interface",
+    "arista_eos": "show interfaces",
+}
 
-_IFACE_RE = re.compile(
-    r"^([A-Za-z][\w/.:]+)\s+is\s+(up|down|administratively down)",
-    re.MULTILINE,
-)
+_IFACE_HEADER = re.compile(r"^(\S+) is (up|down|administratively down)", re.MULTILINE)
+_INPUT_ERRORS = re.compile(r"(\d+) input errors")
+_OUTPUT_ERRORS = re.compile(r"(\d+) output errors")
+_CRC_ERRORS = re.compile(r"(\d+) CRC")
+_RESETS = re.compile(r"(\d+) interface resets")
+_INPUT_DROPS = re.compile(r"(\d+) no buffer")
+_OUTPUT_DROPS = re.compile(r"(\d+) output drops")
 
 
-def parse_interfaces(output: str) -> list[dict]:
-    records = []
-    matches = list(_IFACE_RE.finditer(output))
-    for idx, m in enumerate(matches):
-        start = m.start()
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(output)
-        block = output[start:end]
-        entry = {"name": m.group(1), "status": m.group(2)}
-        for key, pattern in _COUNTERS:
-            hit = re.search(pattern, block, re.IGNORECASE)
-            entry[key] = int(hit.group(1)) if hit else 0
-        records.append(entry)
-    return records
+@dataclass
+class InterfaceErrors:
+    name: str
+    state: str
+    input_errors: int = 0
+    output_errors: int = 0
+    crc: int = 0
+    resets: int = 0
+    input_drops: int = 0
+    output_drops: int = 0
+    flagged: bool = False
+
+    def exceeds(self, error_threshold: int, crc_threshold: int) -> bool:
+        return (
+            self.input_errors >= error_threshold
+            or self.output_errors >= error_threshold
+            or self.crc >= crc_threshold
+        )
 
 
-def flag_errors(records: list[dict], threshold: int) -> list[dict]:
-    counter_keys = [k for k, _ in _COUNTERS]
-    return [r for r in records if any(r.get(k, 0) > threshold for k in counter_keys)]
+def _extract(pattern: re.Pattern, text: str) -> int:
+    m = pattern.search(text)
+    return int(m.group(1)) if m else 0
 
 
-def apply_filter(records: list[dict], names: list[str]) -> list[dict]:
-    lower = {n.lower() for n in names}
-    return [r for r in records if r["name"].lower() in lower]
+def parse_interface_blocks(raw: str) -> list:
+    blocks = re.split(r"(?=^\S+\s+is\s+(?:up|down|administratively down))", raw, flags=re.MULTILINE)
+    results = []
+    for block in blocks:
+        header = _IFACE_HEADER.search(block)
+        if not header:
+            continue
+        results.append(InterfaceErrors(
+            name=header.group(1),
+            state=header.group(2),
+            input_errors=_extract(_INPUT_ERRORS, block),
+            output_errors=_extract(_OUTPUT_ERRORS, block),
+            crc=_extract(_CRC_ERRORS, block),
+            resets=_extract(_RESETS, block),
+            input_drops=_extract(_INPUT_DROPS, block),
+            output_drops=_extract(_OUTPUT_DROPS, block),
+        ))
+    return results
 
 
-def print_table(records: list[dict], flagged: list[dict], threshold: int) -> None:
-    flagged_names = {r["name"] for r in flagged}
-    col_keys = ["name", "input_errors", "output_errors", "crc", "runts",
-                "giants", "input_drops", "output_drops", "resets"]
-    headers  = ["Interface", "In Err", "Out Err", "CRC", "Runts",
-                "Giants", "In Drop", "Out Drop", "Resets"]
-    widths   = [32, 8, 9, 6, 7, 7, 8, 9, 7]
+def audit_device(
+    host: str,
+    username: str,
+    password: str,
+    device_type: str,
+    error_threshold: int,
+    crc_threshold: int,
+    port: int = 22,
+    secret: Optional[str] = None,
+) -> list:
+    params = {
+        "device_type": device_type,
+        "host": host,
+        "username": username,
+        "password": password,
+        "port": port,
+    }
+    if secret:
+        params["secret"] = secret
 
-    header_row = "  ".join(h.ljust(w) for h, w in zip(headers, widths))
-    print(header_row)
-    print("-" * len(header_row))
-    for r in records:
-        flag = "  ***" if r["name"] in flagged_names else ""
-        row = "  ".join(str(r.get(c, "")).ljust(w) for c, w in zip(col_keys, widths))
-        print(row + flag)
+    log.info("Connecting to %s (%s)", host, device_type)
+    try:
+        with ConnectHandler(**params) as conn:
+            if secret:
+                conn.enable()
+            cmd = SHOW_COMMANDS.get(device_type, "show interfaces")
+            log.info("Running: %s", cmd)
+            raw = conn.send_command(cmd, read_timeout=60)
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s", host)
+        sys.exit(1)
+    except NetmikoTimeoutException:
+        log.error("Connection timed out for %s", host)
+        sys.exit(1)
 
+    interfaces = parse_interface_blocks(raw)
+    log.info("Parsed %d interfaces", len(interfaces))
+
+    for iface in interfaces:
+        iface.flagged = iface.exceeds(error_threshold, crc_threshold)
+
+    return interfaces
+
+
+def print_report(interfaces: list, error_threshold: int, crc_threshold: int) -> None:
+    flagged = [i for i in interfaces if i.flagged]
+
+    print(f"\n{'=' * 62}")
+    print(f"Interface Error Audit  —  {len(interfaces)} interfaces checked")
+    print(f"Thresholds: errors >= {error_threshold}, CRC >= {crc_threshold}")
+    print(f"{'=' * 62}")
+
+    if not flagged:
+        print(f"OK  All {len(interfaces)} interfaces within thresholds.\n")
+        return
+
+    print(f"FLAGGED: {len(flagged)} interface(s) exceed thresholds:\n")
+    header = f"  {'Interface':<26} {'State':<22} {'InErr':>7} {'OutErr':>7} {'CRC':>6} {'Resets':>7}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for iface in flagged:
+        print(
+            f"  {iface.name:<26} {iface.state:<22} "
+            f"{iface.input_errors:>7} {iface.output_errors:>7} "
+            f"{iface.crc:>6} {iface.resets:>7}"
+        )
     print()
-    if flagged:
-        print(f"{len(flagged)} interface(s) flagged (any counter > {threshold})")
-    else:
-        print(f"All interfaces within threshold (> {threshold})")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Monitor interface error counters on a network device",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    parser = argparse.ArgumentParser(
+        description="Audit interface error counters and flag interfaces exceeding thresholds."
     )
-    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
-    p.add_argument(
-        "-t", "--device-type", default="cisco_ios",
-        choices=["cisco_ios", "cisco_xe", "cisco_nxos", "arista_eos"],
-        help="Netmiko device type",
+    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
+    parser.add_argument("-s", "--secret", help="Enable secret (Cisco IOS)")
+    parser.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        choices=list(SHOW_COMMANDS.keys()),
+        help="Netmiko device type (default: cisco_ios)",
     )
-    p.add_argument(
-        "-i", "--interfaces",
-        help="Comma-separated interface names to inspect (default: all)",
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument(
+        "--error-threshold",
+        type=int,
+        default=100,
+        help="Flag interfaces with input/output errors >= this value (default: 100)",
     )
-    p.add_argument(
-        "--threshold", type=int, default=0,
-        help="Flag interfaces where any counter exceeds this value",
+    parser.add_argument(
+        "--crc-threshold",
+        type=int,
+        default=50,
+        help="Flag interfaces with CRC errors >= this value (default: 50)",
     )
-    p.add_argument("--port", type=int, default=22, help="SSH port")
-    p.add_argument(
-        "--json", action="store_true", dest="as_json",
-        help="Emit results as JSON instead of a table",
+    parser.add_argument("--output", help="Write results to this JSON file")
+    parser.add_argument(
+        "--flagged-only",
+        action="store_true",
+        help="Limit JSON output to flagged interfaces only",
     )
-    p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    return p
+    return parser
 
 
-def main() -> int:
+def main() -> None:
     args = build_parser().parse_args()
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+    interfaces = audit_device(
+        host=args.device,
+        username=args.username,
+        password=args.password,
+        device_type=args.device_type,
+        error_threshold=args.error_threshold,
+        crc_threshold=args.crc_threshold,
+        port=args.port,
+        secret=args.secret,
+    )
 
-    password = args.password or getpass(f"Password for {args.username}@{args.device}: ")
+    print_report(interfaces, args.error_threshold, args.crc_threshold)
 
-    conn_params = {
-        "device_type": args.device_type,
-        "host": args.device,
-        "username": args.username,
-        "password": password,
-        "port": args.port,
-    }
+    if args.output:
+        subset = [i for i in interfaces if not args.flagged_only or i.flagged]
+        payload = {"device": args.device, "interfaces": [asdict(i) for i in subset]}
+        with open(args.output, "w") as fh:
+            json.dump(payload, fh, indent=2)
+        log.info("Results written to %s", args.output)
 
-    try:
-        log.debug("Connecting to %s", args.device)
-        with ConnectHandler(**conn_params) as conn:
-            output = conn.send_command("show interfaces")
-    except AuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.device)
-        return 2
-    except NetMikoTimeoutException:
-        log.error("Connection timed out: %s", args.device)
-        return 2
-    except Exception as exc:
-        log.error("Connection error: %s", exc)
-        return 2
-
-    records = parse_interfaces(output)
-    if not records:
-        log.error("No interfaces parsed — verify device-type and SSH output")
-        return 2
-
-    if args.interfaces:
-        names = [n.strip() for n in args.interfaces.split(",")]
-        records = apply_filter(records, names)
-        if not records:
-            log.error("None of the requested interfaces were found on the device")
-            return 2
-
-    flagged = flag_errors(records, args.threshold)
-
-    if args.as_json:
-        print(json.dumps(
-            {"device": args.device, "threshold": args.threshold,
-             "interfaces": records, "flagged": flagged},
-            indent=2,
-        ))
-    else:
-        print_table(records, flagged, args.threshold)
-
-    return 1 if flagged else 0
+    sys.exit(1 if any(i.flagged for i in interfaces) else 0)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
 ```
