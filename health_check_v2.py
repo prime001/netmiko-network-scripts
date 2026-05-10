@@ -1,177 +1,234 @@
 ```python
 """
-bgp_monitor.py — BGP Neighbor State Monitor
+interface_errors.py - Interface Error Rate Monitor
 
 Purpose:
-    Connects to a router via SSH (Netmiko) and inspects all BGP neighbor
-    sessions. Reports session state, uptime, and received prefix counts.
-    Flags sessions that are not Established or fall below a prefix threshold.
-    Exits non-zero when issues are found so it can drive cron alerts or
-    monitoring pipelines.
+    Connects to a Cisco IOS/IOS-XE/NX-OS device and reports interfaces
+    with error counters (CRC, input errors, output drops, runts, giants)
+    exceeding configurable thresholds. With --interval, polls twice and
+    reports delta counts so you can distinguish new errors from historical
+    accumulation.
 
 Usage:
-    python bgp_monitor.py -d 10.0.0.1 -u admin -p secret
-    python bgp_monitor.py -d 10.0.0.1 -u admin --min-prefixes 5 --timeout 30
-    python bgp_monitor.py -d 10.0.0.1 -u admin --device-type cisco_ios_xe -v
+    python interface_errors.py -H 192.168.1.1 -u admin -p secret
+    python interface_errors.py -H 192.168.1.1 -u admin -p secret \\
+        --interval 60 --crc-threshold 0 --drop-threshold 50
+    python interface_errors.py -H 192.168.1.1 -u admin -p secret \\
+        --device-type cisco_nxos --all
 
 Prerequisites:
     pip install netmiko
-
-    SSH must be enabled on the target device.
-    The account needs at minimum read access to 'show ip bgp summary'.
+    Device must support 'show interfaces' (Cisco IOS / IOS-XE / NX-OS).
+    Exit code 0 = clean, 1 = thresholds exceeded, 2 = connection error.
 """
 
 import argparse
-import getpass
 import logging
 import re
 import sys
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
-from netmiko import ConnectHandler
-from netmiko.exceptions import AuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
-logger = logging.getLogger(__name__)
-
-# Matches a neighbor row in 'show ip bgp summary' output.
-# Groups: neighbor_ip, remote_as, up_down, state_or_prefix_count
-_NEIGHBOR_RE = re.compile(
-    r"^(\d{1,3}(?:\.\d{1,3}){3})\s+"   # neighbor IP
-    r"\d+\s+"                            # BGP version
-    r"(\d+)\s+"                          # remote AS
-    r"\S+\s+\S+\s+\S+\s+\S+\s+"        # MsgRcvd MsgSent TblVer InQ
-    r"\S+\s+"                            # OutQ
-    r"(\S+)\s+"                          # Up/Down
-    r"(\S+)$",                           # State/PfxRcd
-    re.MULTILINE,
-)
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
+log = logging.getLogger(__name__)
 
 
-def parse_bgp_summary(output: str) -> list:
-    neighbors = []
-    for m in _NEIGHBOR_RE.finditer(output):
-        ip, remote_as, updown, state_or_pfx = m.groups()
-        try:
-            prefixes = int(state_or_pfx)
-            state = "Established"
-        except ValueError:
-            prefixes = 0
-            state = state_or_pfx
-        neighbors.append(
-            {"ip": ip, "as": remote_as, "updown": updown,
-             "state": state, "prefixes": prefixes}
-        )
-    return neighbors
+@dataclass
+class InterfaceCounters:
+    name: str
+    input_errors: int = 0
+    crc: int = 0
+    output_drops: int = 0
+    runts: int = 0
+    giants: int = 0
+    collisions: int = 0
 
 
-def collect_bgp(device_params: dict) -> str:
-    try:
-        with ConnectHandler(**device_params) as conn:
-            logger.info("Connected to %s", device_params["host"])
-            return conn.send_command("show ip bgp summary", read_timeout=60)
-    except AuthenticationException:
-        logger.error("Authentication failed for %s", device_params["host"])
-        sys.exit(2)
-    except NetmikoTimeoutException:
-        logger.error("Connection timed out to %s", device_params["host"])
-        sys.exit(3)
+_IFACE_RE = re.compile(r"^(\S+)\s+is\s+(?:up|down|administratively down)", re.IGNORECASE)
+_INPUT_ERR_RE = re.compile(r"(\d+)\s+input errors")
+_CRC_RE = re.compile(r"(\d+)\s+CRC")
+_DROP_RE = re.compile(r"(\d+)\s+(?:output\s+)?drops")
+_RUNTS_RE = re.compile(r"(\d+)\s+runts")
+_GIANTS_RE = re.compile(r"(\d+)\s+giants")
+_COLLISIONS_RE = re.compile(r"(\d+)\s+collisions")
 
 
-def evaluate(neighbors: list, min_prefixes: int) -> int:
-    issues = 0
-    for n in neighbors:
-        if n["state"] != "Established":
-            logger.warning(
-                "FAIL  %s AS %s — session %s", n["ip"], n["as"], n["state"]
-            )
-            issues += 1
-        elif n["prefixes"] < min_prefixes:
-            logger.warning(
-                "WARN  %s AS %s — only %d prefix(es) (min: %d)",
-                n["ip"], n["as"], n["prefixes"], min_prefixes,
-            )
-            issues += 1
-        else:
-            logger.info(
-                "OK    %s AS %s — %s up, %d prefix(es)",
-                n["ip"], n["as"], n["updown"], n["prefixes"],
-            )
-    return issues
+def parse_counters(output: str) -> Dict[str, InterfaceCounters]:
+    counters: Dict[str, InterfaceCounters] = {}
+    current: Optional[str] = None
+
+    for line in output.splitlines():
+        m = _IFACE_RE.match(line)
+        if m:
+            current = m.group(1)
+            counters[current] = InterfaceCounters(name=current)
+            continue
+
+        if current is None:
+            continue
+
+        c = counters[current]
+        if m := _INPUT_ERR_RE.search(line):
+            c.input_errors = int(m.group(1))
+        if m := _CRC_RE.search(line):
+            c.crc = int(m.group(1))
+        if m := _DROP_RE.search(line):
+            c.output_drops = int(m.group(1))
+        if m := _RUNTS_RE.search(line):
+            c.runts = int(m.group(1))
+        if m := _GIANTS_RE.search(line):
+            c.giants = int(m.group(1))
+        if m := _COLLISIONS_RE.search(line):
+            c.collisions = int(m.group(1))
+
+    return counters
 
 
-def print_table(neighbors: list, host: str) -> None:
-    print(f"\nBGP Summary  —  {host}")
-    print(f"{'Neighbor':<18} {'Remote AS':<12} {'Up/Down':<12} {'State':<16} {'Pfx':>6}")
-    print("─" * 66)
-    for n in neighbors:
+def compute_delta(
+    before: Dict[str, InterfaceCounters],
+    after: Dict[str, InterfaceCounters],
+) -> Dict[str, InterfaceCounters]:
+    result: Dict[str, InterfaceCounters] = {}
+    for name, a in after.items():
+        b = before.get(name, InterfaceCounters(name=name))
+        d = InterfaceCounters(name=name)
+        d.input_errors = max(0, a.input_errors - b.input_errors)
+        d.crc = max(0, a.crc - b.crc)
+        d.output_drops = max(0, a.output_drops - b.output_drops)
+        d.runts = max(0, a.runts - b.runts)
+        d.giants = max(0, a.giants - b.giants)
+        d.collisions = max(0, a.collisions - b.collisions)
+        result[name] = d
+    return result
+
+
+def print_report(
+    counters: Dict[str, InterfaceCounters],
+    crc_threshold: int,
+    input_err_threshold: int,
+    drop_threshold: int,
+    show_all: bool,
+    is_delta: bool,
+) -> int:
+    def exceeds(c: InterfaceCounters) -> bool:
+        return c.crc >= crc_threshold or c.input_errors >= input_err_threshold or c.output_drops >= drop_threshold
+
+    rows: List[InterfaceCounters] = [
+        c for c in counters.values() if exceeds(c) or show_all
+    ]
+    rows.sort(key=lambda c: c.crc + c.input_errors + c.output_drops, reverse=True)
+
+    label = "delta (new errors only)" if is_delta else "cumulative"
+    if not rows:
+        log.info("No interfaces exceeded thresholds [%s]", label)
+        return 0
+
+    hdr = f"{'Interface':<26} {'InErrs':>8} {'CRC':>8} {'Drops':>8} {'Runts':>7} {'Giants':>7} {'Collisions':>11}"
+    print(f"\n  Counters [{label}]")
+    print(f"  {hdr}")
+    print(f"  {'-' * len(hdr)}")
+    flagged = 0
+    for c in rows:
+        flag = "! " if exceeds(c) else "  "
         print(
-            f"{n['ip']:<18} {n['as']:<12} {n['updown']:<12} "
-            f"{n['state']:<16} {n['prefixes']:>6}"
+            f"  {flag}{c.name:<24} {c.input_errors:>8} {c.crc:>8} "
+            f"{c.output_drops:>8} {c.runts:>7} {c.giants:>7} {c.collisions:>11}"
         )
+        if exceeds(c):
+            flagged += 1
+    print()
+    return flagged
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="BGP neighbor state monitor — detects down sessions and low prefix counts"
-    )
-    p.add_argument("-d", "--device", required=True, help="Device hostname or IP")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
-    p.add_argument(
-        "--device-type", default="cisco_ios",
-        help="Netmiko device type (default: cisco_ios)"
-    )
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument(
-        "--timeout", type=int, default=20,
-        help="Connection timeout in seconds (default: 20)"
-    )
-    p.add_argument(
-        "--min-prefixes", type=int, default=1,
-        help="Minimum prefix count per Established neighbor before flagging (default: 1)"
-    )
-    p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    return p
-
-
-def main() -> None:
-    args = build_parser().parse_args()
-
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
-    password = args.password or getpass.getpass(
-        f"Password for {args.username}@{args.device}: "
-    )
-
+def main(args: argparse.Namespace) -> int:
     device_params = {
         "device_type": args.device_type,
-        "host": args.device,
+        "host": args.host,
         "username": args.username,
-        "password": password,
+        "password": args.password,
+        "secret": args.enable_secret or args.password,
         "port": args.port,
-        "conn_timeout": args.timeout,
     }
 
-    raw = collect_bgp(device_params)
-    neighbors = parse_bgp_summary(raw)
+    try:
+        log.info("Connecting to %s (%s)", args.host, args.device_type)
+        with ConnectHandler(**device_params) as conn:
+            if args.enable_secret:
+                conn.enable()
 
-    if not neighbors:
-        logger.warning("No BGP neighbors found — verify BGP is running on %s", args.device)
-        sys.exit(0)
+            log.info("Snapshot 1 — collecting interface counters")
+            snap1 = parse_counters(conn.send_command("show interfaces", read_timeout=60))
+            log.info("  %d interfaces parsed", len(snap1))
 
-    print_table(neighbors, args.device)
-    issues = evaluate(neighbors, args.min_prefixes)
+            if args.interval:
+                log.info("Waiting %ds before second snapshot...", args.interval)
+                time.sleep(args.interval)
+                log.info("Snapshot 2 — collecting interface counters")
+                snap2 = parse_counters(conn.send_command("show interfaces", read_timeout=60))
+                counters = compute_delta(snap1, snap2)
+                is_delta = True
+            else:
+                counters = snap1
+                is_delta = False
 
-    if issues:
-        print(f"\n[!] {issues} issue(s) detected across {len(neighbors)} BGP neighbor(s)")
-        sys.exit(1)
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.host)
+        return 2
+    except NetmikoTimeoutException:
+        log.error("Timed out connecting to %s", args.host)
+        return 2
+    except Exception as exc:
+        log.error("Unexpected error: %s", exc)
+        return 2
 
-    print(f"\n[+] All {len(neighbors)} BGP neighbor(s) healthy")
+    flagged = print_report(
+        counters,
+        crc_threshold=args.crc_threshold,
+        input_err_threshold=args.input_err_threshold,
+        drop_threshold=args.drop_threshold,
+        show_all=args.all,
+        is_delta=is_delta,
+    )
+
+    if flagged:
+        log.warning("%d interface(s) on %s exceeded error thresholds", flagged, args.host)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Report interface error counters exceeding configurable thresholds.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    conn_grp = parser.add_argument_group("connection")
+    conn_grp.add_argument("-H", "--host", required=True, help="Device IP or hostname")
+    conn_grp.add_argument("-u", "--username", required=True, help="SSH username")
+    conn_grp.add_argument("-p", "--password", required=True, help="SSH password")
+    conn_grp.add_argument("-e", "--enable-secret", help="Enable secret (if required)")
+    conn_grp.add_argument("--device-type", default="cisco_ios", help="Netmiko device type")
+    conn_grp.add_argument("--port", type=int, default=22, help="SSH port")
+
+    thresh_grp = parser.add_argument_group("thresholds")
+    thresh_grp.add_argument("--crc-threshold", type=int, default=1, metavar="N",
+                            help="Flag interfaces with >= N CRC errors")
+    thresh_grp.add_argument("--input-err-threshold", type=int, default=10, metavar="N",
+                            help="Flag interfaces with >= N input errors")
+    thresh_grp.add_argument("--drop-threshold", type=int, default=10, metavar="N",
+                            help="Flag interfaces with >= N output drops")
+
+    parser.add_argument("--interval", type=int, default=0, metavar="SECS",
+                        help="Poll twice SECS apart and report delta counts (0 = single snapshot)")
+    parser.add_argument("--all", action="store_true",
+                        help="Show all interfaces, not just those exceeding thresholds")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+
+    parsed = parser.parse_args()
+    if parsed.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    sys.exit(main(parsed))
 ```
