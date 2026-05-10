@@ -1,175 +1,210 @@
-BGP Session State Validator
+route_verify.py - Post-change routing table verification
 
-Captures BGP neighbor state snapshots before/after a network change and
-compares them to detect session drops or unexpected prefix count changes.
+Purpose:
+    Connects to a network device and verifies that expected routes exist in the
+    routing table. Optionally validates next-hop IP and administrative distance.
+    Designed for post-change validation after routing configuration changes.
 
 Usage:
-    # Capture pre-change baseline
-    python bgp_state_monitor.py --host 10.0.0.1 --username admin --password secret \
-        --device-type cisco_ios --snapshot pre-change.json
+    python route_verify.py --host 10.0.0.1 --username admin --password secret \
+        --routes 10.1.0.0/24 10.2.0.0/24 --nexthop 10.0.0.254
 
-    # Validate post-change state against baseline
-    python bgp_state_monitor.py --host 10.0.0.1 --username admin --password secret \
-        --device-type cisco_ios --compare pre-change.json
-
-Exit codes:
-    0 — all sessions nominal (or snapshot saved successfully)
-    1 — session drop, missing peer, or prefix count regression detected
-    2 — usage error or connection failure
+    python route_verify.py --host 10.0.0.1 --username admin --password secret \
+        --routes 0.0.0.0/0 192.168.0.0/16 --max-ad 110 --device-type cisco_xe
 
 Prerequisites:
     pip install netmiko
+    Supported: cisco_ios, cisco_xe, cisco_nxos, cisco_xr
 """
 
 import argparse
-import json
 import logging
 import re
 import sys
-from datetime import datetime, timezone
 
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
-logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
-log = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger(__name__)
 
-BGP_COMMANDS = {
-    "cisco_ios": "show ip bgp summary",
-    "cisco_xe": "show ip bgp summary",
-    "cisco_nxos": "show bgp ipv4 unicast summary",
-    "arista_eos": "show bgp summary",
-    "juniper_junos": "show bgp summary",
+ROUTE_COMMANDS = {
+    "cisco_ios": "show ip route {prefix}",
+    "cisco_xe": "show ip route {prefix}",
+    "cisco_nxos": "show ip route {prefix}",
+    "cisco_xr": "show route {prefix}",
 }
 
-# Matches neighbor lines: peer-IP  ... uptime  state-or-prefixcount
-_PEER_RE = re.compile(
-    r"^(\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\S+\s+(\S+)",
-    re.MULTILINE,
-)
 
-
-def parse_bgp_output(output: str) -> dict:
-    peers = {}
-    for m in _PEER_RE.finditer(output):
-        peer, state = m.group(1), m.group(2)
-        try:
-            peers[peer] = {"established": True, "prefixes": int(state)}
-        except ValueError:
-            peers[peer] = {"established": False, "state": state, "prefixes": 0}
-    return peers
-
-
-def collect(conn, device_type: str) -> dict:
-    cmd = BGP_COMMANDS.get(device_type, "show ip bgp summary")
-    log.info("Sending: %s", cmd)
-    output = conn.send_command(cmd)
-    peers = parse_bgp_output(output)
-    if not peers:
-        log.warning("No BGP neighbors parsed — check device type or BGP config")
-    else:
-        log.info("Parsed %d neighbor(s)", len(peers))
-    return {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "host": conn.host,
-        "device_type": device_type,
-        "peers": peers,
+def parse_route_output(output: str, prefix: str) -> dict:
+    result = {
+        "prefix": prefix,
+        "found": False,
+        "nexthops": [],
+        "protocol": None,
+        "ad": None,
+        "metric": None,
     }
 
+    if not output.strip() or output.strip().startswith("%"):
+        return result
+    if "not in table" in output.lower():
+        return result
 
-def compare(pre: dict, post: dict) -> int:
-    pre_peers, post_peers = pre["peers"], post["peers"]
-    issues = 0
+    result["found"] = True
 
-    for peer, ps in pre_peers.items():
-        if peer not in post_peers:
-            log.error("PEER MISSING post-change: %s", peer)
-            issues += 1
+    proto_match = re.search(
+        r"^([A-Z*][A-Za-z0-9 ]*?)\s+\d+\.\d+\.\d+\.\d+", output, re.MULTILINE
+    )
+    if proto_match:
+        result["protocol"] = proto_match.group(1).strip()
+
+    ad_metric = re.search(r"\[(\d+)/(\d+)\]", output)
+    if ad_metric:
+        result["ad"] = int(ad_metric.group(1))
+        result["metric"] = int(ad_metric.group(2))
+
+    result["nexthops"] = re.findall(r"via (\d+\.\d+\.\d+\.\d+)", output)
+    return result
+
+
+def verify_routes(conn, prefixes, expected_nexthop=None, max_ad=None, device_type="cisco_ios"):
+    cmd_tpl = ROUTE_COMMANDS.get(device_type, ROUTE_COMMANDS["cisco_ios"])
+    results = {}
+
+    for prefix in prefixes:
+        cmd = cmd_tpl.format(prefix=prefix)
+        logger.debug("Sending: %s", cmd)
+        try:
+            output = conn.send_command(cmd)
+        except Exception as exc:
+            logger.error("Command failed for %s: %s", prefix, exc)
+            results[prefix] = {"error": str(exc), "passed": False}
             continue
 
-        cs = post_peers[peer]
-        if ps["established"] and not cs["established"]:
-            log.error("SESSION DOWN: %s  was=Established  now=%s", peer, cs.get("state", "?"))
-            issues += 1
-        elif ps["established"] and cs["established"]:
-            delta = cs["prefixes"] - ps["prefixes"]
-            if delta < 0:
-                log.warning(
-                    "PREFIX DROP: %s  pre=%d  post=%d  delta=%d",
-                    peer, ps["prefixes"], cs["prefixes"], delta,
+        info = parse_route_output(output, prefix)
+        info["passed"] = info["found"]
+
+        if info["found"] and expected_nexthop and expected_nexthop not in info["nexthops"]:
+            info["passed"] = False
+            logger.warning(
+                "%s found but nexthop %s not in %s",
+                prefix, expected_nexthop, info["nexthops"],
+            )
+
+        if info["found"] and max_ad is not None and info["ad"] is not None:
+            if info["ad"] > max_ad:
+                info["passed"] = False
+                logger.warning(
+                    "%s AD %d exceeds max allowed %d", prefix, info["ad"], max_ad
                 )
-                issues += 1
-            else:
-                log.info(
-                    "OK: %s  pre=%d  post=%d  delta=+%d",
-                    peer, ps["prefixes"], cs["prefixes"], delta,
-                )
+
+        results[prefix] = info
+
+    return results
+
+
+def print_results(results, hostname):
+    passed = sum(1 for r in results.values() if r.get("passed"))
+    failed = len(results) - passed
+
+    print(f"\nRoute Verification Results — {hostname}")
+    print("=" * 65)
+    print(f"{'Prefix':<24} {'Status':<8} {'Proto':<10} {'AD/Metric':<12} Next-Hop(s)")
+    print("-" * 65)
+
+    for prefix, info in sorted(results.items()):
+        if info.get("error"):
+            print(f"{prefix:<24} {'ERROR':<8} -          -            {info['error'][:20]}")
+            continue
+
+        status = "PASS" if info["passed"] else "FAIL"
+        proto = info.get("protocol") or ("-" if not info["found"] else "?")
+        if info["ad"] is not None:
+            ad_metric = f"{info['ad']}/{info['metric']}"
         else:
-            log.info("STILL DOWN (pre+post): %s  state=%s", peer, cs.get("state", "?"))
+            ad_metric = "-"
+        if info["nexthops"]:
+            nexthops = ", ".join(info["nexthops"])
+        elif info["found"]:
+            nexthops = "connected"
+        else:
+            nexthops = "missing"
+        print(f"{prefix:<24} {status:<8} {proto:<10} {ad_metric:<12} {nexthops}")
 
-    for peer in post_peers:
-        if peer not in pre_peers:
-            log.info("NEW PEER (not in baseline): %s", peer)
-
-    if issues:
-        log.error("%d issue(s) found — change validation FAILED", issues)
-    else:
-        log.info("All BGP sessions nominal — change validation PASSED")
-
-    return 1 if issues else 0
+    print("-" * 65)
+    print(f"Total: {len(results)}  Passed: {passed}  Failed: {failed}\n")
+    return 0 if failed == 0 else 1
 
 
-def build_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="BGP session state validator (pre/post change)")
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Verify expected routes exist on a network device."
+    )
     p.add_argument("--host", required=True, help="Device IP or hostname")
-    p.add_argument("--username", required=True)
-    p.add_argument("--password", required=True)
+    p.add_argument("--username", required=True, help="SSH username")
+    p.add_argument("--password", required=True, help="SSH password")
     p.add_argument(
         "--device-type",
         default="cisco_ios",
-        choices=list(BGP_COMMANDS.keys()),
-        metavar="TYPE",
-        help="Netmiko device type (default: cisco_ios). Choices: " + ", ".join(BGP_COMMANDS),
+        choices=list(ROUTE_COMMANDS.keys()),
+        help="Netmiko device type (default: cisco_ios)",
     )
-    p.add_argument("--port", type=int, default=22)
-    p.add_argument("--snapshot", metavar="FILE", help="Capture current state to FILE (pre-change)")
-    p.add_argument("--compare", metavar="FILE", help="Compare current state against FILE (post-change)")
-    return p.parse_args()
+    p.add_argument(
+        "--routes",
+        nargs="+",
+        required=True,
+        metavar="PREFIX",
+        help="Prefixes to verify, e.g. 10.0.0.0/8 192.168.1.0/24",
+    )
+    p.add_argument("--nexthop", metavar="IP", help="Required next-hop IP address")
+    p.add_argument(
+        "--max-ad", type=int, metavar="N", help="Fail routes with AD above this value"
+    )
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds")
+    p.add_argument("--verbose", action="store_true", help="Debug logging")
+    return p
 
 
 if __name__ == "__main__":
-    args = build_args()
+    args = build_parser().parse_args()
 
-    if not args.snapshot and not args.compare:
-        log.error("Provide --snapshot FILE to capture baseline or --compare FILE to validate.")
-        sys.exit(2)
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    device = {
+    device_params = {
         "device_type": args.device_type,
         "host": args.host,
         "username": args.username,
         "password": args.password,
         "port": args.port,
+        "timeout": args.timeout,
     }
 
+    logger.info("Connecting to %s (%s)", args.host, args.device_type)
     try:
-        log.info("Connecting to %s as %s", args.host, args.username)
-        with ConnectHandler(**device) as conn:
-            snapshot = collect(conn, args.device_type)
+        with ConnectHandler(**device_params) as conn:
+            hostname = conn.find_prompt().rstrip("#> ")
+            logger.info("Connected — %s", hostname)
+            results = verify_routes(
+                conn,
+                args.routes,
+                expected_nexthop=args.nexthop,
+                max_ad=args.max_ad,
+                device_type=args.device_type,
+            )
     except NetmikoAuthenticationException:
-        log.error("Authentication failed: %s", args.host)
+        logger.error("Authentication failed for %s@%s", args.username, args.host)
         sys.exit(2)
     except NetmikoTimeoutException:
-        log.error("Connection timed out: %s", args.host)
+        logger.error("Connection timed out to %s", args.host)
+        sys.exit(2)
+    except Exception as exc:
+        logger.error("Unexpected error: %s", exc)
         sys.exit(2)
 
-    if args.snapshot:
-        with open(args.snapshot, "w") as fh:
-            json.dump(snapshot, fh, indent=2)
-        log.info("Baseline saved to %s  (%d peer(s))", args.snapshot, len(snapshot["peers"]))
-        sys.exit(0)
-
-    with open(args.compare) as fh:
-        baseline = json.load(fh)
-
-    log.info("Baseline timestamp: %s", baseline.get("timestamp", "unknown"))
-    sys.exit(compare(baseline, snapshot))
+    sys.exit(print_results(results, hostname))
