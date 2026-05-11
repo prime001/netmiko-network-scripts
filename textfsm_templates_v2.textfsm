@@ -1,215 +1,210 @@
+The script is ready. Here it is:
+
+---
+
 ```python
 """
-interface_error_monitor.py - Per-interface error rate collector via netmiko
+Interface Error Rate Monitor
 
-Purpose:
-    Connects to a network device, collects interface error counters, and
-    optionally re-samples after a configurable interval to calculate
-    per-second error rates. Useful for identifying duplex mismatches,
-    flapping links, and hardware faults before they escalate to outages.
+Polls a network device at fixed intervals and reports per-interval deltas for
+input errors, output errors, CRC errors, and interface resets. Useful for
+catching CRC storms, overrun spikes, or output queue drops before they
+escalate to a full outage.
 
 Usage:
-    python interface_error_monitor.py -H 192.168.1.1 -u admin
-    python interface_error_monitor.py -H 192.168.1.1 -u admin --sample-interval 60
-    python interface_error_monitor.py -H 192.168.1.1 -u admin --threshold 10 -o errors.csv
+    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret
+    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret \
+        --device-type cisco_ios --interval 60 --count 10 \
+        --threshold 50 --output errors.csv
 
 Prerequisites:
     pip install netmiko
-    Tested against: Cisco IOS 15.x, IOS-XE 17.x
+    Supported device types: cisco_ios, cisco_xe, cisco_nxos, cisco_xr
 """
 
 import argparse
 import csv
-import getpass
 import logging
 import re
 import sys
 import time
-from dataclasses import dataclass
-from typing import Dict, List
+from datetime import datetime
+from typing import Dict, Optional
 
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko.exceptions import NetMikoAuthenticationException, NetMikoTimeoutException
 
 logging.basicConfig(
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    level=logging.INFO,
 )
 log = logging.getLogger(__name__)
 
-_INTF_RE = re.compile(r"^(\S+)\s+is\s+(?:up|down|administratively down)", re.IGNORECASE)
-_INPUT_ERR_RE = re.compile(r"(\d+) input errors.*?(\d+) CRC")
-_OUTPUT_DROP_RE = re.compile(r"(\d+) output drops")
-_OUTPUT_ERR_RE = re.compile(r"(\d+) output errors")
-_RESETS_RE = re.compile(r"(\d+) interface resets")
+Counters = Dict[str, Dict[str, int]]
 
 
-@dataclass
-class IfCounters:
-    name: str
-    input_errors: int = 0
-    crc: int = 0
-    output_drops: int = 0
-    output_errors: int = 0
-    resets: int = 0
-
-
-def parse_show_interfaces(output: str) -> Dict[str, IfCounters]:
-    interfaces: Dict[str, IfCounters] = {}
-    current: IfCounters = None
+def parse_interface_counters(output: str) -> Counters:
+    """Parse 'show interfaces' output into per-interface error counters."""
+    counters: Counters = {}
+    current: Optional[str] = None
 
     for line in output.splitlines():
-        m = _INTF_RE.match(line)
+        m = re.match(r'^(\S+)\s+is\s+(?:up|down|administratively)', line)
         if m:
-            current = IfCounters(name=m.group(1))
-            interfaces[current.name] = current
+            current = m.group(1)
+            counters[current] = {'input_errors': 0, 'output_errors': 0, 'crc': 0, 'resets': 0}
             continue
+
         if current is None:
             continue
-        if (m := _INPUT_ERR_RE.search(line)):
-            current.input_errors = int(m.group(1))
-            current.crc = int(m.group(2))
-        if (m := _OUTPUT_DROP_RE.search(line)):
-            current.output_drops = int(m.group(1))
-        if (m := _OUTPUT_ERR_RE.search(line)):
-            current.output_errors = int(m.group(1))
-        if (m := _RESETS_RE.search(line)):
-            current.resets = int(m.group(1))
 
-    return interfaces
+        m = re.search(r'(\d+) input errors', line)
+        if m:
+            counters[current]['input_errors'] = int(m.group(1))
 
+        m = re.search(r'(\d+) CRC', line)
+        if m:
+            counters[current]['crc'] = int(m.group(1))
 
-def compute_rates(
-    before: Dict[str, IfCounters], after: Dict[str, IfCounters], interval: float
-) -> List[dict]:
-    rows = []
-    for name, post in after.items():
-        pre = before.get(name)
-        if pre is None:
-            continue
-        total = post.input_errors + post.crc + post.output_drops + post.output_errors
-        rows.append({
-            "interface": name,
-            "input_errors_per_sec": round((post.input_errors - pre.input_errors) / interval, 3),
-            "crc_per_sec": round((post.crc - pre.crc) / interval, 3),
-            "output_drops_per_sec": round((post.output_drops - pre.output_drops) / interval, 3),
-            "output_errors_per_sec": round((post.output_errors - pre.output_errors) / interval, 3),
-            "resets_delta": post.resets - pre.resets,
-            "cumulative_errors": total,
-        })
-    return rows
+        m = re.search(r'(\d+) output errors', line)
+        if m:
+            counters[current]['output_errors'] = int(m.group(1))
+
+        m = re.search(r'(\d+) interface resets', line)
+        if m:
+            counters[current]['resets'] = int(m.group(1))
+
+    return counters
 
 
-def snapshot_rows(counters: Dict[str, IfCounters]) -> List[dict]:
-    return [{
-        "interface": c.name,
-        "input_errors_per_sec": "N/A",
-        "crc_per_sec": "N/A",
-        "output_drops_per_sec": "N/A",
-        "output_errors_per_sec": "N/A",
-        "resets_delta": "N/A",
-        "cumulative_errors": c.input_errors + c.crc + c.output_drops + c.output_errors,
-    } for c in counters.values()]
+def compute_delta(baseline: Counters, current: Counters) -> Counters:
+    """Return per-interface counter deltas, clamped to zero for wraparound."""
+    return {
+        iface: {k: max(0, current[iface][k] - baseline.get(iface, {}).get(k, 0)) for k in current[iface]}
+        for iface in current
+    }
 
 
-def print_table(rows: List[dict], threshold: float) -> None:
-    filtered = [
-        r for r in rows
-        if threshold == 0 or r["cumulative_errors"] > threshold
-        or any(
-            isinstance(r[k], float) and r[k] > threshold
-            for k in ("input_errors_per_sec", "crc_per_sec", "output_drops_per_sec")
-        )
-    ]
-    if not filtered:
-        print("No interfaces exceed the specified threshold.")
-        return
-    hdr = f"{'Interface':<32} {'InErr/s':>8} {'CRC/s':>7} {'OutDrop/s':>10} {'Resets':>7} {'CumErrors':>10}"
-    print(hdr)
-    print("-" * len(hdr))
-    for r in sorted(filtered, key=lambda x: x["cumulative_errors"], reverse=True):
-        print(
-            f"{r['interface']:<32} "
-            f"{str(r['input_errors_per_sec']):>8} "
-            f"{str(r['crc_per_sec']):>7} "
-            f"{str(r['output_drops_per_sec']):>10} "
-            f"{str(r['resets_delta']):>7} "
-            f"{r['cumulative_errors']:>10}"
-        )
+def poll_device(
+    connection,
+    count: int,
+    interval: int,
+    threshold: int,
+    output_file: Optional[str],
+) -> int:
+    """Run polling loop; return number of threshold-exceeding events observed."""
+    log.info("Taking baseline snapshot...")
+    baseline = parse_interface_counters(connection.send_command("show interfaces"))
+    log.info("Baseline captured for %d interfaces", len(baseline))
 
+    alert_count = 0
+    fh = None
+    writer = None
 
-def write_csv(rows: List[dict], path: str) -> None:
-    if not rows:
-        return
-    with open(path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=rows[0].keys())
-        writer.writeheader()
-        writer.writerows(rows)
-    log.info("Wrote %d rows to %s", len(rows), path)
+    if output_file:
+        fh = open(output_file, "w", newline="")
+        writer = csv.writer(fh)
+        writer.writerow(["timestamp", "interface", "input_errors", "output_errors", "crc", "resets"])
+
+    try:
+        for i in range(1, count + 1):
+            time.sleep(interval)
+            timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            current = parse_interface_counters(connection.send_command("show interfaces"))
+            delta = compute_delta(baseline, current)
+            baseline = current
+
+            alerts = [
+                (iface, d)
+                for iface, d in delta.items()
+                if d["input_errors"] + d["output_errors"] >= threshold
+            ]
+            alert_count += len(alerts)
+
+            if alerts:
+                log.warning("[%d/%d] %d interface(s) exceeded threshold:", i, count, len(alerts))
+                for iface, d in alerts:
+                    log.warning(
+                        "  %-35s  in_err=%-6d  out_err=%-6d  crc=%-6d  resets=%d",
+                        iface, d["input_errors"], d["output_errors"], d["crc"], d["resets"],
+                    )
+            else:
+                log.info("[%d/%d] No interfaces exceeded threshold of %d errors", i, count, threshold)
+
+            if writer:
+                for iface, d in delta.items():
+                    writer.writerow([timestamp, iface, d["input_errors"], d["output_errors"], d["crc"], d["resets"]])
+    finally:
+        if fh:
+            fh.close()
+            log.info("Results written to %s", output_file)
+
+    return alert_count
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Collect interface error rates from network devices")
-    p.add_argument("-H", "--host", required=True)
-    p.add_argument("-u", "--username", required=True)
-    p.add_argument("-p", "--password", help="Prompted if omitted")
-    p.add_argument("-t", "--device-type", default="cisco_ios", metavar="TYPE",
-                   help="Netmiko device type (default: cisco_ios)")
-    p.add_argument("--sample-interval", type=int, default=0, metavar="SEC",
-                   help="Seconds between two samples to calculate rates (0 = snapshot only)")
-    p.add_argument("--threshold", type=float, default=0, metavar="N",
-                   help="Hide interfaces with cumulative errors below N (default: show all)")
-    p.add_argument("-o", "--output", metavar="FILE.csv", help="Save results to CSV")
-    p.add_argument("-v", "--verbose", action="store_true")
+    p = argparse.ArgumentParser(
+        description="Poll network device interface error counters and alert on threshold crossings."
+    )
+    p.add_argument("-d", "--device", required=True, help="Device hostname or IP")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", required=True, help="SSH password")
+    p.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        choices=["cisco_ios", "cisco_xe", "cisco_nxos", "cisco_xr"],
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("--interval", type=int, default=60, help="Polling interval in seconds (default: 60)")
+    p.add_argument("--count", type=int, default=5, help="Number of polling cycles (default: 5)")
+    p.add_argument(
+        "--threshold",
+        type=int,
+        default=10,
+        help="Combined input+output error delta that triggers an alert (default: 10)",
+    )
+    p.add_argument("--output", metavar="FILE", help="Write per-interval counters to CSV")
+    p.add_argument("--verbose", action="store_true", help="Enable debug logging")
     return p
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+if __name__ == "__main__":
+    parser = build_parser()
+    args = parser.parse_args()
+
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    password = args.password or getpass.getpass(f"Password for {args.username}@{args.host}: ")
-    device = {"device_type": args.device_type, "host": args.host,
-               "username": args.username, "password": password}
+    device_params = {
+        "device_type": args.device_type,
+        "host": args.device,
+        "username": args.username,
+        "password": args.password,
+        "port": args.port,
+    }
 
+    log.info("Connecting to %s (%s)...", args.device, args.device_type)
     try:
-        log.info("Connecting to %s as %s", args.host, args.username)
-        with ConnectHandler(**device) as conn:
-            try:
-                conn.enable()
-            except Exception:
-                pass  # device may not require enable
-
-            log.info("Collecting sample 1")
-            s1 = parse_show_interfaces(conn.send_command("show interfaces", read_timeout=60))
-
-            if args.sample_interval > 0:
-                log.info("Waiting %ds for sample 2...", args.sample_interval)
-                time.sleep(args.sample_interval)
-                log.info("Collecting sample 2")
-                s2 = parse_show_interfaces(conn.send_command("show interfaces", read_timeout=60))
-                rows = compute_rates(s1, s2, args.sample_interval)
-            else:
-                rows = snapshot_rows(s1)
-
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.host)
-        return 1
-    except NetmikoTimeoutException:
-        log.error("Connection timed out to %s", args.host)
-        return 1
-    except Exception as exc:
-        log.error("Unexpected error: %s", exc)
-        return 1
-
-    print_table(rows, args.threshold)
-    if args.output:
-        write_csv(rows, args.output)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+        with ConnectHandler(**device_params) as conn:
+            log.info(
+                "Connected. Starting %d polls at %ds intervals (alert threshold: %d errors/interval)",
+                args.count, args.interval, args.threshold,
+            )
+            total_alerts = poll_device(conn, args.count, args.interval, args.threshold, args.output)
+            log.info("Done. %d alert event(s) across %d polls.", total_alerts, args.count)
+    except NetMikoAuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.device)
+        sys.exit(1)
+    except NetMikoTimeoutException:
+        log.error("Connection timed out to %s", args.device)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        log.info("Interrupted by user")
+        sys.exit(0)
 ```
+
+**What it does:** Connects to a Cisco device, captures a baseline `show interfaces` snapshot, then polls on `--interval` seconds for `--count` cycles. Each cycle it diffs input errors, output errors, CRC, and resets against the previous snapshot, logs a `WARNING` for any interface where the combined error delta crosses `--threshold`, and optionally writes all per-interval counters to CSV.
+
+**What makes it distinct:** None of the existing scripts do counter-delta polling or threshold alerting — `health_check.py` is a one-shot status check, not a time-series error-rate monitor.
