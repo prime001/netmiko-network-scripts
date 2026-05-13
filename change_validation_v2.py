@@ -1,210 +1,194 @@
-route_verify.py - Post-change routing table verification
+```python
+"""
+interface_snapshot.py — Pre/post-change interface state comparator.
 
-Purpose:
-    Connects to a network device and verifies that expected routes exist in the
-    routing table. Optionally validates next-hop IP and administrative distance.
-    Designed for post-change validation after routing configuration changes.
+Captures a baseline snapshot of interface error counters and operational status,
+then compares a fresh reading against that baseline to surface drift introduced
+during a maintenance window.
 
 Usage:
-    python route_verify.py --host 10.0.0.1 --username admin --password secret \
-        --routes 10.1.0.0/24 10.2.0.0/24 --nexthop 10.0.0.254
+    # Capture baseline before the change:
+    python interface_snapshot.py --host 192.168.1.1 --user admin --password secret \
+        --snapshot --baseline-file /tmp/pre_change.json
 
-    python route_verify.py --host 10.0.0.1 --username admin --password secret \
-        --routes 0.0.0.0/0 192.168.0.0/16 --max-ad 110 --device-type cisco_xe
+    # Compare current state after the change:
+    python interface_snapshot.py --host 192.168.1.1 --user admin --password secret \
+        --compare --baseline-file /tmp/pre_change.json
+
+    Exit code 0 = no drift; exit code 1 = drift detected or error.
 
 Prerequisites:
     pip install netmiko
-    Supported: cisco_ios, cisco_xe, cisco_nxos, cisco_xr
+    Device must support 'show interfaces' (Cisco IOS/IOS-XE/NX-OS).
 """
 
 import argparse
+import json
 import logging
 import re
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
-from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-ROUTE_COMMANDS = {
-    "cisco_ios": "show ip route {prefix}",
-    "cisco_xe": "show ip route {prefix}",
-    "cisco_nxos": "show ip route {prefix}",
-    "cisco_xr": "show route {prefix}",
-}
+COUNTER_FIELDS = ("input_errors", "output_errors", "crc", "resets")
 
 
-def parse_route_output(output: str, prefix: str) -> dict:
-    result = {
-        "prefix": prefix,
-        "found": False,
-        "nexthops": [],
-        "protocol": None,
-        "ad": None,
-        "metric": None,
+def parse_interfaces(raw: str) -> dict:
+    """Return per-interface state and counters parsed from 'show interfaces'."""
+    interfaces = {}
+    current = None
+
+    for line in raw.splitlines():
+        header = re.match(r'^(\S+)\s+is\s+(administratively\s+down|up|down)', line, re.IGNORECASE)
+        if header:
+            current = header.group(1)
+            admin_down = "administratively" in line.lower()
+            oper_up = line.lower().split(" is ")[-1].strip().startswith("up")
+            interfaces[current] = {
+                "admin": "down" if admin_down else "up",
+                "oper": "up" if oper_up else "down",
+                "input_errors": 0,
+                "output_errors": 0,
+                "crc": 0,
+                "resets": 0,
+            }
+            continue
+
+        if current is None:
+            continue
+
+        for pattern, field in (
+            (r"(\d+)\s+input errors", "input_errors"),
+            (r"(\d+)\s+output errors", "output_errors"),
+            (r"(\d+)\s+CRC", "crc"),
+            (r"(\d+)\s+interface resets", "resets"),
+        ):
+            m = re.search(pattern, line, re.IGNORECASE)
+            if m:
+                interfaces[current][field] = int(m.group(1))
+
+    return interfaces
+
+
+def capture_snapshot(conn, baseline_path: Path) -> None:
+    """Write current interface state to a JSON baseline file."""
+    log.info("Collecting interface data from %s...", conn.host)
+    raw = conn.send_command("show interfaces", read_timeout=60)
+    interfaces = parse_interfaces(raw)
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "host": conn.host,
+        "interfaces": interfaces,
     }
+    baseline_path.write_text(json.dumps(payload, indent=2))
+    log.info("Snapshot saved to %s (%d interfaces)", baseline_path, len(interfaces))
 
-    if not output.strip() or output.strip().startswith("%"):
-        return result
-    if "not in table" in output.lower():
-        return result
 
-    result["found"] = True
+def compare_snapshot(conn, baseline_path: Path) -> bool:
+    """Compare current interface state to a saved baseline. Returns True if clean."""
+    if not baseline_path.exists():
+        log.error("Baseline file not found: %s", baseline_path)
+        return False
 
-    proto_match = re.search(
-        r"^([A-Z*][A-Za-z0-9 ]*?)\s+\d+\.\d+\.\d+\.\d+", output, re.MULTILINE
+    baseline = json.loads(baseline_path.read_text())
+    log.info(
+        "Loaded baseline for %s captured at %s",
+        baseline["host"],
+        baseline["timestamp"],
     )
-    if proto_match:
-        result["protocol"] = proto_match.group(1).strip()
 
-    ad_metric = re.search(r"\[(\d+)/(\d+)\]", output)
-    if ad_metric:
-        result["ad"] = int(ad_metric.group(1))
-        result["metric"] = int(ad_metric.group(2))
+    log.info("Collecting current interface data from %s...", conn.host)
+    raw = conn.send_command("show interfaces", read_timeout=60)
+    current = parse_interfaces(raw)
 
-    result["nexthops"] = re.findall(r"via (\d+\.\d+\.\d+\.\d+)", output)
-    return result
+    diffs = []
 
-
-def verify_routes(conn, prefixes, expected_nexthop=None, max_ad=None, device_type="cisco_ios"):
-    cmd_tpl = ROUTE_COMMANDS.get(device_type, ROUTE_COMMANDS["cisco_ios"])
-    results = {}
-
-    for prefix in prefixes:
-        cmd = cmd_tpl.format(prefix=prefix)
-        logger.debug("Sending: %s", cmd)
-        try:
-            output = conn.send_command(cmd)
-        except Exception as exc:
-            logger.error("Command failed for %s: %s", prefix, exc)
-            results[prefix] = {"error": str(exc), "passed": False}
+    for iface, now in current.items():
+        pre = baseline["interfaces"].get(iface)
+        if pre is None:
+            diffs.append(f"  NEW   {iface}  (not present in baseline)")
             continue
 
-        info = parse_route_output(output, prefix)
-        info["passed"] = info["found"]
+        if pre["admin"] != now["admin"]:
+            diffs.append(f"  ADMIN {iface}: {pre['admin']} -> {now['admin']}")
+        if pre["oper"] != now["oper"]:
+            diffs.append(f"  OPER  {iface}: {pre['oper']} -> {now['oper']}")
 
-        if info["found"] and expected_nexthop and expected_nexthop not in info["nexthops"]:
-            info["passed"] = False
-            logger.warning(
-                "%s found but nexthop %s not in %s",
-                prefix, expected_nexthop, info["nexthops"],
-            )
+        for field in COUNTER_FIELDS:
+            delta = now[field] - pre.get(field, 0)
+            if delta > 0:
+                diffs.append(f"  {field.upper():<20s} {iface}: +{delta}")
 
-        if info["found"] and max_ad is not None and info["ad"] is not None:
-            if info["ad"] > max_ad:
-                info["passed"] = False
-                logger.warning(
-                    "%s AD %d exceeds max allowed %d", prefix, info["ad"], max_ad
-                )
+    for iface in baseline["interfaces"]:
+        if iface not in current:
+            diffs.append(f"  GONE  {iface}  (was in baseline, not seen now)")
 
-        results[prefix] = info
+    if diffs:
+        print(f"\nDrift detected — {len(diffs)} difference(s) found:")
+        for line in diffs:
+            print(line)
+        return False
 
-    return results
-
-
-def print_results(results, hostname):
-    passed = sum(1 for r in results.values() if r.get("passed"))
-    failed = len(results) - passed
-
-    print(f"\nRoute Verification Results — {hostname}")
-    print("=" * 65)
-    print(f"{'Prefix':<24} {'Status':<8} {'Proto':<10} {'AD/Metric':<12} Next-Hop(s)")
-    print("-" * 65)
-
-    for prefix, info in sorted(results.items()):
-        if info.get("error"):
-            print(f"{prefix:<24} {'ERROR':<8} -          -            {info['error'][:20]}")
-            continue
-
-        status = "PASS" if info["passed"] else "FAIL"
-        proto = info.get("protocol") or ("-" if not info["found"] else "?")
-        if info["ad"] is not None:
-            ad_metric = f"{info['ad']}/{info['metric']}"
-        else:
-            ad_metric = "-"
-        if info["nexthops"]:
-            nexthops = ", ".join(info["nexthops"])
-        elif info["found"]:
-            nexthops = "connected"
-        else:
-            nexthops = "missing"
-        print(f"{prefix:<24} {status:<8} {proto:<10} {ad_metric:<12} {nexthops}")
-
-    print("-" * 65)
-    print(f"Total: {len(results)}  Passed: {passed}  Failed: {failed}\n")
-    return 0 if failed == 0 else 1
+    print(f"\nClean — {len(current)} interfaces match baseline, no drift detected.")
+    return True
 
 
-def build_parser():
-    p = argparse.ArgumentParser(
-        description="Verify expected routes exist on a network device."
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Capture and compare interface state around a maintenance window.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--host", required=True, help="Device IP or hostname")
-    p.add_argument("--username", required=True, help="SSH username")
-    p.add_argument("--password", required=True, help="SSH password")
-    p.add_argument(
-        "--device-type",
-        default="cisco_ios",
-        choices=list(ROUTE_COMMANDS.keys()),
-        help="Netmiko device type (default: cisco_ios)",
+    parser.add_argument("--host", required=True, help="Device IP or hostname")
+    parser.add_argument("--user", required=True, help="SSH username")
+    parser.add_argument("--password", required=True, help="SSH password")
+    parser.add_argument(
+        "--device-type", default="cisco_ios",
+        help="Netmiko device type",
     )
-    p.add_argument(
-        "--routes",
-        nargs="+",
-        required=True,
-        metavar="PREFIX",
-        help="Prefixes to verify, e.g. 10.0.0.0/8 192.168.1.0/24",
+    parser.add_argument(
+        "--baseline-file", default="interface_baseline.json",
+        help="Path to baseline JSON file",
     )
-    p.add_argument("--nexthop", metavar="IP", help="Required next-hop IP address")
-    p.add_argument(
-        "--max-ad", type=int, metavar="N", help="Fail routes with AD above this value"
-    )
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds")
-    p.add_argument("--verbose", action="store_true", help="Debug logging")
-    return p
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--snapshot", action="store_true", help="Capture baseline snapshot")
+    mode.add_argument("--compare", action="store_true", help="Compare current state to baseline")
+    return parser
 
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
     device_params = {
         "device_type": args.device_type,
         "host": args.host,
-        "username": args.username,
+        "username": args.user,
         "password": args.password,
-        "port": args.port,
-        "timeout": args.timeout,
     }
 
-    logger.info("Connecting to %s (%s)", args.host, args.device_type)
     try:
+        log.info("Connecting to %s...", args.host)
         with ConnectHandler(**device_params) as conn:
-            hostname = conn.find_prompt().rstrip("#> ")
-            logger.info("Connected — %s", hostname)
-            results = verify_routes(
-                conn,
-                args.routes,
-                expected_nexthop=args.nexthop,
-                max_ad=args.max_ad,
-                device_type=args.device_type,
-            )
+            baseline_path = Path(args.baseline_file)
+            if args.snapshot:
+                capture_snapshot(conn, baseline_path)
+            else:
+                clean = compare_snapshot(conn, baseline_path)
+                sys.exit(0 if clean else 1)
     except NetmikoAuthenticationException:
-        logger.error("Authentication failed for %s@%s", args.username, args.host)
-        sys.exit(2)
+        log.error("Authentication failed for %s", args.host)
+        sys.exit(1)
     except NetmikoTimeoutException:
-        logger.error("Connection timed out to %s", args.host)
-        sys.exit(2)
+        log.error("Connection timed out to %s", args.host)
+        sys.exit(1)
     except Exception as exc:
-        logger.error("Unexpected error: %s", exc)
-        sys.exit(2)
-
-    sys.exit(print_results(results, hostname))
+        log.error("Unexpected error: %s", exc)
+        sys.exit(1)
+```
