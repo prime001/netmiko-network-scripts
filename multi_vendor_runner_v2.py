@@ -1,26 +1,26 @@
 ```python
-"""vlan_audit.py — Multi-switch VLAN consistency auditor
+"""
+mac_tracer.py - MAC Address to Switch Port Tracer
 
-Purpose:
-    Connects to one or more switches, collects VLAN databases and trunk
-    assignments, and reports VLANs that are missing from some switches.
-    Optionally compares against a saved JSON baseline to detect drift.
+Locates a MAC address (or resolves an IP via ARP then locates the MAC)
+across one or more switches by querying CAM tables over SSH with netmiko.
+Common use cases: finding where a rogue device is plugged in, pinpointing
+a workstation's physical port, or auditing MAC table entries.
 
 Usage:
-    python vlan_audit.py --hosts 10.0.0.1 10.0.0.2 --username admin
-    python vlan_audit.py --hosts-file switches.txt --username admin \\
-        --baseline vlans_baseline.json
-    python vlan_audit.py --hosts 10.0.0.1 --username admin \\
-        --save-baseline vlans_baseline.json
+    python mac_tracer.py --hosts 10.0.0.1,10.0.0.2 --mac 00:1a:2b:3c:4d:5e
+    python mac_tracer.py --hosts 10.0.0.1 --ip 192.168.1.100
+    python mac_tracer.py --inventory hosts.txt --mac aa:bb:cc:dd:ee:ff --username admin
 
 Prerequisites:
     pip install netmiko
-    Devices must support 'show vlan brief' and 'show interfaces trunk'
+    SSH read access to target switches.
+    Supported: cisco_ios, cisco_nxos, arista_eos, hp_comware.
 """
 
 import argparse
-import json
 import logging
+import re
 import sys
 from getpass import getpass
 
@@ -28,178 +28,188 @@ from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stderr,
 )
 log = logging.getLogger(__name__)
 
+MAC_COMMANDS = {
+    "cisco_ios": "show mac address-table address {mac}",
+    "cisco_nxos": "show mac address-table address {mac}",
+    "arista_eos": "show mac address-table address {mac}",
+    "hp_comware": "display mac-address {mac}",
+}
 
-def parse_vlan_brief(output):
-    """Return {vlan_id: name} from 'show vlan brief' output."""
-    vlans = {}
-    for line in output.splitlines():
-        parts = line.split()
-        if parts and parts[0].isdigit():
-            vlans[int(parts[0])] = parts[1] if len(parts) > 1 else ""
-    return vlans
-
-
-def parse_trunk_interfaces(output):
-    """Return list of trunking interface names from 'show interfaces trunk'."""
-    trunks = []
-    for line in output.splitlines():
-        parts = line.split()
-        if len(parts) >= 3 and parts[2] in ("trunking", "802.1q"):
-            trunks.append(parts[0])
-    return trunks
+ARP_COMMANDS = {
+    "cisco_ios": "show arp {ip}",
+    "cisco_nxos": "show ip arp {ip}",
+    "arista_eos": "show arp {ip}",
+    "hp_comware": "display arp {ip}",
+}
 
 
-def collect_device_vlans(host, device_type, username, password, port):
-    """Connect to a device and return its VLAN and trunk data, or None on failure."""
-    params = {
-        "device_type": device_type,
-        "host": host,
-        "username": username,
-        "password": password,
-        "port": port,
-    }
-    try:
-        log.info("Connecting to %s", host)
-        with ConnectHandler(**params) as conn:
-            vlan_output = conn.send_command("show vlan brief")
-            trunk_output = conn.send_command("show interfaces trunk")
-            return {
-                "vlans": parse_vlan_brief(vlan_output),
-                "trunks": parse_trunk_interfaces(trunk_output),
-            }
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed: %s", host)
-    except NetmikoTimeoutException:
-        log.error("Connection timed out: %s", host)
-    except Exception as exc:
-        log.error("Error on %s: %s", host, exc)
-    return None
+def normalize_mac(mac: str) -> str:
+    digits = re.sub(r"[^0-9a-fA-F]", "", mac)
+    if len(digits) != 12:
+        raise ValueError(f"Invalid MAC address: {mac!r}")
+    return ":".join(digits[i:i + 2] for i in range(0, 12, 2)).lower()
 
 
-def build_report(results, baseline=None):
-    """Cross-reference VLANs across all reachable devices."""
-    reachable = {h: d for h, d in results.items() if d is not None}
-    all_vlan_ids = set()
-    for data in reachable.values():
-        all_vlan_ids.update(data["vlans"].keys())
-
-    report = {"all_vlans": sorted(all_vlan_ids), "devices": {}}
-
-    for host, data in results.items():
-        if data is None:
-            report["devices"][host] = {"error": "unreachable"}
-            continue
-
-        device_vlans = set(data["vlans"].keys())
-        entry = {
-            "vlan_count": len(device_vlans),
-            "trunk_count": len(data["trunks"]),
-            "missing_vlans": sorted(all_vlan_ids - device_vlans),
-        }
-
-        if baseline:
-            baseline_vlans = set(baseline.get("vlans", []))
-            entry["added_since_baseline"] = sorted(device_vlans - baseline_vlans)
-            entry["removed_since_baseline"] = sorted(baseline_vlans - device_vlans)
-
-        report["devices"][host] = entry
-
-    return report
+def resolve_ip_to_mac(conn, device_type: str, ip: str) -> str | None:
+    cmd_tpl = ARP_COMMANDS.get(device_type)
+    if not cmd_tpl:
+        log.warning("No ARP command defined for %s", device_type)
+        return None
+    output = conn.send_command(cmd_tpl.format(ip=ip))
+    match = re.search(
+        r"([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}"
+        r"|[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})",
+        output,
+    )
+    return normalize_mac(match.group(1)) if match else None
 
 
-def print_report(report):
-    divider = "=" * 60
-    print(f"\n{divider}")
-    print("VLAN AUDIT REPORT")
-    print(divider)
-    print(f"Total unique VLANs across all devices: {len(report['all_vlans'])}")
-    print(f"VLANs present: {report['all_vlans']}\n")
+def query_mac_table(conn, device_type: str, mac: str) -> list[dict]:
+    cmd_tpl = MAC_COMMANDS.get(device_type)
+    if not cmd_tpl:
+        log.warning("No MAC table command defined for %s", device_type)
+        return []
+    if device_type in ("cisco_ios", "cisco_nxos"):
+        d = mac.replace(":", "")
+        query_mac = f"{d[0:4]}.{d[4:8]}.{d[8:12]}"
+    else:
+        query_mac = mac
+    output = conn.send_command(cmd_tpl.format(mac=query_mac))
+    return _parse_cam(output, device_type)
 
-    for host, dev in report["devices"].items():
-        print(f"  {host}")
-        if "error" in dev:
-            print(f"    ERROR: {dev['error']}")
-            continue
-        print(f"    VLANs: {dev['vlan_count']}  Trunks: {dev['trunk_count']}")
-        missing = dev["missing_vlans"]
-        print(f"    Missing from this device: {missing if missing else 'none'}")
-        if "added_since_baseline" in dev:
-            added = dev["added_since_baseline"]
-            removed = dev["removed_since_baseline"]
-            if added:
-                print(f"    Added since baseline:   {added}")
-            if removed:
-                print(f"    Removed since baseline: {removed}")
 
-    print(divider + "\n")
+def _parse_cam(output: str, device_type: str) -> list[dict]:
+    results = []
+    if device_type in ("cisco_ios", "cisco_nxos"):
+        pat = re.compile(
+            r"^\s*(\d+)\s+([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+\S+\s+(\S+)",
+            re.MULTILINE,
+        )
+        for m in pat.finditer(output):
+            results.append({"vlan": m.group(1), "mac": m.group(2), "port": m.group(3)})
+    elif device_type == "arista_eos":
+        pat = re.compile(
+            r"^\s*(\d+)\s+([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\s+\S+\s+(\S+)",
+            re.MULTILINE,
+        )
+        for m in pat.finditer(output):
+            results.append({"vlan": m.group(1), "mac": m.group(2), "port": m.group(3)})
+    elif device_type == "hp_comware":
+        pat = re.compile(
+            r"([0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4})\s+(\d+)\s+\S+\s+(\S+)",
+            re.MULTILINE,
+        )
+        for m in pat.finditer(output):
+            results.append({"vlan": m.group(2), "mac": m.group(1), "port": m.group(3)})
+    return results
+
+
+def connect(host: str, username: str, password: str, device_type: str, port: int):
+    return ConnectHandler(
+        device_type=device_type,
+        host=host,
+        username=username,
+        password=password,
+        port=port,
+        timeout=15,
+    )
+
+
+def load_hosts(path: str) -> list[str]:
+    with open(path) as f:
+        return [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Audit VLAN consistency across multiple switches"
+        description="Trace a MAC address or IP to its switch port."
     )
-    host_group = parser.add_mutually_exclusive_group(required=True)
-    host_group.add_argument("--hosts", nargs="+", metavar="HOST",
-                            help="Device IP(s) or hostnames")
-    host_group.add_argument("--hosts-file", metavar="FILE",
-                            help="File with one host per line (# for comments)")
-    parser.add_argument("--username", required=True)
-    parser.add_argument("--password", default=None,
-                        help="Prompt if omitted")
-    parser.add_argument("--device-type", default="cisco_ios",
-                        help="Netmiko device type (default: cisco_ios)")
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--mac", help="MAC address to locate (any common format)")
+    target.add_argument("--ip", help="IP address to resolve via ARP then locate")
+
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("--hosts", help="Comma-separated switch IPs/hostnames")
+    src.add_argument("--inventory", help="File with one host per line")
+
+    parser.add_argument("--username", default="admin")
+    parser.add_argument("--password", help="SSH password (prompted if omitted)")
+    parser.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        choices=list(MAC_COMMANDS.keys()),
+    )
     parser.add_argument("--port", type=int, default=22)
-    parser.add_argument("--baseline", metavar="FILE",
-                        help="JSON baseline file to compare against")
-    parser.add_argument("--save-baseline", metavar="FILE",
-                        help="Save current VLAN union to a JSON baseline file")
-    parser.add_argument("--json-out", metavar="FILE",
-                        help="Write full report to a JSON file")
+    parser.add_argument(
+        "--gateway",
+        help="Host used for ARP resolution when --ip is given; defaults to first host",
+    )
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     password = args.password or getpass(f"Password for {args.username}: ")
 
-    if args.hosts_file:
-        with open(args.hosts_file) as fh:
-            hosts = [l.strip() for l in fh if l.strip() and not l.startswith("#")]
+    hosts = (
+        [h.strip() for h in args.hosts.split(",") if h.strip()]
+        if args.hosts
+        else load_hosts(args.inventory)
+    )
+    if not hosts:
+        parser.error("No hosts specified.")
+
+    mac = None
+    if args.mac:
+        try:
+            mac = normalize_mac(args.mac)
+        except ValueError as e:
+            parser.error(str(e))
     else:
-        hosts = args.hosts
+        gateway = args.gateway or hosts[0]
+        try:
+            conn = connect(gateway, args.username, password, args.device_type, args.port)
+            mac = resolve_ip_to_mac(conn, args.device_type, args.ip)
+            conn.disconnect()
+        except (NetmikoAuthenticationException, NetmikoTimeoutException) as e:
+            print(f"[ERROR] Cannot connect to gateway {gateway}: {e}", file=sys.stderr)
+            sys.exit(1)
+        if not mac:
+            print(f"[ERROR] Could not resolve {args.ip} to a MAC address.", file=sys.stderr)
+            sys.exit(1)
+        print(f"Resolved {args.ip} → {mac}")
 
-    baseline = None
-    if args.baseline:
-        with open(args.baseline) as fh:
-            baseline = json.load(fh)
-        log.info("Loaded baseline from %s (%d VLANs)", args.baseline,
-                 len(baseline.get("vlans", [])))
+    found = False
+    for host in hosts:
+        log.debug("Querying %s for MAC %s", host, mac)
+        try:
+            conn = connect(host, args.username, password, args.device_type, args.port)
+            entries = query_mac_table(conn, args.device_type, mac)
+            conn.disconnect()
+        except NetmikoAuthenticationException:
+            print(f"[{host}] Authentication failed", file=sys.stderr)
+            continue
+        except NetmikoTimeoutException:
+            print(f"[{host}] Connection timed out", file=sys.stderr)
+            continue
 
-    results = {
-        host: collect_device_vlans(host, args.device_type, args.username,
-                                   password, args.port)
-        for host in hosts
-    }
+        if entries:
+            found = True
+            for e in entries:
+                print(f"[FOUND] host={host}  vlan={e['vlan']}  mac={e['mac']}  port={e['port']}")
+        else:
+            print(f"[    ] {host}: not found")
 
-    report = build_report(results, baseline)
-    print_report(report)
-
-    if args.save_baseline:
-        all_vlans = sorted({v for d in results.values() if d for v in d["vlans"]})
-        with open(args.save_baseline, "w") as fh:
-            json.dump({"vlans": all_vlans, "devices": hosts}, fh, indent=2)
-        log.info("Baseline saved to %s", args.save_baseline)
-
-    if args.json_out:
-        with open(args.json_out, "w") as fh:
-            json.dump(report, fh, indent=2)
-        log.info("Report written to %s", args.json_out)
-
-    unreachable = sum(1 for d in report["devices"].values() if "error" in d)
-    sys.exit(1 if unreachable else 0)
+    if not found:
+        print(f"\nMAC {mac} not found on any queried device.")
+        sys.exit(2)
 
 
 if __name__ == "__main__":
