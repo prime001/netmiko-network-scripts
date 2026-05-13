@@ -1,201 +1,220 @@
-This is a generation request — I'll produce the script directly.
-
 ```python
 """
-mac_table_lookup.py — MAC Address Table Collector and Host Locator
+lldp_cdp_mapper.py - Network topology discovery via LLDP/CDP neighbor crawling.
 
 Purpose:
-    Connects to a network switch, retrieves the MAC address table, and
-    optionally cross-references the ARP table to resolve IP addresses.
-    Useful for quickly determining which switch port and VLAN a host is
-    connected to without logging in manually.
+    Connects to a seed device and discovers adjacent devices by parsing LLDP/CDP
+    neighbor tables. Optionally performs a multi-hop BFS crawl to build a topology
+    map and exports results as a human-readable adjacency table or JSON file.
 
 Usage:
-    # Dump full MAC table
-    python mac_table_lookup.py -H 192.168.1.1 -u admin -p secret
-
-    # Locate a specific host by MAC (any format accepted)
-    python mac_table_lookup.py -H 192.168.1.1 -u admin -p secret --mac aa:bb:cc:dd:ee:ff
-
-    # Include IP addresses via ARP cross-reference, save to CSV
-    python mac_table_lookup.py -H 192.168.1.1 -u admin -p secret --arp --output results.csv
+    python lldp_cdp_mapper.py --host 10.0.0.1 -u admin -p secret
+    python lldp_cdp_mapper.py --host 10.0.0.1 -u admin -p secret --depth 3 --protocol lldp
+    python lldp_cdp_mapper.py --host 10.0.0.1 -u admin -p secret --json-out topology.json
 
 Prerequisites:
     pip install netmiko
-    Cisco IOS, IOS-XE, or NX-OS device with 'show mac address-table' support.
-    Read-only credentials (privilege level 1) are sufficient.
+    Device must have CDP or LLDP enabled; user requires at minimum read-only access.
+    Multi-hop crawl requires reachability and credentials on each discovered neighbor.
 """
 
 import argparse
-import csv
+import json
 import logging
 import re
 import sys
-from typing import Optional
+from collections import defaultdict
+from getpass import getpass
 
-from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.StreamHandler()],
+    datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-MAC_TABLE_CMD = "show mac address-table"
-ARP_TABLE_CMD = "show ip arp"
-
-_MAC_RE = re.compile(
-    r"^\s*(\d+)\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+\S+\s+(\S+)",
-    re.IGNORECASE | re.MULTILINE,
-)
-_ARP_RE = re.compile(
-    r"Internet\s+(\d+\.\d+\.\d+\.\d+)\s+\S+\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})",
-    re.IGNORECASE,
-)
-_SKIP_INTERFACES = {"CPU", "DROP", "STATIC", "ROUTER"}
+SUPPORTED_DEVICE_TYPES = [
+    "cisco_ios", "cisco_xe", "cisco_nxos", "cisco_xr", "arista_eos",
+]
 
 
-def parse_mac_table(output: str) -> list[dict]:
-    entries = []
-    for m in _MAC_RE.finditer(output):
-        vlan, mac, iface = m.group(1), m.group(2).lower(), m.group(3)
-        if iface.upper() in _SKIP_INTERFACES:
+def parse_cdp_neighbors(output):
+    neighbors = []
+    for block in re.split(r"-{10,}", output):
+        if not block.strip():
             continue
-        entries.append({"vlan": vlan, "mac": mac, "interface": iface, "ip": ""})
-    return entries
+        entry = {}
+        m = re.search(r"Device ID:\s*(\S+)", block)
+        if m:
+            entry["device_id"] = m.group(1)
+        m = re.search(r"IP(?:v4)? address:\s*(\d[\d.]+)", block, re.IGNORECASE)
+        if m:
+            entry["mgmt_ip"] = m.group(1)
+        m = re.search(r"Platform:\s*([^,\n]+)", block)
+        if m:
+            entry["platform"] = m.group(1).strip()
+        m = re.search(r"Interface:\s*(\S+),\s*Port ID[^:]*:\s*(\S+)", block)
+        if m:
+            entry["local_port"] = m.group(1).rstrip(",")
+            entry["remote_port"] = m.group(2)
+        if entry.get("device_id"):
+            neighbors.append(entry)
+    return neighbors
 
 
-def parse_arp_table(output: str) -> dict[str, str]:
-    return {
-        m.group(2).lower(): m.group(1)
-        for m in _ARP_RE.finditer(output)
-    }
+def parse_lldp_neighbors(output):
+    neighbors = []
+    for block in re.split(r"(?=Local\s+Intf)", output, flags=re.IGNORECASE):
+        if not block.strip():
+            continue
+        entry = {}
+        m = re.search(r"System Name:\s*(\S+)", block, re.IGNORECASE)
+        if m:
+            entry["device_id"] = m.group(1)
+        m = re.search(r"(?:Management Address|IP[v4]*).*?(\d{1,3}(?:\.\d{1,3}){3})",
+                      block, re.IGNORECASE | re.DOTALL)
+        if m:
+            entry["mgmt_ip"] = m.group(1)
+        m = re.search(r"System Description:\s*(.+)", block)
+        if m:
+            entry["platform"] = m.group(1).strip()[:60]
+        m = re.search(r"Local\s+Intf[a-z]*:\s*(\S+)", block, re.IGNORECASE)
+        if m:
+            entry["local_port"] = m.group(1)
+        m = re.search(r"Port\s+(?:id|ID):\s*(\S+)", block)
+        if m:
+            entry["remote_port"] = m.group(1)
+        if entry.get("device_id"):
+            neighbors.append(entry)
+    return neighbors
 
 
-def normalize_mac(mac: str) -> str:
-    digits = re.sub(r"[^0-9a-fA-F]", "", mac).lower()
-    if len(digits) != 12:
-        raise ValueError(f"Invalid MAC address: {mac!r}")
-    return f"{digits[0:4]}.{digits[4:8]}.{digits[8:12]}"
-
-
-def collect(
-    host: str,
-    username: str,
-    password: str,
-    device_type: str,
-    mac_filter: Optional[str],
-    use_arp: bool,
-) -> list[dict]:
+def query_device(host, username, password, device_type, protocol):
     device_params = {
         "device_type": device_type,
         "host": host,
         "username": username,
         "password": password,
+        "timeout": 20,
+        "session_log": None,
     }
-    log.info("Connecting to %s (%s)", host, device_type)
     try:
+        log.info("Connecting to %s", host)
         with ConnectHandler(**device_params) as conn:
-            log.info("Fetching MAC address table")
-            entries = parse_mac_table(conn.send_command(MAC_TABLE_CMD))
-
-            arp_map: dict[str, str] = {}
-            if use_arp:
-                log.info("Fetching ARP table for IP resolution")
-                arp_map = parse_arp_table(conn.send_command(ARP_TABLE_CMD))
-
+            if protocol == "cdp":
+                output = conn.send_command("show cdp neighbors detail", read_timeout=30)
+                return parse_cdp_neighbors(output)
+            output = conn.send_command("show lldp neighbors detail", read_timeout=30)
+            return parse_lldp_neighbors(output)
     except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", username, host)
-        sys.exit(1)
+        log.error("Authentication failed: %s", host)
     except NetmikoTimeoutException:
-        log.error("Connection timed out to %s", host)
-        sys.exit(1)
-
-    for entry in entries:
-        entry["ip"] = arp_map.get(entry["mac"], "")
-
-    if mac_filter:
-        try:
-            target = normalize_mac(mac_filter)
-        except ValueError as exc:
-            log.error(exc)
-            sys.exit(1)
-        entries = [e for e in entries if e["mac"] == target]
-
-    return entries
+        log.error("Timeout: %s", host)
+    except Exception as exc:
+        log.error("Error on %s: %s", host, exc)
+    return None
 
 
-def print_table(entries: list[dict]) -> None:
-    if not entries:
-        print("No matching entries.")
-        return
-    fmt = "{:<8}{:<20}{:<25}{}"
-    print(fmt.format("VLAN", "MAC", "Interface", "IP"))
-    print("-" * 70)
-    for e in entries:
-        print(fmt.format(e["vlan"], e["mac"], e["interface"], e["ip"]))
+def crawl_topology(seed, username, password, device_type, protocol, max_depth):
+    adjacency = defaultdict(list)
+    visited = set()
+    queue = [(seed, 0)]
+
+    while queue:
+        host, depth = queue.pop(0)
+        if host in visited:
+            continue
+        visited.add(host)
+
+        neighbors = query_device(host, username, password, device_type, protocol)
+        if neighbors is None:
+            log.warning("Skipped %s (connection failed)", host)
+            continue
+
+        adjacency[host] = neighbors
+        log.info("  %s: %d neighbor(s) found", host, len(neighbors))
+
+        if depth < max_depth:
+            for nbr in neighbors:
+                nbr_ip = nbr.get("mgmt_ip")
+                if nbr_ip and nbr_ip not in visited:
+                    queue.append((nbr_ip, depth + 1))
+
+    return dict(adjacency)
 
 
-def write_csv(entries: list[dict], path: str) -> None:
-    with open(path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=["vlan", "mac", "interface", "ip"])
-        writer.writeheader()
-        writer.writerows(entries)
-    log.info("Results written to %s", path)
+def print_table(adjacency):
+    col = "{:<22} {:<16} {:<24} {:<18} {:<16}"
+    header = col.format("Local Device", "Neighbor IP", "Neighbor ID", "Local Port", "Remote Port")
+    separator = "-" * len(header)
+    print(separator)
+    print(header)
+    print(separator)
+    for device, neighbors in sorted(adjacency.items()):
+        if not neighbors:
+            print(col.format(device, "-", "(no neighbors found)", "-", "-"))
+            continue
+        for nbr in neighbors:
+            print(col.format(
+                device,
+                nbr.get("mgmt_ip", "unknown"),
+                nbr.get("device_id", "unknown"),
+                nbr.get("local_port", "-"),
+                nbr.get("remote_port", "-"),
+            ))
+    print(separator)
+    total_links = sum(len(v) for v in adjacency.values())
+    print(f"Devices crawled: {len(adjacency)}  |  Total adjacencies: {total_links}")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Collect MAC address table entries and optionally resolve IPs via ARP"
+def main():
+    parser = argparse.ArgumentParser(
+        description="Map network topology by crawling CDP/LLDP neighbor tables",
     )
-    p.add_argument("-H", "--host", required=True, help="Switch IP or hostname")
-    p.add_argument("-u", "--username", required=True)
-    p.add_argument("-p", "--password", required=True)
-    p.add_argument(
-        "-t", "--device-type",
-        default="cisco_ios",
-        help="Netmiko device type (default: cisco_ios)",
-    )
-    p.add_argument(
-        "--mac",
-        metavar="MAC",
-        help="Search for a single MAC (any separator format accepted)",
-    )
-    p.add_argument(
-        "--arp",
-        action="store_true",
-        help="Cross-reference ARP table to populate the IP column",
-    )
-    p.add_argument(
-        "--output",
-        metavar="FILE",
-        help="Write results to a CSV file",
-    )
-    p.add_argument("--debug", action="store_true", help="Enable debug logging")
-    return p
-
-
-if __name__ == "__main__":
-    parser = build_parser()
+    parser.add_argument("--host", required=True, help="Seed device IP or hostname")
+    parser.add_argument("--username", "-u", required=True, help="SSH username")
+    parser.add_argument("--password", "-p", default=None,
+                        help="SSH password (will prompt if omitted)")
+    parser.add_argument("--device-type", default="cisco_ios",
+                        choices=SUPPORTED_DEVICE_TYPES,
+                        help="Netmiko device type (default: cisco_ios)")
+    parser.add_argument("--protocol", choices=["cdp", "lldp"], default="cdp",
+                        help="Neighbor discovery protocol (default: cdp)")
+    parser.add_argument("--depth", type=int, default=1, metavar="N",
+                        help="Crawl hops from seed: 1=seed only, 2=+one hop (default: 1)")
+    parser.add_argument("--json-out", metavar="FILE",
+                        help="Write full topology to JSON file")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable verbose debug logging")
     args = parser.parse_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    results = collect(
-        host=args.host,
-        username=args.username,
-        password=args.password,
-        device_type=args.device_type,
-        mac_filter=args.mac,
-        use_arp=args.arp,
+    if args.depth < 1:
+        parser.error("--depth must be >= 1")
+
+    password = args.password or getpass(f"Password for {args.username}@{args.host}: ")
+
+    topology = crawl_topology(
+        args.host, args.username, password,
+        args.device_type, args.protocol, args.depth,
     )
 
-    print_table(results)
-    log.info("%d entr%s collected", len(results), "y" if len(results) == 1 else "ies")
+    if not topology:
+        log.error("No topology data collected — verify connectivity and credentials")
+        sys.exit(1)
 
-    if args.output:
-        write_csv(results, args.output)
+    print_table(topology)
+
+    if args.json_out:
+        with open(args.json_out, "w") as fh:
+            json.dump(topology, fh, indent=2)
+        log.info("Topology written to %s", args.json_out)
+
+
+if __name__ == "__main__":
+    main()
 ```
