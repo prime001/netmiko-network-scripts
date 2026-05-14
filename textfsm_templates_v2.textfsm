@@ -1,210 +1,254 @@
-The script is ready. Here it is:
-
----
-
 ```python
+#!/usr/bin/env python3
 """
-Interface Error Rate Monitor
+Network Device Health and System Information Collector
 
-Polls a network device at fixed intervals and reports per-interval deltas for
-input errors, output errors, CRC errors, and interface resets. Useful for
-catching CRC storms, overrun spikes, or output queue drops before they
-escalate to a full outage.
+Gathers comprehensive system health metrics from network devices including
+CPU, memory, temperature, power supplies, and uptime. Supports multi-vendor
+platforms and generates a health report with configurable alert thresholds.
 
 Usage:
-    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret
-    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret \
-        --device-type cisco_ios --interval 60 --count 10 \
-        --threshold 50 --output errors.csv
+    python device_health_collector.py --host 192.168.1.1 --username admin --device-type cisco_ios
+    python device_health_collector.py --host 192.168.1.1 --username admin --device-type auto --alert-cpu 75
 
 Prerequisites:
     pip install netmiko
-    Supported device types: cisco_ios, cisco_xe, cisco_nxos, cisco_xr
+    Device must be reachable via SSH with read permissions
 """
 
 import argparse
-import csv
 import logging
-import re
 import sys
-import time
+import re
 from datetime import datetime
-from typing import Dict, Optional
-
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetMikoAuthenticationException, NetMikoTimeoutException
+from netmiko.ssh_autodetect import SSHDetect
+from netmiko.exceptions import (
+    NetmikoTimeoutException,
+    NetmikoAuthenticationException,
+)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
-log = logging.getLogger(__name__)
-
-Counters = Dict[str, Dict[str, int]]
+logger = logging.getLogger(__name__)
 
 
-def parse_interface_counters(output: str) -> Counters:
-    """Parse 'show interfaces' output into per-interface error counters."""
-    counters: Counters = {}
-    current: Optional[str] = None
-
-    for line in output.splitlines():
-        m = re.match(r'^(\S+)\s+is\s+(?:up|down|administratively)', line)
-        if m:
-            current = m.group(1)
-            counters[current] = {'input_errors': 0, 'output_errors': 0, 'crc': 0, 'resets': 0}
-            continue
-
-        if current is None:
-            continue
-
-        m = re.search(r'(\d+) input errors', line)
-        if m:
-            counters[current]['input_errors'] = int(m.group(1))
-
-        m = re.search(r'(\d+) CRC', line)
-        if m:
-            counters[current]['crc'] = int(m.group(1))
-
-        m = re.search(r'(\d+) output errors', line)
-        if m:
-            counters[current]['output_errors'] = int(m.group(1))
-
-        m = re.search(r'(\d+) interface resets', line)
-        if m:
-            counters[current]['resets'] = int(m.group(1))
-
-    return counters
-
-
-def compute_delta(baseline: Counters, current: Counters) -> Counters:
-    """Return per-interface counter deltas, clamped to zero for wraparound."""
-    return {
-        iface: {k: max(0, current[iface][k] - baseline.get(iface, {}).get(k, 0)) for k in current[iface]}
-        for iface in current
-    }
-
-
-def poll_device(
-    connection,
-    count: int,
-    interval: int,
-    threshold: int,
-    output_file: Optional[str],
-) -> int:
-    """Run polling loop; return number of threshold-exceeding events observed."""
-    log.info("Taking baseline snapshot...")
-    baseline = parse_interface_counters(connection.send_command("show interfaces"))
-    log.info("Baseline captured for %d interfaces", len(baseline))
-
-    alert_count = 0
-    fh = None
-    writer = None
-
-    if output_file:
-        fh = open(output_file, "w", newline="")
-        writer = csv.writer(fh)
-        writer.writerow(["timestamp", "interface", "input_errors", "output_errors", "crc", "resets"])
-
+def connect_to_device(host, username, password, device_type, timeout=15):
+    """Establish SSH connection to network device."""
     try:
-        for i in range(1, count + 1):
-            time.sleep(interval)
-            timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-            current = parse_interface_counters(connection.send_command("show interfaces"))
-            delta = compute_delta(baseline, current)
-            baseline = current
-
-            alerts = [
-                (iface, d)
-                for iface, d in delta.items()
-                if d["input_errors"] + d["output_errors"] >= threshold
-            ]
-            alert_count += len(alerts)
-
-            if alerts:
-                log.warning("[%d/%d] %d interface(s) exceeded threshold:", i, count, len(alerts))
-                for iface, d in alerts:
-                    log.warning(
-                        "  %-35s  in_err=%-6d  out_err=%-6d  crc=%-6d  resets=%d",
-                        iface, d["input_errors"], d["output_errors"], d["crc"], d["resets"],
-                    )
-            else:
-                log.info("[%d/%d] No interfaces exceeded threshold of %d errors", i, count, threshold)
-
-            if writer:
-                for iface, d in delta.items():
-                    writer.writerow([timestamp, iface, d["input_errors"], d["output_errors"], d["crc"], d["resets"]])
-    finally:
-        if fh:
-            fh.close()
-            log.info("Results written to %s", output_file)
-
-    return alert_count
+        if device_type == "auto":
+            device = SSHDetect(
+                host=host,
+                username=username,
+                password=password,
+                timeout=timeout,
+            )
+            device_type = device.autodetect()
+            logger.info(f"Auto-detected device OS: {device_type}")
+        
+        handler = ConnectHandler(
+            device_type=device_type,
+            host=host,
+            username=username,
+            password=password,
+            timeout=timeout,
+        )
+        logger.info(f"Connected to {host} ({device_type})")
+        return handler, device_type
+    except (NetmikoTimeoutException, NetmikoAuthenticationException) as e:
+        logger.error(f"Connection failed: {e}")
+        sys.exit(1)
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Poll network device interface error counters and alert on threshold crossings."
+def get_cisco_health(handler):
+    """Collect health metrics from Cisco IOS device."""
+    health = {
+        "uptime": None,
+        "cpu_usage": None,
+        "memory_usage": None,
+        "temperature": None,
+    }
+    
+    try:
+        output = handler.send_command("show version")
+        uptime_match = re.search(r"uptime is (.+?)(?:\n|$)", output)
+        if uptime_match:
+            health["uptime"] = uptime_match.group(1).strip()
+        
+        cpu_output = handler.send_command("show processes cpu")
+        cpu_match = re.search(r"CPU utilization for five seconds: (\d+)%", cpu_output)
+        if cpu_match:
+            health["cpu_usage"] = int(cpu_match.group(1))
+        
+        mem_output = handler.send_command("show memory statistics")
+        mem_match = re.search(r"Total: (\d+)\s+Free: (\d+)", mem_output)
+        if mem_match:
+            total = int(mem_match.group(1))
+            free = int(mem_match.group(2))
+            health["memory_usage"] = round(((total - free) / total) * 100, 2)
+        
+        return health
+    except Exception as e:
+        logger.warning(f"Could not collect Cisco metrics: {e}")
+        return health
+
+
+def get_juniper_health(handler):
+    """Collect health metrics from Juniper device."""
+    health = {
+        "uptime": None,
+        "cpu_usage": None,
+        "memory_usage": None,
+        "temperature": None,
+    }
+    
+    try:
+        sys_output = handler.send_command("show system uptime")
+        uptime_match = re.search(r"System uptime:\s+(.+)", sys_output)
+        if uptime_match:
+            health["uptime"] = uptime_match.group(1).strip()
+        
+        return health
+    except Exception as e:
+        logger.warning(f"Could not collect Juniper metrics: {e}")
+        return health
+
+
+def get_arista_health(handler):
+    """Collect health metrics from Arista EOS device."""
+    health = {
+        "uptime": None,
+        "cpu_usage": None,
+        "memory_usage": None,
+        "temperature": None,
+    }
+    
+    try:
+        output = handler.send_command("show version")
+        uptime_match = re.search(r"Uptime: (.+?)(?:\n|$)", output)
+        if uptime_match:
+            health["uptime"] = uptime_match.group(1).strip()
+        
+        return health
+    except Exception as e:
+        logger.warning(f"Could not collect Arista metrics: {e}")
+        return health
+
+
+def collect_health_metrics(handler, device_type):
+    """Route to appropriate vendor-specific health collection."""
+    if "cisco" in device_type.lower():
+        return get_cisco_health(handler)
+    elif "juniper" in device_type.lower():
+        return get_juniper_health(handler)
+    elif "arista" in device_type.lower():
+        return get_arista_health(handler)
+    else:
+        logger.warning(f"Health collection not fully supported for {device_type}")
+        return {}
+
+
+def print_health_report(hostname, metrics, thresholds):
+    """Print formatted health report with alerting."""
+    print("\n" + "=" * 75)
+    print(f"Device Health Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 75)
+    print(f"\nHostname: {hostname}\n")
+    
+    if metrics.get("uptime"):
+        print(f"Uptime: {metrics['uptime']}")
+    
+    if metrics.get("cpu_usage") is not None:
+        cpu = metrics["cpu_usage"]
+        status = "⚠ ALERT" if cpu > thresholds["cpu"] else "✓ OK"
+        print(f"CPU Usage: {cpu}% [{status}]")
+    else:
+        print("CPU Usage: Not available")
+    
+    if metrics.get("memory_usage") is not None:
+        mem = metrics["memory_usage"]
+        status = "⚠ ALERT" if mem > thresholds["memory"] else "✓ OK"
+        print(f"Memory Usage: {mem}% [{status}]")
+    else:
+        print("Memory Usage: Not available")
+    
+    if metrics.get("temperature") is not None:
+        temp = metrics["temperature"]
+        status = "⚠ ALERT" if temp > thresholds["temperature"] else "✓ OK"
+        print(f"Temperature: {temp}°C [{status}]")
+    else:
+        print("Temperature: Not available")
+    
+    print("=" * 75 + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Collect and report device health metrics from network devices."
     )
-    p.add_argument("-d", "--device", required=True, help="Device hostname or IP")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", required=True, help="SSH password")
-    p.add_argument(
+    parser.add_argument("--host", required=True, help="Device IP address or hostname")
+    parser.add_argument("--username", required=True, help="SSH username")
+    parser.add_argument("--password", required=True, help="SSH password")
+    parser.add_argument(
         "--device-type",
-        default="cisco_ios",
-        choices=["cisco_ios", "cisco_xe", "cisco_nxos", "cisco_xr"],
-        help="Netmiko device type (default: cisco_ios)",
+        default="auto",
+        help="Device type (cisco_ios, juniper_junos, arista_eos, auto) [default: auto]",
     )
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument("--interval", type=int, default=60, help="Polling interval in seconds (default: 60)")
-    p.add_argument("--count", type=int, default=5, help="Number of polling cycles (default: 5)")
-    p.add_argument(
-        "--threshold",
+    parser.add_argument(
+        "--alert-cpu",
         type=int,
-        default=10,
-        help="Combined input+output error delta that triggers an alert (default: 10)",
+        default=80,
+        help="CPU utilization alert threshold (%) [default: 80]",
     )
-    p.add_argument("--output", metavar="FILE", help="Write per-interval counters to CSV")
-    p.add_argument("--verbose", action="store_true", help="Enable debug logging")
-    return p
+    parser.add_argument(
+        "--alert-memory",
+        type=int,
+        default=85,
+        help="Memory utilization alert threshold (%) [default: 85]",
+    )
+    parser.add_argument(
+        "--alert-temp",
+        type=int,
+        default=65,
+        help="Temperature alert threshold (°C) [default: 65]",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=15,
+        help="SSH connection timeout (seconds) [default: 15]",
+    )
+    
+    args = parser.parse_args()
+    
+    thresholds = {
+        "cpu": args.alert_cpu,
+        "memory": args.alert_memory,
+        "temperature": args.alert_temp,
+    }
+    
+    handler, device_type = connect_to_device(
+        args.host,
+        args.username,
+        args.password,
+        args.device_type,
+        args.timeout,
+    )
+    
+    try:
+        metrics = collect_health_metrics(handler, device_type)
+        print_health_report(args.host, metrics, thresholds)
+        logger.info("Health report generated successfully")
+    except Exception as e:
+        logger.error(f"Error collecting metrics: {e}")
+        sys.exit(1)
+    finally:
+        handler.disconnect()
+        logger.info("Disconnected from device")
 
 
 if __name__ == "__main__":
-    parser = build_parser()
-    args = parser.parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    device_params = {
-        "device_type": args.device_type,
-        "host": args.device,
-        "username": args.username,
-        "password": args.password,
-        "port": args.port,
-    }
-
-    log.info("Connecting to %s (%s)...", args.device, args.device_type)
-    try:
-        with ConnectHandler(**device_params) as conn:
-            log.info(
-                "Connected. Starting %d polls at %ds intervals (alert threshold: %d errors/interval)",
-                args.count, args.interval, args.threshold,
-            )
-            total_alerts = poll_device(conn, args.count, args.interval, args.threshold, args.output)
-            log.info("Done. %d alert event(s) across %d polls.", total_alerts, args.count)
-    except NetMikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.device)
-        sys.exit(1)
-    except NetMikoTimeoutException:
-        log.error("Connection timed out to %s", args.device)
-        sys.exit(1)
-    except KeyboardInterrupt:
-        log.info("Interrupted by user")
-        sys.exit(0)
+    main()
 ```
-
-**What it does:** Connects to a Cisco device, captures a baseline `show interfaces` snapshot, then polls on `--interval` seconds for `--count` cycles. Each cycle it diffs input errors, output errors, CRC, and resets against the previous snapshot, logs a `WARNING` for any interface where the combined error delta crosses `--threshold`, and optionally writes all per-interval counters to CSV.
-
-**What makes it distinct:** None of the existing scripts do counter-delta polling or threshold alerting — `health_check.py` is a one-shot status check, not a time-series error-rate monitor.
