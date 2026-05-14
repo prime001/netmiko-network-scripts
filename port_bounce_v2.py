@@ -1,183 +1,211 @@
-```python
-"""
-errdisable_recovery.py
+port_bounce_v3.py - Interface bounce with pre/post state verification and reporting.
 
-Scans a Cisco IOS/IOS-XE switch for err-disabled interfaces, reports the
-disable reason for each, and optionally recovers them via shutdown/no shutdown.
-
-Common causes handled: bpduguard, psecure-violation, udld, loopback,
-arp-inspection, dhcp-rate-limit, storm-control, link-flap.
+Captures interface counters, line-protocol state, and MAC address table entries
+before and after the bounce, then writes a structured JSON report. Useful for
+proving that an interface recovered cleanly and that end-devices re-learned.
 
 Usage:
-    python errdisable_recovery.py --host 10.0.0.1 --username admin
-    python errdisable_recovery.py --host 10.0.0.1 --username admin --recover
-    python errdisable_recovery.py --host 10.0.0.1 --username admin \\
-        --interface Gi0/1 --recover --wait 10
+    python port_bounce_v3.py -H 10.0.0.1 -u admin -p secret \
+        -i GigabitEthernet0/1 --wait 10 --output report.json
+
+    python port_bounce_v3.py -H 10.0.0.1 -u admin -p secret \
+        -i Gi0/1,Gi0/2,Gi0/3 --link-timeout 90 --no-verify
 
 Prerequisites:
     pip install netmiko
-    SSH enabled on target device; privilege 15 or provide --secret for enable mode
+    SSH access with privilege level sufficient for 'show interface',
+    'show mac address-table', and interface configuration commands.
+    Supported device types: cisco_ios, cisco_xe, cisco_nxos, arista_eos
 """
 
 import argparse
+import json
 import logging
-import re
 import sys
 import time
-from getpass import getpass
+from datetime import datetime, timezone
 
-from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-
-def get_errdisabled(connection, target_intf=None):
-    """Return {interface: reason} for all err-disabled ports on the device."""
-    output = connection.send_command("show interfaces status err-disabled")
-    interfaces = {}
-
-    for line in output.splitlines():
-        if re.match(r"^\s*(Port|---|\s*$)", line):
-            continue
-        match = re.match(r"^(\S+)\s+.*err-disabled", line, re.IGNORECASE)
-        if not match:
-            continue
-        intf = match.group(1)
-        if target_intf and target_intf.lower() not in intf.lower():
-            continue
-
-        detail = connection.send_command(f"show interfaces {intf}")
-        reason_match = re.search(r"err-disabled\s*\(([^)]+)\)", detail)
-        reason = reason_match.group(1).strip() if reason_match else "unknown"
-        interfaces[intf] = reason
-
-    return interfaces
+SUPPORTED_TYPES = ["cisco_ios", "cisco_xe", "cisco_nxos", "arista_eos"]
 
 
-def recover_interface(connection, interface, wait_secs):
-    """Cycle an interface out of err-disabled state. Returns True if recovered."""
-    log.info("[%s] sending shutdown", interface)
-    connection.send_config_set([f"interface {interface}", "shutdown"])
-    time.sleep(1)
+def capture_state(conn, interface: str, device_type: str) -> dict:
+    state = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "interface": interface,
+        "line_protocol": "unknown",
+        "input_errors": None,
+        "output_errors": None,
+        "mac_count": None,
+    }
 
-    log.info("[%s] sending no shutdown", interface)
-    connection.send_config_set([f"interface {interface}", "no shutdown"])
+    intf_output = conn.send_command(f"show interface {interface}", use_textfsm=False)
+    for line in intf_output.splitlines():
+        stripped = line.strip().lower()
+        if "line protocol" in stripped:
+            state["line_protocol"] = "up" if "line protocol is up" in stripped else "down"
+        if "input errors" in stripped:
+            state["input_errors"] = line.strip()
+        if "output errors" in stripped:
+            state["output_errors"] = line.strip()
 
-    log.info("[%s] waiting %ds for link to stabilize", interface, wait_secs)
-    time.sleep(wait_secs)
+    try:
+        if "nxos" in device_type:
+            mac_cmd = f"show mac address-table interface {interface}"
+        else:
+            mac_cmd = f"show mac address-table interface {interface}"
+        mac_output = conn.send_command(mac_cmd, use_textfsm=False)
+        state["mac_count"] = sum(
+            1 for ln in mac_output.splitlines()
+            if ln.strip()
+            and not ln.strip().startswith(("Mac", "Vlan", "-", "Legend", "Total"))
+            and len(ln.split()) >= 4
+        )
+    except Exception as exc:
+        log.debug("MAC table capture skipped for %s: %s", interface, exc)
 
-    verify = connection.send_command(f"show interfaces {interface} status")
-    if "err-disabled" in verify.lower():
-        log.warning("[%s] still err-disabled after recovery attempt", interface)
-        return False
-
-    first_line = next((l for l in verify.splitlines() if l.strip()), "")
-    log.info("[%s] recovered — status: %s", interface, first_line.strip())
-    return True
+    return state
 
 
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Detect and recover err-disabled interfaces on Cisco IOS/IOS-XE"
+def bounce(conn, interface: str, device_type: str, wait_seconds: int) -> None:
+    log.info("Shutting down %s", interface)
+    if "nxos" in device_type:
+        conn.send_config_set([f"interface {interface}", "shutdown"])
+        time.sleep(wait_seconds)
+        conn.send_config_set([f"interface {interface}", "no shutdown"])
+    else:
+        conn.send_config_set([f"interface {interface}", "shutdown"])
+        time.sleep(wait_seconds)
+        conn.send_config_set([f"interface {interface}", "no shutdown"])
+    log.info("Re-enabled %s", interface)
+
+
+def wait_for_up(conn, interface: str, timeout: int, poll_interval: int = 5) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        out = conn.send_command(f"show interface {interface}", use_textfsm=False)
+        if "line protocol is up" in out.lower():
+            log.info("%s is up", interface)
+            return True
+        remaining = int(deadline - time.monotonic())
+        log.debug("%s still down, %ds remaining", interface, remaining)
+        time.sleep(poll_interval)
+    log.warning("%s did not come up within %ds", interface, timeout)
+    return False
+
+
+def build_report(interface: str, pre: dict, post: dict, recovered: bool) -> dict:
+    pre_mac = pre.get("mac_count")
+    post_mac = post.get("mac_count")
+    return {
+        "interface": interface,
+        "bounce_at": pre.get("timestamp"),
+        "recovered": recovered,
+        "pre": pre,
+        "post": post,
+        "mac_delta": (post_mac - pre_mac) if (pre_mac is not None and post_mac is not None) else None,
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Bounce one or more interfaces and verify recovery."
     )
-    p.add_argument("--host", required=True, help="Switch IP or hostname")
-    p.add_argument("--username", required=True, help="SSH username")
-    p.add_argument("--password", help="SSH password (prompted if omitted)")
-    p.add_argument("--secret", default="", help="Enable secret (if required)")
-    p.add_argument(
-        "--device-type",
-        default="cisco_ios",
-        metavar="TYPE",
-        help="Netmiko device type (default: cisco_ios)",
+    parser.add_argument("-H", "--host", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", required=True)
+    parser.add_argument(
+        "-i", "--interfaces", required=True,
+        help="Comma-separated interface list, e.g. GigabitEthernet0/1,Gi0/2"
     )
-    p.add_argument(
-        "--interface",
-        metavar="INTF",
-        help="Limit scan/recovery to one interface (e.g. GigabitEthernet0/1 or Gi0/1)",
+    parser.add_argument(
+        "-t", "--device-type", default="cisco_ios", choices=SUPPORTED_TYPES
     )
-    p.add_argument(
-        "--recover",
-        action="store_true",
-        help="Perform shutdown/no shutdown on each err-disabled interface",
+    parser.add_argument(
+        "--port", type=int, default=22, help="SSH port (default: 22)"
     )
-    p.add_argument(
-        "--wait",
-        type=int,
-        default=5,
-        metavar="SECS",
-        help="Seconds to wait after no shutdown before verifying state (default: 5)",
+    parser.add_argument(
+        "--wait", type=int, default=5,
+        help="Seconds to hold interface down (default: 5)"
     )
-    return p.parse_args()
+    parser.add_argument(
+        "--link-timeout", type=int, default=60,
+        help="Seconds to wait for link-up after no-shut (default: 60)"
+    )
+    parser.add_argument(
+        "--no-verify", action="store_true",
+        help="Skip pre/post capture and link-up polling"
+    )
+    parser.add_argument(
+        "--output", metavar="FILE",
+        help="Write JSON report to FILE instead of stdout"
+    )
+    parser.add_argument("-v", "--verbose", action="store_true")
+    return parser.parse_args()
 
 
-def main():
+def main() -> int:
     args = parse_args()
-    password = args.password or getpass(f"Password for {args.username}@{args.host}: ")
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    interfaces = [i.strip() for i in args.interfaces.split(",") if i.strip()]
+    if not interfaces:
+        log.error("No interfaces provided.")
+        return 1
 
     device_params = {
         "device_type": args.device_type,
         "host": args.host,
         "username": args.username,
-        "password": password,
-        "secret": args.secret,
+        "password": args.password,
+        "port": args.port,
     }
 
+    reports = []
     try:
-        log.info("Connecting to %s", args.host)
-        conn = ConnectHandler(**device_params)
+        log.info("Connecting to %s (%s)", args.host, args.device_type)
+        with ConnectHandler(**device_params) as conn:
+            for iface in interfaces:
+                log.info("Processing %s", iface)
+                pre = capture_state(conn, iface, args.device_type) if not args.no_verify else {}
+                bounce(conn, iface, args.device_type, args.wait)
+                recovered = True
+                if not args.no_verify:
+                    recovered = wait_for_up(conn, iface, timeout=args.link_timeout)
+                post = capture_state(conn, iface, args.device_type) if not args.no_verify else {}
+                reports.append(build_report(iface, pre, post, recovered))
+                if not recovered:
+                    log.error("%s did not recover — manual investigation required", iface)
     except NetmikoAuthenticationException:
         log.error("Authentication failed for %s@%s", args.username, args.host)
-        sys.exit(1)
+        return 2
     except NetmikoTimeoutException:
         log.error("Connection timed out to %s", args.host)
-        sys.exit(1)
+        return 3
+    except Exception as exc:
+        log.error("Unexpected error: %s", exc, exc_info=args.verbose)
+        return 4
 
-    try:
-        if args.secret and not conn.check_enable_mode():
-            conn.enable()
+    payload = json.dumps(reports, indent=2)
+    if args.output:
+        with open(args.output, "w") as fh:
+            fh.write(payload)
+        log.info("Report written to %s", args.output)
+    else:
+        print(payload)
 
-        errdisabled = get_errdisabled(conn, target_intf=args.interface)
-
-        if not errdisabled:
-            log.info("No err-disabled interfaces found on %s", args.host)
-            return
-
-        log.info("Err-disabled interfaces found: %d", len(errdisabled))
-        for intf, reason in errdisabled.items():
-            log.info("  %-30s  reason: %s", intf, reason)
-
-        if not args.recover:
-            log.info("Rerun with --recover to attempt recovery via shutdown/no shutdown")
-            return
-
-        recovered, failed = [], []
-        for intf in errdisabled:
-            if recover_interface(conn, intf, args.wait):
-                recovered.append(intf)
-            else:
-                failed.append(intf)
-
-        log.info(
-            "Recovery complete — recovered: %d  still err-disabled: %d",
-            len(recovered),
-            len(failed),
-        )
-        if failed:
-            log.warning("Persistent failures (manual inspection required): %s", ", ".join(failed))
-            sys.exit(2)
-
-    finally:
-        conn.disconnect()
+    failed = sum(1 for r in reports if not r.get("recovered", True))
+    return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":
-    main()
-```
-
-This is `errdisable_recovery.py` — 157 lines, covering a distinct and common real-world task: scanning a switch for err-disabled ports (BPDU guard trips, port security violations, etc.), reporting the per-interface reason from `show interfaces` output, and optionally recovering via shutdown/no shutdown with post-recovery verification. Fundamentally different from a basic port bounce — it discovers affected ports automatically, captures the err-disable reason before clearing it, and handles the case where the underlying issue prevents recovery.
+    sys.exit(main())
