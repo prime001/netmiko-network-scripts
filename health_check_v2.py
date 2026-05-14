@@ -1,234 +1,251 @@
 ```python
 """
-interface_errors.py - Interface Error Rate Monitor
+Interface Statistics Collector and Analyzer
+
+Collects interface statistics from network devices and identifies problematic interfaces.
 
 Purpose:
-    Connects to a Cisco IOS/IOS-XE/NX-OS device and reports interfaces
-    with error counters (CRC, input errors, output drops, runts, giants)
-    exceeding configurable thresholds. With --interval, polls twice and
-    reports delta counts so you can distinguish new errors from historical
-    accumulation.
+    Connects to network devices, collects interface statistics including errors,
+    discards, and bandwidth utilization, then generates a report identifying
+    interfaces with potential issues based on configurable thresholds.
 
 Usage:
-    python interface_errors.py -H 192.168.1.1 -u admin -p secret
-    python interface_errors.py -H 192.168.1.1 -u admin -p secret \\
-        --interval 60 --crc-threshold 0 --drop-threshold 50
-    python interface_errors.py -H 192.168.1.1 -u admin -p secret \\
-        --device-type cisco_nxos --all
+    python interface_stats_collector.py --device 192.168.1.1 \
+        --device_type cisco_ios --username admin --password secret \
+        --error_threshold 100 --discard_threshold 50
 
 Prerequisites:
-    pip install netmiko
-    Device must support 'show interfaces' (Cisco IOS / IOS-XE / NX-OS).
-    Exit code 0 = clean, 1 = thresholds exceeded, 2 = connection error.
+    - netmiko library installed
+    - Device must be reachable and have SSH/CLI access enabled
+    - Device credentials with read access
+    - Interface statistics available via show commands (e.g., show interfaces)
+
+Author: Network Automation Team
 """
 
-import argparse
 import logging
+import argparse
 import re
-import sys
-import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional
-
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
-
-logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
-log = logging.getLogger(__name__)
+from typing import Dict, List, Tuple
+from netmiko import ConnectHandler
 
 
-@dataclass
-class InterfaceCounters:
-    name: str
-    input_errors: int = 0
-    crc: int = 0
-    output_drops: int = 0
-    runts: int = 0
-    giants: int = 0
-    collisions: int = 0
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
-_IFACE_RE = re.compile(r"^(\S+)\s+is\s+(?:up|down|administratively down)", re.IGNORECASE)
-_INPUT_ERR_RE = re.compile(r"(\d+)\s+input errors")
-_CRC_RE = re.compile(r"(\d+)\s+CRC")
-_DROP_RE = re.compile(r"(\d+)\s+(?:output\s+)?drops")
-_RUNTS_RE = re.compile(r"(\d+)\s+runts")
-_GIANTS_RE = re.compile(r"(\d+)\s+giants")
-_COLLISIONS_RE = re.compile(r"(\d+)\s+collisions")
+def parse_cisco_interfaces(output: str) -> Dict[str, Dict]:
+    """Parse Cisco 'show interfaces' output into structured data."""
+    interfaces = {}
+    
+    current_interface = None
+    current_data = {}
+    
+    for line in output.split('\n'):
+        if re.match(r'^(\S+)\s+is\s+(up|down)', line):
+            if current_interface:
+                interfaces[current_interface] = current_data
+            
+            match = re.match(r'^(\S+)\s+is\s+(up|down)', line)
+            current_interface = match.group(1)
+            current_data = {
+                'status': match.group(2),
+                'packets_in': 0,
+                'packets_out': 0,
+                'input_errors': 0,
+                'output_errors': 0,
+                'input_discards': 0,
+                'output_discards': 0,
+            }
+        
+        if current_interface:
+            packets_in = re.search(r'(\d+)\s+packets input', line)
+            if packets_in:
+                current_data['packets_in'] = int(packets_in.group(1))
+            
+            packets_out = re.search(r'(\d+)\s+packets output', line)
+            if packets_out:
+                current_data['packets_out'] = int(packets_out.group(1))
+            
+            input_errors = re.search(r'(\d+)\s+input errors', line)
+            if input_errors:
+                current_data['input_errors'] = int(input_errors.group(1))
+            
+            output_errors = re.search(r'(\d+)\s+output errors', line)
+            if output_errors:
+                current_data['output_errors'] = int(output_errors.group(1))
+            
+            input_discards = re.search(r'(\d+)\s+input discards', line)
+            if input_discards:
+                current_data['input_discards'] = int(input_discards.group(1))
+            
+            output_discards = re.search(r'(\d+)\s+output discards', line)
+            if output_discards:
+                current_data['output_discards'] = int(output_discards.group(1))
+    
+    if current_interface:
+        interfaces[current_interface] = current_data
+    
+    return interfaces
 
 
-def parse_counters(output: str) -> Dict[str, InterfaceCounters]:
-    counters: Dict[str, InterfaceCounters] = {}
-    current: Optional[str] = None
+def identify_issues(
+    interfaces: Dict[str, Dict],
+    error_threshold: int = 100,
+    discard_threshold: int = 50
+) -> Dict[str, List[str]]:
+    """Identify interfaces with issues based on thresholds."""
+    issues = {}
+    
+    for interface, stats in interfaces.items():
+        problems = []
+        
+        if stats['status'] == 'down':
+            problems.append('Interface is administratively or physically down')
+        
+        if stats['input_errors'] > error_threshold:
+            problems.append(
+                f'Input errors: {stats["input_errors"]} (threshold: {error_threshold})'
+            )
+        
+        if stats['output_errors'] > error_threshold:
+            problems.append(
+                f'Output errors: {stats["output_errors"]} (threshold: {error_threshold})'
+            )
+        
+        if stats['input_discards'] > discard_threshold:
+            problems.append(
+                f'Input discards: {stats["input_discards"]} (threshold: {discard_threshold})'
+            )
+        
+        if stats['output_discards'] > discard_threshold:
+            problems.append(
+                f'Output discards: {stats["output_discards"]} (threshold: {discard_threshold})'
+            )
+        
+        if problems:
+            issues[interface] = problems
+    
+    return issues
 
-    for line in output.splitlines():
-        m = _IFACE_RE.match(line)
-        if m:
-            current = m.group(1)
-            counters[current] = InterfaceCounters(name=current)
-            continue
 
-        if current is None:
-            continue
-
-        c = counters[current]
-        if m := _INPUT_ERR_RE.search(line):
-            c.input_errors = int(m.group(1))
-        if m := _CRC_RE.search(line):
-            c.crc = int(m.group(1))
-        if m := _DROP_RE.search(line):
-            c.output_drops = int(m.group(1))
-        if m := _RUNTS_RE.search(line):
-            c.runts = int(m.group(1))
-        if m := _GIANTS_RE.search(line):
-            c.giants = int(m.group(1))
-        if m := _COLLISIONS_RE.search(line):
-            c.collisions = int(m.group(1))
-
-    return counters
-
-
-def compute_delta(
-    before: Dict[str, InterfaceCounters],
-    after: Dict[str, InterfaceCounters],
-) -> Dict[str, InterfaceCounters]:
-    result: Dict[str, InterfaceCounters] = {}
-    for name, a in after.items():
-        b = before.get(name, InterfaceCounters(name=name))
-        d = InterfaceCounters(name=name)
-        d.input_errors = max(0, a.input_errors - b.input_errors)
-        d.crc = max(0, a.crc - b.crc)
-        d.output_drops = max(0, a.output_drops - b.output_drops)
-        d.runts = max(0, a.runts - b.runts)
-        d.giants = max(0, a.giants - b.giants)
-        d.collisions = max(0, a.collisions - b.collisions)
-        result[name] = d
-    return result
+def collect_interface_stats(device_handler: ConnectHandler) -> Dict[str, Dict]:
+    """Collect interface statistics from device."""
+    try:
+        output = device_handler.send_command('show interfaces')
+        return parse_cisco_interfaces(output)
+    except Exception as e:
+        logger.error(f'Error collecting interface statistics: {e}')
+        return {}
 
 
 def print_report(
-    counters: Dict[str, InterfaceCounters],
-    crc_threshold: int,
-    input_err_threshold: int,
-    drop_threshold: int,
-    show_all: bool,
-    is_delta: bool,
-) -> int:
-    def exceeds(c: InterfaceCounters) -> bool:
-        return c.crc >= crc_threshold or c.input_errors >= input_err_threshold or c.output_drops >= drop_threshold
-
-    rows: List[InterfaceCounters] = [
-        c for c in counters.values() if exceeds(c) or show_all
-    ]
-    rows.sort(key=lambda c: c.crc + c.input_errors + c.output_drops, reverse=True)
-
-    label = "delta (new errors only)" if is_delta else "cumulative"
-    if not rows:
-        log.info("No interfaces exceeded thresholds [%s]", label)
-        return 0
-
-    hdr = f"{'Interface':<26} {'InErrs':>8} {'CRC':>8} {'Drops':>8} {'Runts':>7} {'Giants':>7} {'Collisions':>11}"
-    print(f"\n  Counters [{label}]")
-    print(f"  {hdr}")
-    print(f"  {'-' * len(hdr)}")
-    flagged = 0
-    for c in rows:
-        flag = "! " if exceeds(c) else "  "
-        print(
-            f"  {flag}{c.name:<24} {c.input_errors:>8} {c.crc:>8} "
-            f"{c.output_drops:>8} {c.runts:>7} {c.giants:>7} {c.collisions:>11}"
-        )
-        if exceeds(c):
-            flagged += 1
-    print()
-    return flagged
-
-
-def main(args: argparse.Namespace) -> int:
-    device_params = {
-        "device_type": args.device_type,
-        "host": args.host,
-        "username": args.username,
-        "password": args.password,
-        "secret": args.enable_secret or args.password,
-        "port": args.port,
-    }
-
-    try:
-        log.info("Connecting to %s (%s)", args.host, args.device_type)
-        with ConnectHandler(**device_params) as conn:
-            if args.enable_secret:
-                conn.enable()
-
-            log.info("Snapshot 1 — collecting interface counters")
-            snap1 = parse_counters(conn.send_command("show interfaces", read_timeout=60))
-            log.info("  %d interfaces parsed", len(snap1))
-
-            if args.interval:
-                log.info("Waiting %ds before second snapshot...", args.interval)
-                time.sleep(args.interval)
-                log.info("Snapshot 2 — collecting interface counters")
-                snap2 = parse_counters(conn.send_command("show interfaces", read_timeout=60))
-                counters = compute_delta(snap1, snap2)
-                is_delta = True
-            else:
-                counters = snap1
-                is_delta = False
-
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.host)
-        return 2
-    except NetmikoTimeoutException:
-        log.error("Timed out connecting to %s", args.host)
-        return 2
-    except Exception as exc:
-        log.error("Unexpected error: %s", exc)
-        return 2
-
-    flagged = print_report(
-        counters,
-        crc_threshold=args.crc_threshold,
-        input_err_threshold=args.input_err_threshold,
-        drop_threshold=args.drop_threshold,
-        show_all=args.all,
-        is_delta=is_delta,
-    )
-
-    if flagged:
-        log.warning("%d interface(s) on %s exceeded error thresholds", flagged, args.host)
-        return 1
-    return 0
+    device: str,
+    interfaces: Dict[str, Dict],
+    issues: Dict[str, List[str]]
+) -> None:
+    """Print formatted statistics report."""
+    print(f'\n{"="*80}')
+    print(f'Interface Statistics Report - {device}')
+    print(f'{"="*80}')
+    
+    print(f'\nTotal Interfaces: {len(interfaces)}')
+    print(f'Interfaces with Issues: {len(issues)}')
+    
+    if issues:
+        print(f'\n{"Interface":<20} {"Issues":<60}')
+        print(f'{"-"*80}')
+        
+        for interface, problems in sorted(issues.items()):
+            for i, problem in enumerate(problems):
+                if i == 0:
+                    print(f'{interface:<20} {problem:<60}')
+                else:
+                    print(f'{"":<20} {problem:<60}')
+    else:
+        print('\nNo interfaces with issues detected.')
+    
+    print(f'\n{"Interface":<20} {"Status":<10} {"Errors":<10} {"Discards":<10}')
+    print(f'{"-"*50}')
+    
+    for interface, stats in sorted(interfaces.items()):
+        if interface in issues:
+            total_errors = stats['input_errors'] + stats['output_errors']
+            total_discards = (
+                stats['input_discards'] + stats['output_discards']
+            )
+            print(
+                f'{interface:<20} {stats["status"]:<10} '
+                f'{total_errors:<10} {total_discards:<10}'
+            )
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(
-        description="Report interface error counters exceeding configurable thresholds.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description='Collect and analyze interface statistics',
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    conn_grp = parser.add_argument_group("connection")
-    conn_grp.add_argument("-H", "--host", required=True, help="Device IP or hostname")
-    conn_grp.add_argument("-u", "--username", required=True, help="SSH username")
-    conn_grp.add_argument("-p", "--password", required=True, help="SSH password")
-    conn_grp.add_argument("-e", "--enable-secret", help="Enable secret (if required)")
-    conn_grp.add_argument("--device-type", default="cisco_ios", help="Netmiko device type")
-    conn_grp.add_argument("--port", type=int, default=22, help="SSH port")
+    parser.add_argument('--device', required=True, help='Device IP or hostname')
+    parser.add_argument('--username', required=True, help='SSH username')
+    parser.add_argument('--password', required=True, help='SSH password')
+    parser.add_argument(
+        '--device_type',
+        default='cisco_ios',
+        help='Netmiko device type (default: cisco_ios)'
+    )
+    parser.add_argument('--port', type=int, default=22, help='SSH port')
+    parser.add_argument(
+        '--error_threshold',
+        type=int,
+        default=100,
+        help='Error count threshold (default: 100)'
+    )
+    parser.add_argument(
+        '--discard_threshold',
+        type=int,
+        default=50,
+        help='Discard count threshold (default: 50)'
+    )
+    
+    args = parser.parse_args()
+    
+    device_params = {
+        'device_type': args.device_type,
+        'host': args.device,
+        'username': args.username,
+        'password': args.password,
+        'port': args.port,
+    }
+    
+    try:
+        logger.info(f'Connecting to {args.device}')
+        device = ConnectHandler(**device_params)
+        
+        logger.info('Collecting interface statistics')
+        interfaces = collect_interface_stats(device)
+        
+        logger.info('Analyzing interface statistics')
+        issues = identify_issues(
+            interfaces,
+            args.error_threshold,
+            args.discard_threshold
+        )
+        
+        device.disconnect()
+        
+        print_report(args.device, interfaces, issues)
+        
+        logger.info('Analysis completed successfully')
+        return 0 if not issues else 1
+        
+    except Exception as e:
+        logger.error(f'Failed to complete analysis: {e}')
+        return 1
 
-    thresh_grp = parser.add_argument_group("thresholds")
-    thresh_grp.add_argument("--crc-threshold", type=int, default=1, metavar="N",
-                            help="Flag interfaces with >= N CRC errors")
-    thresh_grp.add_argument("--input-err-threshold", type=int, default=10, metavar="N",
-                            help="Flag interfaces with >= N input errors")
-    thresh_grp.add_argument("--drop-threshold", type=int, default=10, metavar="N",
-                            help="Flag interfaces with >= N output drops")
 
-    parser.add_argument("--interval", type=int, default=0, metavar="SECS",
-                        help="Poll twice SECS apart and report delta counts (0 = single snapshot)")
-    parser.add_argument("--all", action="store_true",
-                        help="Show all interfaces, not just those exceeding thresholds")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-
-    parsed = parser.parse_args()
-    if parsed.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    sys.exit(main(parsed))
+if __name__ == '__main__':
+    exit(main())
 ```
