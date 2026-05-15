@@ -1,251 +1,214 @@
-```python
+The repo context is clear. Writing the BGP neighbor health check script now — this is a focused operational tool distinct from the generic health_check.py/v2 scripts.
+
 """
-Interface Statistics Collector and Analyzer
+bgp_neighbor_check.py — BGP session state and prefix-count auditor.
 
-Collects interface statistics from network devices and identifies problematic interfaces.
+Connects to a Cisco IOS/IOS-XE router via Netmiko and inspects all BGP
+neighbors reported by 'show ip bgp summary'.  Each neighbor is evaluated
+against two pass/fail criteria:
 
-Purpose:
-    Connects to network devices, collects interface statistics including errors,
-    discards, and bandwidth utilization, then generates a report identifying
-    interfaces with potential issues based on configurable thresholds.
+  1. Session state must be "Established".
+  2. Received prefix count must meet or exceed --min-prefixes (default 0).
+
+Exit codes:
+  0  all neighbors healthy
+  1  one or more neighbors failed the check
+  2  connection / authentication error
 
 Usage:
-    python interface_stats_collector.py --device 192.168.1.1 \
-        --device_type cisco_ios --username admin --password secret \
-        --error_threshold 100 --discard_threshold 50
+  python bgp_neighbor_check.py --host 10.0.0.1 --username admin
+  python bgp_neighbor_check.py --host 10.0.0.1 --username admin \
+      --device-type cisco_ios --min-prefixes 100 --timeout 30
 
 Prerequisites:
-    - netmiko library installed
-    - Device must be reachable and have SSH/CLI access enabled
-    - Device credentials with read access
-    - Interface statistics available via show commands (e.g., show interfaces)
-
-Author: Network Automation Team
+  pip install netmiko
 """
 
-import logging
 import argparse
+import getpass
+import logging
 import re
-from typing import Dict, List, Tuple
-from netmiko import ConnectHandler
+import sys
+from dataclasses import dataclass
+from typing import List
 
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
+
+# Matches an IPv4 address at the start of a BGP summary table row.
+_PEER_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})\s")
 
 
-def parse_cisco_interfaces(output: str) -> Dict[str, Dict]:
-    """Parse Cisco 'show interfaces' output into structured data."""
-    interfaces = {}
-    
-    current_interface = None
-    current_data = {}
-    
-    for line in output.split('\n'):
-        if re.match(r'^(\S+)\s+is\s+(up|down)', line):
-            if current_interface:
-                interfaces[current_interface] = current_data
-            
-            match = re.match(r'^(\S+)\s+is\s+(up|down)', line)
-            current_interface = match.group(1)
-            current_data = {
-                'status': match.group(2),
-                'packets_in': 0,
-                'packets_out': 0,
-                'input_errors': 0,
-                'output_errors': 0,
-                'input_discards': 0,
-                'output_discards': 0,
-            }
-        
-        if current_interface:
-            packets_in = re.search(r'(\d+)\s+packets input', line)
-            if packets_in:
-                current_data['packets_in'] = int(packets_in.group(1))
-            
-            packets_out = re.search(r'(\d+)\s+packets output', line)
-            if packets_out:
-                current_data['packets_out'] = int(packets_out.group(1))
-            
-            input_errors = re.search(r'(\d+)\s+input errors', line)
-            if input_errors:
-                current_data['input_errors'] = int(input_errors.group(1))
-            
-            output_errors = re.search(r'(\d+)\s+output errors', line)
-            if output_errors:
-                current_data['output_errors'] = int(output_errors.group(1))
-            
-            input_discards = re.search(r'(\d+)\s+input discards', line)
-            if input_discards:
-                current_data['input_discards'] = int(input_discards.group(1))
-            
-            output_discards = re.search(r'(\d+)\s+output discards', line)
-            if output_discards:
-                current_data['output_discards'] = int(output_discards.group(1))
-    
-    if current_interface:
-        interfaces[current_interface] = current_data
-    
-    return interfaces
+@dataclass
+class BgpNeighbor:
+    peer: str
+    remote_as: str
+    msg_rcvd: int
+    msg_sent: int
+    uptime: str
+    state_or_pfxrcd: str
+
+    @property
+    def established(self) -> bool:
+        return self.state_or_pfxrcd.lstrip("-").isdigit()
+
+    @property
+    def prefix_count(self) -> int:
+        return int(self.state_or_pfxrcd) if self.established else 0
+
+    @property
+    def state(self) -> str:
+        return "Established" if self.established else self.state_or_pfxrcd
 
 
-def identify_issues(
-    interfaces: Dict[str, Dict],
-    error_threshold: int = 100,
-    discard_threshold: int = 50
-) -> Dict[str, List[str]]:
-    """Identify interfaces with issues based on thresholds."""
-    issues = {}
-    
-    for interface, stats in interfaces.items():
-        problems = []
-        
-        if stats['status'] == 'down':
-            problems.append('Interface is administratively or physically down')
-        
-        if stats['input_errors'] > error_threshold:
-            problems.append(
-                f'Input errors: {stats["input_errors"]} (threshold: {error_threshold})'
+def parse_bgp_summary(output: str) -> List[BgpNeighbor]:
+    neighbors: List[BgpNeighbor] = []
+    in_table = False
+
+    for line in output.splitlines():
+        if "Neighbor" in line and "MsgRcvd" in line:
+            in_table = True
+            continue
+        if not in_table or not line.strip():
+            continue
+        if not _PEER_RE.match(line):
+            continue
+
+        parts = line.split()
+        # IOS BGP summary row: Neighbor V AS MsgRcvd MsgSent TblVer InQ OutQ Up/Down State/PfxRcd
+        if len(parts) < 10:
+            continue
+
+        neighbors.append(
+            BgpNeighbor(
+                peer=parts[0],
+                remote_as=parts[2],
+                msg_rcvd=_to_int(parts[3]),
+                msg_sent=_to_int(parts[4]),
+                uptime=parts[8],
+                state_or_pfxrcd=parts[9],
             )
-        
-        if stats['output_errors'] > error_threshold:
-            problems.append(
-                f'Output errors: {stats["output_errors"]} (threshold: {error_threshold})'
-            )
-        
-        if stats['input_discards'] > discard_threshold:
-            problems.append(
-                f'Input discards: {stats["input_discards"]} (threshold: {discard_threshold})'
-            )
-        
-        if stats['output_discards'] > discard_threshold:
-            problems.append(
-                f'Output discards: {stats["output_discards"]} (threshold: {discard_threshold})'
-            )
-        
-        if problems:
-            issues[interface] = problems
-    
-    return issues
-
-
-def collect_interface_stats(device_handler: ConnectHandler) -> Dict[str, Dict]:
-    """Collect interface statistics from device."""
-    try:
-        output = device_handler.send_command('show interfaces')
-        return parse_cisco_interfaces(output)
-    except Exception as e:
-        logger.error(f'Error collecting interface statistics: {e}')
-        return {}
-
-
-def print_report(
-    device: str,
-    interfaces: Dict[str, Dict],
-    issues: Dict[str, List[str]]
-) -> None:
-    """Print formatted statistics report."""
-    print(f'\n{"="*80}')
-    print(f'Interface Statistics Report - {device}')
-    print(f'{"="*80}')
-    
-    print(f'\nTotal Interfaces: {len(interfaces)}')
-    print(f'Interfaces with Issues: {len(issues)}')
-    
-    if issues:
-        print(f'\n{"Interface":<20} {"Issues":<60}')
-        print(f'{"-"*80}')
-        
-        for interface, problems in sorted(issues.items()):
-            for i, problem in enumerate(problems):
-                if i == 0:
-                    print(f'{interface:<20} {problem:<60}')
-                else:
-                    print(f'{"":<20} {problem:<60}')
-    else:
-        print('\nNo interfaces with issues detected.')
-    
-    print(f'\n{"Interface":<20} {"Status":<10} {"Errors":<10} {"Discards":<10}')
-    print(f'{"-"*50}')
-    
-    for interface, stats in sorted(interfaces.items()):
-        if interface in issues:
-            total_errors = stats['input_errors'] + stats['output_errors']
-            total_discards = (
-                stats['input_discards'] + stats['output_discards']
-            )
-            print(
-                f'{interface:<20} {stats["status"]:<10} '
-                f'{total_errors:<10} {total_discards:<10}'
-            )
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description='Collect and analyze interface statistics',
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    parser.add_argument('--device', required=True, help='Device IP or hostname')
-    parser.add_argument('--username', required=True, help='SSH username')
-    parser.add_argument('--password', required=True, help='SSH password')
-    parser.add_argument(
-        '--device_type',
-        default='cisco_ios',
-        help='Netmiko device type (default: cisco_ios)'
-    )
-    parser.add_argument('--port', type=int, default=22, help='SSH port')
-    parser.add_argument(
-        '--error_threshold',
-        type=int,
-        default=100,
-        help='Error count threshold (default: 100)'
-    )
-    parser.add_argument(
-        '--discard_threshold',
-        type=int,
-        default=50,
-        help='Discard count threshold (default: 50)'
-    )
-    
-    args = parser.parse_args()
-    
-    device_params = {
-        'device_type': args.device_type,
-        'host': args.device,
-        'username': args.username,
-        'password': args.password,
-        'port': args.port,
-    }
-    
-    try:
-        logger.info(f'Connecting to {args.device}')
-        device = ConnectHandler(**device_params)
-        
-        logger.info('Collecting interface statistics')
-        interfaces = collect_interface_stats(device)
-        
-        logger.info('Analyzing interface statistics')
-        issues = identify_issues(
-            interfaces,
-            args.error_threshold,
-            args.discard_threshold
         )
-        
-        device.disconnect()
-        
-        print_report(args.device, interfaces, issues)
-        
-        logger.info('Analysis completed successfully')
-        return 0 if not issues else 1
-        
-    except Exception as e:
-        logger.error(f'Failed to complete analysis: {e}')
+
+    return neighbors
+
+
+def _to_int(value: str) -> int:
+    try:
+        return int(value)
+    except ValueError:
+        return 0
+
+
+def audit_neighbors(neighbors: List[BgpNeighbor], min_prefixes: int) -> List[str]:
+    failures: List[str] = []
+
+    for n in neighbors:
+        if not n.established:
+            failures.append(
+                f"FAIL  peer={n.peer} AS={n.remote_as} state={n.state} uptime={n.uptime}"
+            )
+        elif n.prefix_count < min_prefixes:
+            failures.append(
+                f"FAIL  peer={n.peer} AS={n.remote_as} state={n.state} "
+                f"prefixes={n.prefix_count} < threshold={min_prefixes}"
+            )
+        else:
+            log.info(
+                "OK    peer=%s AS=%s state=%s prefixes=%d uptime=%s",
+                n.peer, n.remote_as, n.state, n.prefix_count, n.uptime,
+            )
+
+    return failures
+
+
+def run(args: argparse.Namespace) -> int:
+    conn_params = {
+        "device_type": args.device_type,
+        "host": args.host,
+        "username": args.username,
+        "password": args.password,
+        "port": args.port,
+        "timeout": args.timeout,
+    }
+
+    try:
+        log.info("Connecting to %s", args.host)
+        with ConnectHandler(**conn_params) as conn:
+            output = conn.send_command("show ip bgp summary")
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.host)
+        return 2
+    except NetmikoTimeoutException:
+        log.error("Connection timed out: %s", args.host)
+        return 2
+    except Exception as exc:
+        log.error("Connection error: %s", exc)
+        return 2
+
+    neighbors = parse_bgp_summary(output)
+    if not neighbors:
+        log.warning("No BGP neighbors found — verify BGP is configured and device-type is correct")
         return 1
 
+    log.info("Evaluating %d BGP neighbor(s) on %s", len(neighbors), args.host)
+    failures = audit_neighbors(neighbors, args.min_prefixes)
 
-if __name__ == '__main__':
-    exit(main())
-```
+    if failures:
+        for msg in failures:
+            print(msg)
+        print(f"\n{len(failures)}/{len(neighbors)} neighbor(s) failed on {args.host}")
+        return 1
+
+    print(f"All {len(neighbors)} BGP neighbor(s) healthy on {args.host}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Audit BGP neighbor states and prefix counts via Netmiko"
+    )
+    p.add_argument("--host", required=True, help="Device IP or hostname")
+    p.add_argument("--username", required=True)
+    p.add_argument(
+        "--password",
+        default=None,
+        help="SSH password — omit to prompt interactively",
+    )
+    p.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        dest="device_type",
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    p.add_argument("--port", type=int, default=22)
+    p.add_argument("--timeout", type=int, default=30, help="SSH connect timeout in seconds")
+    p.add_argument(
+        "--min-prefixes",
+        type=int,
+        default=0,
+        dest="min_prefixes",
+        help="Minimum accepted received-prefix count per neighbor (default: 0)",
+    )
+    p.add_argument("--debug", action="store_true")
+    return p
+
+
+if __name__ == "__main__":
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.password is None:
+        args.password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
+
+    sys.exit(run(args))
