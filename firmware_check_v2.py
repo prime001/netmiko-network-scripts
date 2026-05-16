@@ -1,218 +1,215 @@
-The user has fully specified all requirements and explicitly said to output only the script content — no design exploration needed. Proceeding directly.
+firmware_upgrade.py - Cisco IOS firmware upgrade orchestrator
 
-"""
-firmware_compliance_audit.py — Multi-device firmware compliance auditor.
+Purpose:
+    Automates the end-to-end firmware upgrade workflow for Cisco IOS devices:
+    validates flash space, transfers the image via SCP, verifies MD5 integrity,
+    updates the boot variable, and optionally schedules a reload.
 
-Reads a YAML inventory of devices with their expected firmware versions, connects
-to each device via netmiko, retrieves the running version, and produces a
-pass/fail compliance report. Exits non-zero if any device is non-compliant.
+    Use firmware_check.py to audit current versions fleet-wide before deciding
+    which devices to target here.
 
 Usage:
-    python firmware_compliance_audit.py \
-        --inventory devices.yaml \
-        --username admin \
-        --password secret \
-        [--secret enable_pw] \
-        [--output report.json] \
-        [--timeout 30] \
-        [--verbose]
+    python firmware_upgrade.py -d 192.168.1.1 -u admin -p secret \
+        --image c2960-lanbasek9-mz.152-7.E6.bin \
+        --source-path /tftp/images/ \
+        [--reload-in 60] [--dry-run]
 
 Prerequisites:
-    pip install netmiko pyyaml
-
-Inventory YAML format:
-    devices:
-      - host: 192.168.1.1
-        device_type: cisco_ios
-        expected_version: "15.9(3)M5"
-      - host: 192.168.1.2
-        device_type: cisco_nxos
-        expected_version: "9.3(9)"
+    pip install netmiko
+    - SCP must be enabled on the target device:  ip scp server enable
+    - Account requires privilege 15 or a valid enable secret
+    - The firmware .bin must exist at --source-path on the machine running this script
 """
 
 import argparse
-import json
 import logging
+import os
 import sys
-from datetime import datetime, timezone
 
-import yaml
-from netmiko import ConnectHandler
+from netmiko import ConnectHandler, file_transfer
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
-VERSION_COMMANDS = {
-    "cisco_ios": "show version",
-    "cisco_nxos": "show version",
-    "cisco_asa": "show version",
-    "juniper_junos": "show version",
-    "arista_eos": "show version",
-    "hp_comware": "display version",
-}
-
-VERSION_MARKERS = {
-    "cisco_ios": "Version ",
-    "cisco_nxos": "NXOS: version",
-    "cisco_asa": "Software Version",
-    "juniper_junos": "Junos:",
-    "arista_eos": "EOS version:",
-    "hp_comware": "Version",
-}
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Audit firmware compliance across a device inventory."
-    )
-    parser.add_argument("--inventory", required=True, help="Path to YAML inventory file")
-    parser.add_argument("--username", required=True, help="SSH username")
-    parser.add_argument("--password", required=True, help="SSH password")
-    parser.add_argument("--secret", default="", help="Enable secret (if required)")
-    parser.add_argument("--output", help="Write JSON report to this file path")
-    parser.add_argument(
-        "--timeout", type=int, default=30, help="SSH connection timeout in seconds"
-    )
-    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
-    return parser.parse_args()
-
-
-def configure_logging(verbose: bool) -> None:
-    logging.basicConfig(
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        level=logging.DEBUG if verbose else logging.INFO,
-        stream=sys.stderr,
-    )
-    logging.getLogger("paramiko").setLevel(logging.WARNING)
-
-
-def load_inventory(path: str) -> list:
-    with open(path) as f:
-        data = yaml.safe_load(f)
-    devices = data.get("devices", [])
-    if not devices:
-        logging.error("Inventory file contains no devices: %s", path)
-        sys.exit(1)
-    return devices
-
-
-def extract_version(output: str, device_type: str) -> str:
-    marker = VERSION_MARKERS.get(device_type, "Version")
+def get_free_flash_bytes(conn):
+    output = conn.send_command("show flash:", use_textfsm=False)
     for line in output.splitlines():
-        if marker.lower() in line.lower():
-            tokens = line.split()
-            for i, token in enumerate(tokens):
-                if token.rstrip(",").lower() in ("version", "ver"):
-                    if i + 1 < len(tokens):
-                        return tokens[i + 1].strip(",").rstrip(".")
-    return "UNKNOWN"
+        lower = line.lower()
+        if "bytes free" in lower or "bytes available" in lower:
+            for token in line.split():
+                if token.isdigit():
+                    return int(token)
+    return None
 
 
-def audit_device(
-    device: dict, username: str, password: str, secret: str, timeout: int
-) -> dict:
-    host = device["host"]
-    device_type = device.get("device_type", "cisco_ios")
-    expected = device.get("expected_version", "")
-    result = {
-        "host": host,
-        "device_type": device_type,
-        "expected_version": expected,
-        "running_version": None,
-        "compliant": False,
-        "error": None,
-        "checked_at": datetime.now(timezone.utc).isoformat(),
+def image_on_flash(conn, image_name):
+    output = conn.send_command(f"show flash: | include {image_name}", use_textfsm=False)
+    return image_name in output
+
+
+def current_boot_statements(conn):
+    return conn.send_command("show running-config | include boot system", use_textfsm=False).strip()
+
+
+def transfer_image(conn, source_path, image_name):
+    result = file_transfer(
+        conn,
+        source_file=os.path.join(source_path, image_name),
+        dest_file=image_name,
+        file_system="flash:",
+        direction="put",
+        overwrite_file=False,
+    )
+    return result.get("file_verified", False) or result.get("file_exists", False)
+
+
+def apply_boot_variable(conn, image_name, dry_run):
+    commands = [
+        "no boot system",
+        f"boot system flash:{image_name}",
+    ]
+    if dry_run:
+        log.info("[DRY-RUN] Would send config:\n  %s", "\n  ".join(commands))
+        log.info("[DRY-RUN] Would write memory")
+        return True
+    output = conn.send_config_set(commands)
+    if "Invalid" in output or "Error" in output:
+        log.error("Config error while setting boot variable:\n%s", output)
+        return False
+    conn.send_command("write memory", expect_string=r"#", read_timeout=30)
+    return True
+
+
+def schedule_reload(conn, minutes, dry_run):
+    if dry_run:
+        log.info("[DRY-RUN] Would schedule: reload in %d", minutes)
+        return
+    conn.send_command(
+        f"reload in {minutes}",
+        expect_string=r"[confirm]",
+        strip_prompt=False,
+        strip_command=False,
+        read_timeout=15,
+    )
+    conn.send_command(
+        "\n",
+        expect_string=r"#",
+        strip_prompt=False,
+        strip_command=False,
+        read_timeout=10,
+    )
+    log.info("Reload scheduled in %d minutes", minutes)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Cisco IOS firmware upgrade orchestrator",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", required=True, help="SSH password")
+    p.add_argument("--secret", default="", help="Enable secret")
+    p.add_argument("--device-type", default="cisco_ios", help="Netmiko device type")
+    p.add_argument("--image", required=True, help="Firmware image filename (e.g. c2960-...bin)")
+    p.add_argument("--source-path", default=".", help="Local directory containing the image")
+    p.add_argument(
+        "--min-free-mb",
+        type=int,
+        default=32,
+        help="Extra free flash (MB) required beyond image size",
+    )
+    p.add_argument(
+        "--reload-in",
+        type=int,
+        default=0,
+        metavar="MINUTES",
+        help="Schedule reload N minutes after upgrade (0 = skip)",
+    )
+    p.add_argument("--dry-run", action="store_true", help="Validate and plan without making changes")
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+
+    image_path = os.path.join(args.source_path, args.image)
+    if not args.dry_run and not os.path.isfile(image_path):
+        log.error("Image not found locally: %s", image_path)
+        sys.exit(1)
+
+    image_size_bytes = os.path.getsize(image_path) if os.path.isfile(image_path) else 0
+    image_size_mb = image_size_bytes / (1024 * 1024)
+
+    device = {
+        "device_type": args.device_type,
+        "host": args.device,
+        "username": args.username,
+        "password": args.password,
+        "secret": args.secret,
+        "timeout": 30,
+        "session_timeout": 600,
+        "global_delay_factor": 2,
     }
 
-    cmd = VERSION_COMMANDS.get(device_type)
-    if not cmd:
-        result["error"] = f"Unsupported device_type: {device_type}"
-        logging.warning("[%s] %s", host, result["error"])
-        return result
-
+    log.info("Connecting to %s ...", args.device)
     try:
-        logging.info("[%s] Connecting (%s)...", host, device_type)
-        with ConnectHandler(
-            device_type=device_type,
-            host=host,
-            username=username,
-            password=password,
-            secret=secret or password,
-            timeout=timeout,
-        ) as conn:
-            output = conn.send_command(cmd)
+        with ConnectHandler(**device) as conn:
+            if args.secret:
+                conn.enable()
 
-        version = extract_version(output, device_type)
-        result["running_version"] = version
-        result["compliant"] = version == expected
-        status = "PASS" if result["compliant"] else "FAIL"
-        logging.info(
-            "[%s] %s — running=%s expected=%s", host, status, version, expected
-        )
+            free_bytes = get_free_flash_bytes(conn)
+            if free_bytes is not None:
+                free_mb = free_bytes / (1024 * 1024)
+                required_mb = image_size_mb + args.min_free_mb
+                log.info(
+                    "Flash: %.1f MB free | Image: %.1f MB | Required: %.1f MB",
+                    free_mb, image_size_mb, required_mb,
+                )
+                if free_mb < required_mb:
+                    log.error("Insufficient flash space — aborting")
+                    sys.exit(1)
+            else:
+                log.warning("Could not parse flash size — proceeding without space check")
+
+            if image_on_flash(conn, args.image):
+                log.info("Image already present on flash — skipping transfer")
+            elif args.dry_run:
+                log.info("[DRY-RUN] Would transfer %s (%.1f MB) via SCP", args.image, image_size_mb)
+            else:
+                log.info("Transferring %s via SCP (%.1f MB) — this may take several minutes ...", args.image, image_size_mb)
+                if not transfer_image(conn, args.source_path, args.image):
+                    log.error("Transfer failed or MD5 mismatch — aborting")
+                    sys.exit(1)
+                log.info("Transfer complete and MD5 verified")
+
+            log.info("Current boot config: %s", current_boot_statements(conn) or "(none)")
+
+            if not apply_boot_variable(conn, args.image, args.dry_run):
+                sys.exit(1)
+            log.info("Boot variable set to flash:%s", args.image)
+
+            if args.reload_in > 0:
+                schedule_reload(conn, args.reload_in, args.dry_run)
+
+            log.info("Upgrade workflow complete for %s", args.device)
 
     except NetmikoAuthenticationException:
-        result["error"] = "Authentication failed"
-        logging.error("[%s] Authentication failed", host)
+        log.error("Authentication failed for %s", args.device)
+        sys.exit(1)
     except NetmikoTimeoutException:
-        result["error"] = "Connection timed out"
-        logging.error("[%s] Connection timed out", host)
+        log.error("Connection timed out for %s", args.device)
+        sys.exit(1)
     except Exception as exc:
-        result["error"] = str(exc)
-        logging.error("[%s] %s", host, exc)
-
-    return result
-
-
-def print_report(results: list) -> None:
-    total = len(results)
-    passed = sum(1 for r in results if r["compliant"])
-    errors = sum(1 for r in results if r["error"])
-    width = 60
-
-    print(f"\n{'=' * width}")
-    print("  FIRMWARE COMPLIANCE REPORT")
-    print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"{'=' * width}")
-    print(f"  Devices checked : {total}")
-    print(f"  Compliant       : {passed}")
-    print(f"  Non-compliant   : {total - passed - errors}")
-    print(f"  Errors          : {errors}")
-    print(f"{'=' * width}")
-
-    for r in results:
-        if r["error"]:
-            tag = "ERROR"
-            detail = r["error"]
-        elif r["compliant"]:
-            tag = "PASS "
-            detail = f"running={r['running_version']}"
-        else:
-            tag = "FAIL "
-            detail = f"running={r['running_version']}  expected={r['expected_version']}"
-        print(f"  [{tag}]  {r['host']:<20} {detail}")
-
-    print()
+        log.error("Unexpected error on %s: %s", args.device, exc)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    configure_logging(args.verbose)
-
-    inventory = load_inventory(args.inventory)
-    results = [
-        audit_device(d, args.username, args.password, args.secret, args.timeout)
-        for d in inventory
-    ]
-
-    print_report(results)
-
-    if args.output:
-        report = {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "results": results,
-        }
-        with open(args.output, "w") as f:
-            json.dump(report, f, indent=2)
-        logging.info("JSON report written to %s", args.output)
-
-    non_compliant = [r for r in results if not r["compliant"]]
-    sys.exit(1 if non_compliant else 0)
+    main()
