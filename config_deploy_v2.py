@@ -1,239 +1,197 @@
-#!/usr/bin/env python3
+The user is asking me to write a standalone script, not modify this repo. I'll write the script now.
+
 """
-Device Configuration Auditor - Validates device configurations against compliance baselines.
+vlan_provisioner.py — Bulk VLAN provisioning via Netmiko
 
 Purpose:
-    Connects to network devices and audits their running configuration against
-    a compliance baseline. Reports configuration deviations, missing configs,
-    and policy violations for security and compliance assessment.
+    Deploy a set of VLANs from a CSV file to a Cisco IOS or NX-OS switch,
+    then verify each VLAN was created successfully. Intended for initial
+    switch build-out or adding new VLANs across a distribution layer.
 
 Usage:
-    python device_config_auditor.py -d 192.168.1.1 -u admin -p password \
-        -t cisco_ios -b baseline.json -o report.json
+    python vlan_provisioner.py --host 192.168.1.10 --username admin \
+        --password secret --vlan-file vlans.csv
+
+    python vlan_provisioner.py --host 192.168.1.10 --username admin \
+        --password secret --vlan-file vlans.csv --dry-run --verbose
+
+CSV format (vlan_id required, vlan_name optional):
+    10,Management
+    20,Servers
+    30,Voice
 
 Prerequisites:
-    - netmiko library installed (pip install netmiko)
-    - Device reachable and credentials valid
-    - Baseline JSON file with compliance rules
-    - SSH access enabled on target device
-
-Baseline JSON example:
-    {
-        "required_lines": ["ip domain-name example.com", "logging 192.168.1.100"],
-        "forbidden_lines": ["enable password", "no logging"],
-        "required_services": ["logging", "snmp"],
-        "forbidden_services": ["service udp-small-servers"],
-        "min_config_length": 1000
-    }
+    pip install netmiko
+    SSH must be enabled on the target device.
+    Account needs privilege level sufficient for 'vlan' configuration commands.
+    Supported platforms: Cisco IOS, IOS-XE, NX-OS.
 """
 
 import argparse
-import json
+import csv
 import logging
 import sys
-from typing import Dict, List, Tuple
+from dataclasses import dataclass
+from typing import List, Set, Tuple
 
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoTimeoutException, NetmikoAuthenticationException
-
+from netmiko.exceptions import AuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-def load_baseline(baseline_file: str) -> Dict:
-    """Load compliance baseline from JSON file."""
-    try:
-        with open(baseline_file, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        logger.error(f"Baseline file not found: {baseline_file}")
-        sys.exit(1)
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in baseline: {e}")
-        sys.exit(1)
+@dataclass
+class Vlan:
+    vlan_id: int
+    name: str
 
 
-def connect_device(device_params: Dict) -> ConnectHandler:
-    """Establish SSH connection to network device."""
-    try:
-        logger.info(f"Connecting to {device_params['host']}...")
-        device = ConnectHandler(**device_params)
-        logger.info("Connection established")
-        return device
-    except NetmikoAuthenticationException:
-        logger.error("Authentication failed - check credentials")
-        sys.exit(1)
-    except NetmikoTimeoutException:
-        logger.error("Connection timeout - device unreachable")
-        sys.exit(1)
-    except Exception as e:
-        logger.error(f"Connection error: {e}")
-        sys.exit(1)
-
-
-def get_running_config(device: ConnectHandler) -> str:
-    """Retrieve running configuration from device."""
-    try:
-        config = device.send_command("show running-config")
-        logger.info(f"Retrieved {len(config)} bytes of configuration")
-        return config
-    except Exception as e:
-        logger.error(f"Failed to retrieve running config: {e}")
-        sys.exit(1)
-
-
-def check_required_lines(config: str, required_lines: List[str]) -> Tuple[List[str], List[str]]:
-    """Validate required configuration lines are present."""
-    found = []
-    missing = []
-
-    for line in required_lines:
-        if line in config:
-            found.append(line)
-            logger.info(f"✓ Found required: {line}")
-        else:
-            missing.append(line)
-            logger.warning(f"✗ Missing required: {line}")
-
-    return found, missing
-
-
-def check_forbidden_lines(config: str, forbidden_lines: List[str]) -> Tuple[List[str], List[str]]:
-    """Validate forbidden configuration lines are absent."""
-    compliant = []
-    violations = []
-
-    for line in forbidden_lines:
-        if line not in config:
-            compliant.append(line)
-            logger.info(f"✓ Forbidden absent: {line}")
-        else:
-            violations.append(line)
-            logger.warning(f"✗ Found forbidden: {line}")
-
-    return compliant, violations
-
-
-def check_services(config: str, required: List[str], forbidden: List[str]) -> Dict[str, bool]:
-    """Validate required and forbidden services."""
-    results = {"required_present": {}, "forbidden_absent": {}}
-
-    for service in required:
-        present = service in config
-        results["required_present"][service] = present
-        status = "✓" if present else "✗"
-        logger.info(f"{status} Service '{service}': {present}")
-
-    for service in forbidden:
-        absent = service not in config
-        results["forbidden_absent"][service] = absent
-        status = "✓" if absent else "✗"
-        logger.info(f"{status} Service '{service}' absent: {absent}")
-
-    return results
-
-
-def audit_configuration(baseline: Dict, config: str) -> Dict:
-    """Perform complete configuration audit against baseline."""
-    report = {
-        "compliance_status": "PASS",
-        "violations": [],
-        "summary": {}
-    }
-
-    # Check configuration length minimum
-    if "min_config_length" in baseline:
-        min_length = baseline["min_config_length"]
-        if len(config) < min_length:
-            report["compliance_status"] = "FAIL"
-            report["violations"].append(
-                f"Config length {len(config)} bytes is below minimum {min_length}"
+def load_vlans(path: str) -> List[Vlan]:
+    vlans = []
+    with open(path, newline="") as fh:
+        for row in csv.reader(fh):
+            if not row or row[0].strip().lower() in ("vlan_id", "#", ""):
+                continue
+            try:
+                vlan_id = int(row[0].strip())
+            except ValueError:
+                log.warning("Skipping non-numeric row: %s", row)
+                continue
+            if not (1 <= vlan_id <= 4094):
+                log.warning("Skipping out-of-range VLAN ID %d", vlan_id)
+                continue
+            name = (
+                row[1].strip()
+                if len(row) > 1 and row[1].strip()
+                else f"VLAN{vlan_id:04d}"
             )
-            logger.warning(f"Config length check failed: {len(config)} < {min_length}")
-
-    # Validate required lines
-    if "required_lines" in baseline:
-        found, missing = check_required_lines(config, baseline["required_lines"])
-        report["summary"]["required_lines"] = {"found": len(found), "missing": len(missing)}
-        if missing:
-            report["compliance_status"] = "FAIL"
-            report["violations"].extend([f"Missing required: {line}" for line in missing])
-
-    # Validate forbidden lines
-    if "forbidden_lines" in baseline:
-        compliant, violations = check_forbidden_lines(config, baseline["forbidden_lines"])
-        report["summary"]["forbidden_lines"] = {"compliant": len(compliant), "violations": len(violations)}
-        if violations:
-            report["compliance_status"] = "FAIL"
-            report["violations"].extend([f"Forbidden found: {line}" for line in violations])
-
-    # Validate services
-    if "required_services" in baseline or "forbidden_services" in baseline:
-        services_result = check_services(
-            config,
-            baseline.get("required_services", []),
-            baseline.get("forbidden_services", [])
-        )
-        report["summary"]["services"] = services_result
-
-    return report
+            vlans.append(Vlan(vlan_id=vlan_id, name=name))
+    return vlans
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Audit network device configuration against compliance baseline"
+def build_commands(vlans: List[Vlan]) -> List[str]:
+    cmds = []
+    for v in vlans:
+        cmds.append(f"vlan {v.vlan_id}")
+        cmds.append(f" name {v.name}")
+    return cmds
+
+
+def parse_vlan_brief(output: str) -> Set[int]:
+    found = set()
+    for line in output.splitlines():
+        parts = line.split()
+        if parts and parts[0].isdigit():
+            found.add(int(parts[0]))
+    return found
+
+
+def verify_vlans(conn, vlans: List[Vlan]) -> Tuple[List[int], List[int]]:
+    output = conn.send_command("show vlan brief")
+    found = parse_vlan_brief(output)
+    present = [v.vlan_id for v in vlans if v.vlan_id in found]
+    missing = [v.vlan_id for v in vlans if v.vlan_id not in found]
+    return present, missing
+
+
+def provision(conn, vlans: List[Vlan]) -> bool:
+    commands = build_commands(vlans)
+    log.info("Pushing %d config lines for %d VLANs", len(commands), len(vlans))
+    output = conn.send_config_set(commands)
+    log.debug("Device output:\n%s", output)
+
+    present, missing = verify_vlans(conn, vlans)
+    log.info("Verified present (%d): %s", len(present), present)
+    if missing:
+        log.error("VLANs absent after provisioning (%d): %s", len(missing), missing)
+        return False
+    log.info("All %d VLANs confirmed on device", len(present))
+    return True
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Bulk VLAN provisioner — pushes VLANs from a CSV to a switch via SSH"
     )
-    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", required=True, help="SSH password")
-    parser.add_argument("-t", "--device-type", required=True, help="Device type (e.g., cisco_ios)")
-    parser.add_argument("-b", "--baseline", required=True, help="Baseline JSON file path")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--timeout", type=int, default=30, help="Connection timeout in seconds")
-    parser.add_argument("-o", "--output", help="Save report to JSON file")
+    p.add_argument("--host", required=True, help="Device IP or hostname")
+    p.add_argument("--username", required=True, help="SSH username")
+    p.add_argument("--password", required=True, help="SSH password")
+    p.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        choices=["cisco_ios", "cisco_nxos"],
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    p.add_argument(
+        "--vlan-file",
+        required=True,
+        metavar="PATH",
+        help="CSV file: vlan_id[,vlan_name] — one VLAN per line",
+    )
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print commands without connecting to the device",
+    )
+    p.add_argument("--verbose", action="store_true", help="Enable DEBUG logging")
+    return p.parse_args()
 
-    args = parser.parse_args()
 
-    # Load and validate baseline
-    baseline = load_baseline(args.baseline)
-    logger.info(f"Baseline loaded: {args.baseline}")
+def main() -> int:
+    args = parse_args()
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    # Connect to device
-    device_params = {
+    try:
+        vlans = load_vlans(args.vlan_file)
+    except FileNotFoundError:
+        log.error("VLAN file not found: %s", args.vlan_file)
+        return 1
+    except Exception as exc:
+        log.error("Failed to read VLAN file: %s", exc)
+        return 1
+
+    if not vlans:
+        log.error("No valid VLANs found in %s", args.vlan_file)
+        return 1
+
+    log.info("Loaded %d VLANs from %s", len(vlans), args.vlan_file)
+
+    if args.dry_run:
+        print(f"--- DRY RUN: commands for {args.host} ({args.device_type}) ---")
+        for cmd in build_commands(vlans):
+            print(f"  {cmd}")
+        return 0
+
+    device = {
         "device_type": args.device_type,
-        "host": args.device,
+        "host": args.host,
         "username": args.username,
         "password": args.password,
         "port": args.port,
-        "timeout": args.timeout,
     }
 
-    device = connect_device(device_params)
-
     try:
-        # Retrieve and audit configuration
-        config = get_running_config(device)
-        report = audit_configuration(baseline, config)
+        log.info("Connecting to %s (%s)", args.host, args.device_type)
+        with ConnectHandler(**device) as conn:
+            success = provision(conn, vlans)
+    except AuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.host)
+        return 1
+    except NetmikoTimeoutException:
+        log.error("Connection to %s timed out", args.host)
+        return 1
+    except Exception as exc:
+        log.error("Unexpected error: %s", exc)
+        return 1
 
-        # Display results
-        logger.info(f"\nAudit Result: {report['compliance_status']}")
-        logger.info(f"Violations: {len(report['violations'])}")
-
-        if args.output:
-            with open(args.output, 'w') as f:
-                json.dump(report, f, indent=2)
-            logger.info(f"Report saved: {args.output}")
-
-        sys.exit(0 if report["compliance_status"] == "PASS" else 1)
-
-    finally:
-        device.disconnect()
-        logger.info("Disconnected")
+    return 0 if success else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
