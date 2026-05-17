@@ -1,33 +1,32 @@
-Here is the script:
+The script content (as requested, no fences):
 
-```python
+```
 """
-interface_baseline.py - Interface error/counter baseline capture and comparison.
+BGP Neighbor Validator
 
-Purpose:
-    Captures interface error counters and link status before a maintenance window,
-    then compares against a post-change capture to flag any interfaces that accrued
-    new errors or changed link state. Useful after cable swaps, optic replacements,
-    patch panel work, or any physical layer change where silent error accumulation
-    is the failure mode.
+Connects to a router and validates BGP session states against an expected
+peer list. Use this after BGP configuration changes, maintenance windows,
+or router failovers to confirm all sessions are Established.
 
 Usage:
-    # Step 1 — save a baseline before the change:
-    python interface_baseline.py --host 192.168.1.1 -u admin -p secret \
-        --mode capture --snapshot pre_change.json
-
-    # Step 2 — after the change, capture and compare in one shot:
-    python interface_baseline.py --host 192.168.1.1 -u admin -p secret \
-        --mode compare --baseline pre_change.json --snapshot post_change.json
-
-    # Diff two existing snapshot files without connecting to a device:
-    python interface_baseline.py --mode diff \
-        --baseline pre_change.json --snapshot post_change.json
+    python bgp_neighbor_validator.py -d 192.168.1.1 -u admin -p secret
+    python bgp_neighbor_validator.py -d 192.168.1.1 -u admin -p secret --peers-file peers.json
+    python bgp_neighbor_validator.py -d 192.168.1.1 -u admin -p secret --expect 10.0.0.1 10.0.0.2
+    python bgp_neighbor_validator.py -d 192.168.1.1 -u admin -p secret --show-all
 
 Prerequisites:
     pip install netmiko
-    Tested against Cisco IOS/IOS-XE. Device must permit 'show interfaces'.
-    Exit code 0 = clean, 1 = issues found (CRC errors, status changes, threshold exceeded).
+
+peers.json format:
+    [
+        {"neighbor": "10.0.0.1", "remote_as": "65001", "description": "upstream-A"},
+        {"neighbor": "10.0.0.2", "remote_as": "65002"}
+    ]
+
+Exit codes:
+    0 — all expected peers are Established
+    1 — connection or parse error
+    2 — one or more expected peers are down or missing
 """
 
 import argparse
@@ -35,190 +34,198 @@ import json
 import logging
 import re
 import sys
-from datetime import datetime, timezone
-from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional
 
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    datefmt="%Y-%m-%dT%H:%M:%S",
 )
-log = logging.getLogger(__name__)
-
-_ERROR_FIELDS = {
-    "input_errors": r"(\d+) input errors",
-    "crc": r"(\d+) CRC",
-    "frame": r"(\d+) frame",
-    "overrun": r"(\d+) overrun",
-    "ignored": r"(\d+) ignored",
-    "input_drops": r"(\d+) input drops",
-    "output_errors": r"(\d+) output errors",
-    "collisions": r"(\d+) collisions",
-    "output_drops": r"(\d+) output drops",
-    "late_collisions": r"(\d+) late collision",
-    "resets": r"(\d+) resets",
-}
+logger = logging.getLogger(__name__)
 
 
-def _parse_interfaces(raw: str) -> dict:
-    interfaces = {}
-    for block in re.split(r"\n(?=\S)", raw):
-        m = re.match(r"^(\S+)\s+is\s+(up|down|administratively down)", block)
-        if not m:
-            continue
-        counters = {"status": m.group(2)}
-        for field, pattern in _ERROR_FIELDS.items():
-            hit = re.search(pattern, block, re.IGNORECASE)
-            counters[field] = int(hit.group(1)) if hit else 0
-        interfaces[m.group(1)] = counters
-    return interfaces
+@dataclass
+class BgpNeighbor:
+    neighbor: str
+    remote_as: str
+    state: str
+    prefixes_received: Optional[int]
+    uptime: str
+
+    @property
+    def is_established(self) -> bool:
+        # IOS encodes Established state as a numeric prefix count
+        return self.state.lower() == "established" or self.state.isdigit()
 
 
-def capture_snapshot(host: str, username: str, password: str, device_type: str) -> dict:
-    params = {
-        "device_type": device_type,
-        "host": host,
-        "username": username,
-        "password": password,
-        "timeout": 30,
-    }
-    log.info("Connecting to %s", host)
-    try:
-        with ConnectHandler(**params) as conn:
-            log.info("Connected — capturing interface counters")
-            raw = conn.send_command("show interfaces", read_timeout=60)
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", username, host)
-        sys.exit(1)
-    except NetmikoTimeoutException:
-        log.error("Connection timed out to %s", host)
-        sys.exit(1)
+def parse_bgp_summary(output: str) -> list:
+    """Parse 'show ip bgp summary' from Cisco IOS/IOS-XE.
 
-    interfaces = _parse_interfaces(raw)
-    log.info("Captured %d interfaces", len(interfaces))
-    return {
-        "host": host,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "interfaces": interfaces,
-    }
-
-
-def _save(snapshot: dict, path: str) -> None:
-    Path(path).write_text(json.dumps(snapshot, indent=2))
-    log.info("Snapshot written to %s", path)
-
-
-def _load(path: str) -> dict:
-    try:
-        return json.loads(Path(path).read_text())
-    except FileNotFoundError:
-        log.error("File not found: %s", path)
-        sys.exit(1)
-    except json.JSONDecodeError as exc:
-        log.error("Cannot parse %s: %s", path, exc)
-        sys.exit(1)
-
-
-def compare(baseline: dict, current: dict, threshold: int) -> list:
-    issues = []
-    for iface, curr in current["interfaces"].items():
-        base = baseline["interfaces"].get(iface)
-        if base is None:
-            continue
-        deltas = {
-            f: curr.get(f, 0) - base.get(f, 0)
-            for f in _ERROR_FIELDS
-            if curr.get(f, 0) - base.get(f, 0) > 0
-        }
-        hard_errors = sum(
-            v for f, v in deltas.items() if f not in ("input_drops", "output_drops")
-        )
-        status_changed = base["status"] != curr["status"]
-        if hard_errors > threshold or status_changed or deltas.get("crc", 0) > 0:
-            issues.append({
-                "interface": iface,
-                "baseline_status": base["status"],
-                "current_status": curr["status"],
-                "status_changed": status_changed,
-                "error_deltas": deltas,
-                "total_new_errors": hard_errors,
-            })
-    return sorted(issues, key=lambda x: x["total_new_errors"], reverse=True)
-
-
-def print_report(baseline: dict, current: dict, issues: list, threshold: int) -> None:
-    sep = "=" * 68
-    print(f"\n{sep}")
-    print("INTERFACE BASELINE COMPARISON REPORT")
-    print(sep)
-    print(f"Host:         {current['host']}")
-    print(f"Baseline:     {baseline['timestamp']}")
-    print(f"Post-change:  {current['timestamp']}")
-    print(f"Threshold:    {threshold} new errors to flag")
-    print(f"Checked:      {len(current['interfaces'])} interfaces")
-    print(sep)
-
-    if not issues:
-        print("\n  PASS — no interfaces exceeded error thresholds.\n")
-        print(sep + "\n")
-        return
-
-    print(f"\n  WARNING — {len(issues)} interface(s) flagged:\n")
-    for item in issues:
-        status_note = (
-            f"  [status: {item['baseline_status']} -> {item['current_status']}]"
-            if item["status_changed"] else ""
-        )
-        print(f"  {item['interface']}{status_note}")
-        for field, delta in item["error_deltas"].items():
-            print(f"    {field:<20} +{delta}")
-        print()
-
-    result = "FAIL" if any(i["error_deltas"].get("crc", 0) > 0 for i in issues) else "WARN"
-    print(f"{sep}\nResult: {result}\n{sep}\n")
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Capture and compare interface error baselines across a change window."
+    Neighbor lines follow: <IP> <ver> <AS> <rcvd> <sent> <tbl> <inq> <outq> <uptime> <state/pfx>
+    """
+    neighbors = []
+    pattern = re.compile(
+        r"^(\d+\.\d+\.\d+\.\d+)\s+\d+\s+(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\S+)\s+(\S+)",
+        re.MULTILINE,
     )
-    p.add_argument("--host", help="Device IP or hostname")
-    p.add_argument("--username", "-u", help="SSH username")
-    p.add_argument("--password", "-p", help="SSH password")
-    p.add_argument("--device-type", default="cisco_ios",
-                   help="Netmiko device type (default: cisco_ios)")
-    p.add_argument("--mode", required=True, choices=["capture", "compare", "diff"],
-                   help="capture: save snapshot; compare: capture+diff; diff: compare two files")
-    p.add_argument("--snapshot", required=True,
-                   help="Output path for current/post-change snapshot")
-    p.add_argument("--baseline", help="Baseline snapshot file (required for compare/diff)")
-    p.add_argument("--threshold", type=int, default=10,
-                   help="Hard error delta to flag an interface (default: 10)")
+    for m in pattern.finditer(output):
+        ip, remote_as, uptime, state_or_pfx = m.groups()
+        neighbors.append(
+            BgpNeighbor(
+                neighbor=ip,
+                remote_as=remote_as,
+                state="Established" if state_or_pfx.isdigit() else state_or_pfx,
+                prefixes_received=int(state_or_pfx) if state_or_pfx.isdigit() else None,
+                uptime=uptime,
+            )
+        )
+    return neighbors
+
+
+def load_peers_file(path: str) -> list:
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.error("Failed to load peers file %s: %s", path, exc)
+        sys.exit(1)
+
+
+def validate(actual: list, expected_ips: list) -> tuple:
+    """Return (passed, failed_down, missing) neighbor IP lists."""
+    actual_map = {n.neighbor: n for n in actual}
+    passed, failed_down, missing = [], [], []
+    for ip in expected_ips:
+        if ip not in actual_map:
+            missing.append(ip)
+        elif actual_map[ip].is_established:
+            passed.append(ip)
+        else:
+            failed_down.append(ip)
+    return passed, failed_down, missing
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Validate BGP neighbor session states on a Cisco IOS/IOS-XE router."
+    )
+    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", required=True, help="SSH password")
+    p.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("--peers-file", help="JSON file listing expected BGP peer IPs")
+    p.add_argument(
+        "--expect",
+        nargs="+",
+        metavar="IP",
+        help="One or more expected BGP neighbor IPs",
+    )
+    p.add_argument(
+        "--show-all",
+        action="store_true",
+        help="Print all discovered neighbors regardless of expected list",
+    )
+    p.add_argument("--debug", action="store_true", help="Enable debug logging")
     return p
 
 
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    expected_ips = []
+    if args.peers_file:
+        peers_data = load_peers_file(args.peers_file)
+        expected_ips.extend(p["neighbor"] for p in peers_data)
+    if args.expect:
+        expected_ips.extend(args.expect)
+    seen = set()
+    expected_ips = [x for x in expected_ips if not (x in seen or seen.add(x))]
+
+    device_params = {
+        "device_type": args.device_type,
+        "host": args.device,
+        "username": args.username,
+        "password": args.password,
+        "port": args.port,
+    }
+
+    logger.info("Connecting to %s (%s)...", args.device, args.device_type)
+    try:
+        with ConnectHandler(**device_params) as conn:
+            hostname = conn.find_prompt().rstrip("#>")
+            logger.info("Connected to %s", hostname)
+            output = conn.send_command("show ip bgp summary")
+    except NetmikoAuthenticationException:
+        logger.error("Authentication failed for %s", args.device)
+        return 1
+    except NetmikoTimeoutException:
+        logger.error("Connection timed out to %s", args.device)
+        return 1
+    except Exception as exc:
+        logger.error("Unexpected connection error: %s", exc)
+        return 1
+
+    neighbors = parse_bgp_summary(output)
+    if not neighbors:
+        logger.warning(
+            "No BGP neighbors parsed. Verify device type or run with --debug to see raw output."
+        )
+        if args.debug:
+            print(output)
+        return 1
+
+    if args.show_all:
+        print(f"\n{'Neighbor':<18} {'AS':<8} {'State':<14} {'Uptime':<12} {'Prefixes':>8}")
+        print("-" * 64)
+        for n in sorted(neighbors, key=lambda x: x.neighbor):
+            pfx = str(n.prefixes_received) if n.prefixes_received is not None else "-"
+            print(f"{n.neighbor:<18} {n.remote_as:<8} {n.state:<14} {n.uptime:<12} {pfx:>8}")
+
+    if not expected_ips:
+        logger.info(
+            "No expected peers specified — found %d neighbor(s). "
+            "Use --expect or --peers-file to validate.",
+            len(neighbors),
+        )
+        return 0
+
+    passed, failed_down, missing = validate(neighbors, expected_ips)
+    actual_map = {n.neighbor: n for n in neighbors}
+
+    print(f"\nBGP Validation Results — {hostname} ({args.device})")
+    print("=" * 56)
+    for ip in passed:
+        n = actual_map[ip]
+        pfx = f"  [{n.prefixes_received} pfx]" if n.prefixes_received is not None else ""
+        print(f"  PASS  {ip:<18} Established  up {n.uptime}{pfx}")
+    for ip in failed_down:
+        n = actual_map[ip]
+        print(f"  FAIL  {ip:<18} {n.state}")
+    for ip in missing:
+        print(f"  MISS  {ip:<18} not present in BGP table")
+
+    total = len(expected_ips)
+    print(
+        f"\nSummary: {len(passed)}/{total} passed, "
+        f"{len(failed_down)} down, {len(missing)} missing"
+    )
+
+    return 0 if not failed_down and not missing else 2
+
+
 if __name__ == "__main__":
-    parser = _build_parser()
-    args = parser.parse_args()
-
-    if args.mode in ("compare", "diff") and not args.baseline:
-        parser.error("--baseline is required for compare and diff modes")
-
-    if args.mode in ("capture", "compare"):
-        if not all([args.host, args.username, args.password]):
-            parser.error("--host, --username, and --password are required for capture/compare")
-        current = capture_snapshot(args.host, args.username, args.password, args.device_type)
-        _save(current, args.snapshot)
-    else:
-        current = _load(args.snapshot)
-
-    if args.mode in ("compare", "diff"):
-        baseline = _load(args.baseline)
-        issues = compare(baseline, current, args.threshold)
-        print_report(baseline, current, issues, args.threshold)
-        sys.exit(1 if issues else 0)
-
-    log.info("Done. Run with --mode compare --baseline %s after your change.", args.snapshot)
+    sys.exit(main())
 ```
+
+**What this does:** BGP neighbor validator — connects via netmiko, runs `show ip bgp summary`, parses all neighbors and their session states, then validates them against an expected peer list (from `--expect` IPs or a `--peers-file` JSON). Returns exit code 0/1/2 for CI/pipeline integration. Distinct from all existing scripts in the repo and covers a real post-change validation workflow network engineers actually run.
