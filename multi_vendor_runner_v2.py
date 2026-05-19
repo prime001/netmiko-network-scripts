@@ -1,226 +1,241 @@
 ```python
 """
-interface_error_monitor.py - Monitor interface error counters on network devices.
+mac_arp_correlator.py - Map IP addresses to MAC addresses to switch ports.
 
 Purpose:
-    Connects to a network device via SSH and reports interface error counters
-    (input errors, output drops, CRC errors, giants, runts). Supports one-shot
-    reporting or continuous polling with delta tracking and threshold-based alerting.
-    Useful for catching bad cables, duplex mismatches, and oversubscribed links.
+    Correlates ARP table entries (IP->MAC) with MAC address table entries
+    (MAC->port) to produce a complete IP->MAC->interface mapping. Useful for
+    locating endpoints, auditing access layers, and troubleshooting
+    connectivity issues without manual network traversal.
 
 Usage:
-    python interface_error_monitor.py -H 192.168.1.1 -u admin -p secret
-    python interface_error_monitor.py -H 192.168.1.1 -u admin -p secret --poll 60
-    python interface_error_monitor.py -H 192.168.1.1 -u admin -p secret \\
-        --interface GigabitEthernet0/1 --threshold 10
+    python mac_arp_correlator.py -H 192.168.1.1 -u admin -p secret
+    python mac_arp_correlator.py -H 10.0.0.1 -u admin -p secret --search 00:1a:2b:3c:4d:5e
+    python mac_arp_correlator.py -H 10.0.0.1 -u admin -p secret --ip 192.168.1.50
+    python mac_arp_correlator.py -H 10.0.0.1 -u admin -p secret --csv results.csv
 
 Prerequisites:
     pip install netmiko
-    Supported: cisco_ios, cisco_xe, cisco_nxos, cisco_xr
+    SSH access to device with privilege level sufficient to read ARP and MAC tables.
+    Supported device types: cisco_ios, cisco_nxos, arista_eos
 """
 
 import argparse
+import csv
 import logging
 import re
 import sys
-import time
 from dataclasses import dataclass
-from typing import Dict, Optional
 
 from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
     level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
 
 @dataclass
-class InterfaceCounters:
-    name: str
-    input_errors: int = 0
-    output_drops: int = 0
-    crc: int = 0
-    giants: int = 0
-    runts: int = 0
-
-    def total(self) -> int:
-        return self.input_errors + self.output_drops + self.crc + self.giants + self.runts
-
-    def delta(self, prev: "InterfaceCounters") -> "InterfaceCounters":
-        return InterfaceCounters(
-            name=self.name,
-            input_errors=self.input_errors - prev.input_errors,
-            output_drops=self.output_drops - prev.output_drops,
-            crc=self.crc - prev.crc,
-            giants=self.giants - prev.giants,
-            runts=self.runts - prev.runts,
-        )
+class ArpEntry:
+    ip: str
+    mac: str
+    interface: str
 
 
-def parse_cisco_counters(output: str) -> Dict[str, InterfaceCounters]:
-    counters: Dict[str, InterfaceCounters] = {}
-    current: Optional[str] = None
+@dataclass
+class MacEntry:
+    mac: str
+    vlan: str
+    interface: str
 
-    iface_re = re.compile(r"^(\S+) is (?:up|down|administratively down)")
-    input_re = re.compile(
-        r"(\d+) input errors,\s*(\d+) CRC,\s*\d+ frame,\s*\d+ overrun,\s*(\d+) ignored"
+
+@dataclass
+class CorrelatedEntry:
+    ip: str
+    mac: str
+    arp_interface: str
+    switch_port: str
+    vlan: str
+
+
+def normalize_mac(mac: str) -> str:
+    digits = re.sub(r"[^0-9a-fA-F]", "", mac)
+    if len(digits) != 12:
+        return mac.lower()
+    return ":".join(digits[i:i + 2] for i in range(0, 12, 2)).lower()
+
+
+def parse_ios_arp(output: str) -> list[ArpEntry]:
+    entries = []
+    pattern = re.compile(
+        r"Internet\s+(\d+\.\d+\.\d+\.\d+)\s+\S+\s+([0-9a-fA-F.]+)\s+\S+\s+(\S+)"
     )
-    runts_giants_re = re.compile(r"(\d+) runts,\s*(\d+) giants")
-    drops_re = re.compile(r"(\d+) output drops")
-
-    for line in output.splitlines():
-        m = iface_re.match(line)
-        if m:
-            current = m.group(1)
-            counters[current] = InterfaceCounters(name=current)
-            continue
-
-        if current is None:
-            continue
-
-        m = input_re.search(line)
-        if m:
-            counters[current].input_errors = int(m.group(1))
-            counters[current].crc = int(m.group(2))
-
-        m = runts_giants_re.search(line)
-        if m:
-            counters[current].runts = int(m.group(1))
-            counters[current].giants = int(m.group(2))
-
-        m = drops_re.search(line)
-        if m:
-            counters[current].output_drops = int(m.group(1))
-
-    return counters
+    for m in pattern.finditer(output):
+        ip, mac, iface = m.groups()
+        entries.append(ArpEntry(ip=ip, mac=normalize_mac(mac), interface=iface))
+    return entries
 
 
-def fetch_counters(
-    conn, device_type: str, interface: Optional[str]
-) -> Dict[str, InterfaceCounters]:
-    cmd = "show interfaces" if not interface else f"show interfaces {interface}"
-    output = conn.send_command(cmd)
-    if device_type in ("cisco_ios", "cisco_xe", "cisco_nxos", "cisco_xr"):
-        return parse_cisco_counters(output)
-    log.error("Unsupported device type '%s'", device_type)
-    return {}
+def parse_ios_mac_table(output: str) -> list[MacEntry]:
+    entries = []
+    pattern = re.compile(r"^\s*(\d+)\s+([0-9a-fA-F.]+)\s+\S+\s+(\S+)", re.MULTILINE)
+    for m in pattern.finditer(output):
+        vlan, mac, iface = m.groups()
+        entries.append(MacEntry(mac=normalize_mac(mac), vlan=vlan, interface=iface))
+    return entries
 
 
-def report(
-    current: Dict[str, InterfaceCounters],
-    prev: Optional[Dict[str, InterfaceCounters]],
-    threshold: int,
-) -> bool:
-    alerted = False
-    for name, c in sorted(current.items()):
-        total = c.total()
-        if total == 0 and (prev is None or name not in prev):
-            continue
+def parse_nxos_arp(output: str) -> list[ArpEntry]:
+    entries = []
+    pattern = re.compile(
+        r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F:]+)\s+\S+\s+(\S+)"
+    )
+    for m in pattern.finditer(output):
+        ip, mac, iface = m.groups()
+        entries.append(ArpEntry(ip=ip, mac=normalize_mac(mac), interface=iface))
+    return entries
 
-        d: Optional[InterfaceCounters] = None
-        if prev and name in prev:
-            d = c.delta(prev[name])
 
-        incrementing = d is not None and d.total() > 0
-        over_threshold = total >= threshold if threshold > 0 else total > 0
+def parse_nxos_mac_table(output: str) -> list[MacEntry]:
+    entries = []
+    # VLAN  MAC   type  age  secure ntfy  Ports
+    pattern = re.compile(
+        r"^\s*(\d+)\s+([0-9a-fA-F.]+)\s+\S+\s+\S+\s+\S+\s+\S+\s+(\S+)",
+        re.MULTILINE,
+    )
+    for m in pattern.finditer(output):
+        vlan, mac, iface = m.groups()
+        entries.append(MacEntry(mac=normalize_mac(mac), vlan=vlan, interface=iface))
+    return entries
 
-        if not over_threshold and not incrementing:
-            continue
 
-        delta_str = ""
-        if d and d.total() > 0:
-            delta_str = (
-                f" [+in_err={d.input_errors} +drops={d.output_drops}"
-                f" +crc={d.crc} +giants={d.giants} +runts={d.runts}]"
+DEVICE_PARSERS = {
+    "cisco_ios": {
+        "arp_cmd": "show ip arp",
+        "mac_cmd": "show mac address-table",
+        "parse_arp": parse_ios_arp,
+        "parse_mac": parse_ios_mac_table,
+    },
+    "cisco_nxos": {
+        "arp_cmd": "show ip arp",
+        "mac_cmd": "show mac address-table",
+        "parse_arp": parse_nxos_arp,
+        "parse_mac": parse_nxos_mac_table,
+    },
+    "arista_eos": {
+        "arp_cmd": "show ip arp",
+        "mac_cmd": "show mac address-table",
+        "parse_arp": parse_ios_arp,
+        "parse_mac": parse_ios_mac_table,
+    },
+}
+
+
+def correlate(arp_entries: list[ArpEntry], mac_entries: list[MacEntry]) -> list[CorrelatedEntry]:
+    mac_to_port = {e.mac: e for e in mac_entries}
+    results = []
+    for arp in arp_entries:
+        mac_entry = mac_to_port.get(arp.mac)
+        results.append(
+            CorrelatedEntry(
+                ip=arp.ip,
+                mac=arp.mac,
+                arp_interface=arp.interface,
+                switch_port=mac_entry.interface if mac_entry else "N/A",
+                vlan=mac_entry.vlan if mac_entry else "",
             )
-
-        level = logging.WARNING if (over_threshold and threshold > 0) else logging.INFO
-        log.log(
-            level,
-            "%-40s in_err=%-6d drops=%-6d crc=%-6d giants=%-4d runts=%-4d%s",
-            name, c.input_errors, c.output_drops, c.crc, c.giants, c.runts, delta_str,
         )
-        if over_threshold:
-            alerted = True
-
-    return alerted
+    return results
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Monitor interface error counters on network devices via SSH."
-    )
-    p.add_argument("-H", "--host", required=True, help="Device hostname or IP")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", required=True, help="SSH password")
-    p.add_argument(
-        "-t", "--device-type",
-        default="cisco_ios",
-        choices=["cisco_ios", "cisco_xe", "cisco_nxos", "cisco_xr"],
-        help="Netmiko device type (default: cisco_ios)",
-    )
-    p.add_argument("-i", "--interface", help="Limit to a single interface name")
-    p.add_argument(
-        "--poll", type=int, metavar="SECONDS",
-        help="Poll continuously at this interval; omit for a single snapshot",
-    )
-    p.add_argument(
-        "--threshold", type=int, default=0,
-        help="Cumulative error count that triggers WARNING (0 = flag any non-zero)",
-    )
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument("-v", "--verbose", action="store_true", help="Enable debug output")
-    return p
+def print_table(entries: list[CorrelatedEntry]) -> None:
+    if not entries:
+        print("No entries found.")
+        return
+    fmt = f"{'IP Address':<18} {'MAC Address':<19} {'ARP Interface':<24} {'Switch Port':<24} VLAN"
+    print(fmt)
+    print("-" * len(fmt))
+    for e in sorted(entries, key=lambda x: tuple(int(o) for o in x.ip.split("."))):
+        print(f"{e.ip:<18} {e.mac:<19} {e.arp_interface:<24} {e.switch_port:<24} {e.vlan}")
+
+
+def write_csv(entries: list[CorrelatedEntry], path: str) -> None:
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["ip", "mac", "arp_interface", "switch_port", "vlan"]
+        )
+        writer.writeheader()
+        for e in entries:
+            writer.writerow(
+                {"ip": e.ip, "mac": e.mac, "arp_interface": e.arp_interface,
+                 "switch_port": e.switch_port, "vlan": e.vlan}
+            )
+    log.info("Results written to %s", path)
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    parser = argparse.ArgumentParser(
+        description="Correlate ARP and MAC address tables to map IP->MAC->port."
+    )
+    parser.add_argument("-H", "--host", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", required=True)
+    parser.add_argument(
+        "-t", "--device-type",
+        default="cisco_ios",
+        choices=list(DEVICE_PARSERS),
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument("--search", metavar="MAC", help="Filter output by MAC address")
+    parser.add_argument("--ip", metavar="IP", help="Filter output by IP address")
+    parser.add_argument("--csv", metavar="FILE", help="Export results to CSV")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    device_params = {
-        "device_type": args.device_type,
-        "host": args.host,
-        "username": args.username,
-        "password": args.password,
-        "port": args.port,
-    }
+    parsers = DEVICE_PARSERS[args.device_type]
 
-    log.info("Connecting to %s (%s)", args.host, args.device_type)
     try:
-        conn = ConnectHandler(**device_params)
+        log.info("Connecting to %s (%s)", args.host, args.device_type)
+        with ConnectHandler(
+            device_type=args.device_type,
+            host=args.host,
+            username=args.username,
+            password=args.password,
+            port=args.port,
+        ) as conn:
+            log.info("Fetching ARP table")
+            arp_raw = conn.send_command(parsers["arp_cmd"])
+            log.info("Fetching MAC address table")
+            mac_raw = conn.send_command(parsers["mac_cmd"])
     except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.host)
+        log.error("Authentication failed for %s", args.host)
         sys.exit(1)
     except NetmikoTimeoutException:
-        log.error("Connection timed out to %s:%d", args.host, args.port)
+        log.error("Connection to %s timed out", args.host)
         sys.exit(1)
 
-    prev: Optional[Dict[str, InterfaceCounters]] = None
-    alerted = False
-    try:
-        while True:
-            counters = fetch_counters(conn, args.device_type, args.interface)
-            if not counters:
-                log.warning("No counters parsed — check device type or interface name.")
-            else:
-                alerted = report(counters, prev, args.threshold)
-                prev = counters
+    arp_entries = parsers["parse_arp"](arp_raw)
+    mac_entries = parsers["parse_mac"](mac_raw)
+    log.info("Parsed %d ARP entries, %d MAC entries", len(arp_entries), len(mac_entries))
 
-            if not args.poll:
-                break
-            log.info("Next poll in %d seconds — Ctrl+C to stop.", args.poll)
-            time.sleep(args.poll)
-    except KeyboardInterrupt:
-        log.info("Stopped.")
-    finally:
-        conn.disconnect()
+    results = correlate(arp_entries, mac_entries)
 
-    sys.exit(1 if alerted else 0)
+    if args.search:
+        needle = normalize_mac(args.search)
+        results = [r for r in results if r.mac == needle]
+    if args.ip:
+        results = [r for r in results if r.ip == args.ip]
+
+    print_table(results)
+
+    if args.csv:
+        write_csv(results, args.csv)
 
 
 if __name__ == "__main__":
