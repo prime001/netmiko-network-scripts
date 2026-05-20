@@ -1,18 +1,20 @@
-interface_error_monitor.py — Interface Error Counter Monitor
+The task is fully specified with no design ambiguity — outputting the script directly as instructed.
 
-Purpose:
-    Connects to a network device via SSH, collects per-interface error counters
-    (input errors, CRC, output drops, giants, runts), and reports any interface
-    exceeding a configurable threshold. Useful for identifying degraded links or
-    faulty hardware before they cause outages.
+"""
+neighbor_map.py — CDP/LLDP Neighbor Topology Mapper
+
+Connects to a network device via SSH and extracts CDP or LLDP neighbor
+information, producing a structured topology summary useful for audits,
+documentation, and change-impact analysis.
 
 Usage:
-    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret
-    python interface_error_monitor.py -d 10.0.0.1 -u admin -p secret --threshold 50 --json
-    python interface_error_monitor.py -d 10.0.0.1 -u admin -p secret --device-type cisco_nxos --all
+    python neighbor_map.py -d 192.168.1.1 -u admin
+    python neighbor_map.py -d 192.168.1.1 -u admin -p secret --protocol lldp
+    python neighbor_map.py -d 192.168.1.1 -u admin --output json --device-type cisco_ios_xe
 
 Prerequisites:
     pip install netmiko
+    CDP or LLDP must be enabled on the target device.
 """
 
 import argparse
@@ -20,218 +22,170 @@ import json
 import logging
 import re
 import sys
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import asdict, dataclass
+from getpass import getpass
 
-from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.WARNING)
 log = logging.getLogger(__name__)
 
 
 @dataclass
-class InterfaceErrors:
-    name: str
-    input_errors: int = 0
-    crc: int = 0
-    output_drops: int = 0
-    giants: int = 0
-    runts: int = 0
-
-    def flagged(self, threshold: int) -> bool:
-        return (
-            self.input_errors >= threshold
-            or self.crc >= threshold
-            or self.output_drops >= threshold
-        )
-
-    def severity_score(self) -> int:
-        return self.input_errors + self.output_drops + self.crc
-
-    def to_dict(self) -> dict:
-        return {
-            "interface": self.name,
-            "input_errors": self.input_errors,
-            "crc": self.crc,
-            "output_drops": self.output_drops,
-            "giants": self.giants,
-            "runts": self.runts,
-        }
+class Neighbor:
+    device_id: str
+    local_port: str
+    remote_port: str
+    platform: str = ""
+    mgmt_address: str = ""
+    capabilities: str = ""
 
 
-def parse_interface_errors(output: str) -> List[InterfaceErrors]:
-    interfaces: List[InterfaceErrors] = []
-    current: Optional[InterfaceErrors] = None
+def parse_cdp_neighbors(output: str) -> list[Neighbor]:
+    neighbors = []
+    for block in re.split(r"-{3,}", output):
+        if not block.strip():
+            continue
+        device_id = re.search(r"Device ID:\s*(\S+)", block)
+        local_port = re.search(r"Interface:\s*([^,]+),", block)
+        remote_port = re.search(r"Port ID \(outgoing port\):\s*(.+)", block)
+        platform = re.search(r"Platform:\s*([^,]+)", block)
+        mgmt = re.search(r"(?:IP address|IPv4 Address):\s*(\S+)", block)
+        caps = re.search(r"Capabilities:\s*(.+)", block)
 
-    intf_re = re.compile(r"^(\S+)\s+is\s+(?:up|down|administratively down)")
-    input_err_re = re.compile(r"(\d+)\s+input errors")
-    crc_re = re.compile(r"(\d+)\s+CRC")
-    output_drop_re = re.compile(r"(\d+)\s+output drops")
-    output_queue_re = re.compile(r"[Oo]utput queue[^,]*,\s*(\d+)\s+drops")
-    giants_re = re.compile(r"(\d+)\s+giants")
-    runts_re = re.compile(r"(\d+)\s+runts")
-
-    for line in output.splitlines():
-        if m := intf_re.match(line):
-            if current is not None:
-                interfaces.append(current)
-            current = InterfaceErrors(name=m.group(1))
+        if not (device_id and local_port and remote_port):
             continue
 
-        if current is None:
+        neighbors.append(Neighbor(
+            device_id=device_id.group(1).strip(),
+            local_port=local_port.group(1).strip(),
+            remote_port=remote_port.group(1).strip(),
+            platform=platform.group(1).strip() if platform else "",
+            mgmt_address=mgmt.group(1).strip() if mgmt else "",
+            capabilities=caps.group(1).strip() if caps else "",
+        ))
+    return neighbors
+
+
+def parse_lldp_neighbors(output: str) -> list[Neighbor]:
+    neighbors = []
+    for block in re.split(r"(?=Local Intf:)", output):
+        if not block.strip():
+            continue
+        local_port = re.search(r"Local Intf:\s*(\S+)", block)
+        device_id = re.search(r"System Name:\s*(\S+)", block)
+        remote_port = re.search(r"Port id:\s*(\S+)", block)
+        platform = re.search(r"System Description:\s*(.+)", block)
+        mgmt = re.search(r"Management Addresses[^\n]*\n\s*(\d+\.\d+\.\d+\.\d+)", block)
+        caps = re.search(r"System Capabilities:\s*(.+)", block)
+
+        if not (device_id and local_port and remote_port):
             continue
 
-        if m := input_err_re.search(line):
-            current.input_errors = int(m.group(1))
-        if m := crc_re.search(line):
-            current.crc = int(m.group(1))
-        if m := output_drop_re.search(line):
-            current.output_drops = int(m.group(1))
-        if m := output_queue_re.search(line):
-            current.output_drops = max(current.output_drops, int(m.group(1)))
-        if m := giants_re.search(line):
-            current.giants = int(m.group(1))
-        if m := runts_re.search(line):
-            current.runts = int(m.group(1))
-
-    if current is not None:
-        interfaces.append(current)
-
-    return interfaces
+        neighbors.append(Neighbor(
+            device_id=device_id.group(1).strip(),
+            local_port=local_port.group(1).strip(),
+            remote_port=remote_port.group(1).strip(),
+            platform=platform.group(1).strip()[:60] if platform else "",
+            mgmt_address=mgmt.group(1).strip() if mgmt else "",
+            capabilities=caps.group(1).strip() if caps else "",
+        ))
+    return neighbors
 
 
-def collect_errors(
+def collect_neighbors(
     host: str,
     username: str,
     password: str,
     device_type: str,
-    port: int,
-    enable_secret: Optional[str],
-) -> List[InterfaceErrors]:
-    params = {
+    protocol: str,
+) -> list[Neighbor]:
+    device = {
         "device_type": device_type,
         "host": host,
         "username": username,
         "password": password,
-        "port": port,
     }
-    if enable_secret:
-        params["secret"] = enable_secret
-
-    log.info("Connecting to %s (%s)", host, device_type)
-    with ConnectHandler(**params) as conn:
-        if enable_secret:
-            conn.enable()
-        raw = conn.send_command("show interfaces", read_timeout=60)
-
-    interfaces = parse_interface_errors(raw)
-    log.info("Parsed %d interfaces from %s", len(interfaces), host)
-    return interfaces
+    log.info("Connecting to %s", host)
+    with ConnectHandler(**device) as conn:
+        if protocol == "cdp":
+            output = conn.send_command("show cdp neighbors detail")
+            return parse_cdp_neighbors(output)
+        output = conn.send_command("show lldp neighbors detail")
+        return parse_lldp_neighbors(output)
 
 
-def print_table(interfaces: List[InterfaceErrors], threshold: int, show_all: bool) -> None:
-    target = interfaces if show_all else [i for i in interfaces if i.flagged(threshold)]
-
-    if not target:
-        print(f"\nAll {len(interfaces)} interfaces are within threshold ({threshold}). No errors detected.\n")
+def print_table(neighbors: list[Neighbor]) -> None:
+    if not neighbors:
+        print("No neighbors found.")
         return
-
-    col = [32, 14, 10, 14, 8, 8]
-    total_w = sum(col)
+    col = (30, 20, 20, 16)
     header = (
-        f"{'Interface':<{col[0]}} {'Input Errors':>{col[1]}} {'CRC':>{col[2]}} "
-        f"{'Output Drops':>{col[3]}} {'Giants':>{col[4]}} {'Runts':>{col[5]}}"
+        f"{'Device ID':<{col[0]}} {'Local Port':<{col[1]}} "
+        f"{'Remote Port':<{col[2]}} {'Mgmt IP':<{col[3]}} Platform"
     )
-
-    label = "ALL INTERFACES" if show_all else f"FLAGGED INTERFACES (threshold={threshold})"
-    print(f"\n{label:^{total_w}}")
-    print("-" * total_w)
     print(header)
-    print("-" * total_w)
-
-    for intf in sorted(target, key=lambda x: x.severity_score(), reverse=True):
-        flag = " !" if intf.flagged(threshold) else "  "
+    print("-" * (sum(col) + 30))
+    for n in neighbors:
         print(
-            f"{intf.name:<{col[0]}} {intf.input_errors:>{col[1]}} {intf.crc:>{col[2]}} "
-            f"{intf.output_drops:>{col[3]}} {intf.giants:>{col[4]}} {intf.runts:>{col[5]}}{flag}"
+            f"{n.device_id:<{col[0]}} {n.local_port:<{col[1]}} "
+            f"{n.remote_port:<{col[2]}} {n.mgmt_address:<{col[3]}} {n.platform}"
         )
 
-    flagged_count = sum(1 for i in interfaces if i.flagged(threshold))
-    print(f"\n{flagged_count}/{len(interfaces)} interface(s) flagged.\n")
 
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Report interface error counters and flag degraded links."
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Map CDP/LLDP neighbors from a network device"
     )
-    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", required=True, help="SSH password")
-    p.add_argument("-e", "--enable-secret", default=None, help="Enable/privilege password")
-    p.add_argument(
-        "--device-type",
-        default="cisco_ios",
+    parser.add_argument("-d", "--device", required=True, help="Target device IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
+    parser.add_argument(
+        "--device-type", default="cisco_ios",
         help="Netmiko device type (default: cisco_ios)",
     )
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument(
-        "--threshold",
-        type=int,
-        default=10,
-        help="Error count to flag an interface (default: 10)",
+    parser.add_argument(
+        "--protocol", choices=["cdp", "lldp"], default="cdp",
+        help="Discovery protocol to query (default: cdp)",
     )
-    p.add_argument(
-        "--json",
-        action="store_true",
-        help="Output flagged interfaces as JSON",
+    parser.add_argument(
+        "--output", choices=["table", "json"], default="table",
+        help="Output format (default: table)",
     )
-    p.add_argument(
-        "--all",
-        action="store_true",
-        dest="show_all",
-        help="Include interfaces with zero errors in output",
-    )
-    p.add_argument("--debug", action="store_true", help="Enable debug logging")
-    return p
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    password = args.password or getpass(f"Password for {args.username}@{args.device}: ")
+
+    try:
+        neighbors = collect_neighbors(
+            host=args.device,
+            username=args.username,
+            password=password,
+            device_type=args.device_type,
+            protocol=args.protocol,
+        )
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.device)
+        return 1
+    except NetmikoTimeoutException:
+        log.error("Connection timed out to %s", args.device)
+        return 1
+    except Exception as exc:
+        log.error("Unexpected error: %s", exc)
+        return 1
+
+    if args.output == "json":
+        print(json.dumps([asdict(n) for n in neighbors], indent=2))
+    else:
+        print(f"\n{args.protocol.upper()} neighbors on {args.device} ({len(neighbors)} found)\n")
+        print_table(neighbors)
+
+    return 0
 
 
 if __name__ == "__main__":
-    parser = build_parser()
-    args = parser.parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    try:
-        interfaces = collect_errors(
-            host=args.device,
-            username=args.username,
-            password=args.password,
-            device_type=args.device_type,
-            port=args.port,
-            enable_secret=args.enable_secret,
-        )
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s", args.device)
-        sys.exit(1)
-    except NetmikoTimeoutException:
-        log.error("Connection timed out to %s", args.device)
-        sys.exit(1)
-    except Exception as exc:
-        log.error("Unexpected error: %s", exc)
-        sys.exit(1)
-
-    if args.json:
-        flagged = interfaces if args.show_all else [i for i in interfaces if i.flagged(args.threshold)]
-        print(json.dumps(
-            {"device": args.device, "threshold": args.threshold, "interfaces": [i.to_dict() for i in flagged]},
-            indent=2,
-        ))
-    else:
-        print_table(interfaces, args.threshold, args.show_all)
+    sys.exit(main())
