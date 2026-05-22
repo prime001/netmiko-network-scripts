@@ -1,20 +1,27 @@
-mac_aware_port_bounce.py - Port bounce with MAC address tracking and reconnection verification.
+mac_port_bounce.py — Locate a device by MAC address and bounce its switchport.
 
-Purpose:
-    Bounces one or more switch ports while recording connected MAC addresses
-    before shutdown, then polls the forwarding table until those MACs reappear
-    or a timeout expires. Confirms devices reconnect cleanly after forced
-    re-authentication, cable remediation, or 802.1X reauthentication cycles.
+In most NOC tickets you get a host name or IP, not a switch interface. This
+script resolves a MAC address (or IP via ARP table) to a specific port, then
+performs a shutdown / no-shutdown cycle on that port and confirms it returns
+to up/up.
 
 Usage:
-    python mac_aware_port_bounce.py -d 192.168.1.1 -u admin -p secret \
-        -i GigabitEthernet0/1 GigabitEthernet0/2 \
-        [--wait 10] [--timeout 90] [--device-type cisco_ios] [--secret enable]
+    # Bounce by MAC address
+    python mac_port_bounce.py --host 10.0.0.1 --username admin --password secret \
+        --mac 00:1a:2b:3c:4d:5e
+
+    # Bounce by IP (resolves via ARP table first)
+    python mac_port_bounce.py --host 10.0.0.1 --username admin --password secret \
+        --ip 192.168.1.42
+
+    # Skip MAC lookup; bounce a known interface directly
+    python mac_port_bounce.py --host 10.0.0.1 --username admin --password secret \
+        --interface GigabitEthernet0/1 --wait 10
 
 Prerequisites:
     pip install netmiko
-    Device must support: show mac address-table interface <intf>
-    SSH credentials must have privilege to enter config mode (shut/no shut).
+    Tested against Cisco IOS / IOS-XE.  For NX-OS change --device-type to
+    cisco_nxos and the MAC table regex may need adjustment.
 """
 
 import argparse
@@ -22,163 +29,153 @@ import logging
 import re
 import sys
 import time
+from typing import Optional
 
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-MAC_RE = re.compile(r"[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}", re.I)
+
+def normalize_mac(mac: str) -> str:
+    return re.sub(r"[.:\-]", "", mac).lower()
 
 
-def get_interface_macs(conn, interface):
-    output = conn.send_command(f"show mac address-table interface {interface}")
-    return set(MAC_RE.findall(output))
+def ip_to_mac(conn, ip: str) -> Optional[str]:
+    output = conn.send_command(f"show ip arp {ip}")
+    match = re.search(r"([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})", output, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return None
 
 
-def get_interface_status(conn, interface):
-    output = conn.send_command(f"show interfaces {interface} | include line protocol")
-    return "up" if "up" in output.lower() else "down"
+def mac_to_port(conn, mac: str) -> Optional[str]:
+    norm = normalize_mac(mac)
+    output = conn.send_command("show mac address-table")
+    for line in output.splitlines():
+        if norm in normalize_mac(line):
+            tokens = line.split()
+            for token in reversed(tokens):
+                if re.match(r"[A-Za-z]", token) and "/" in token:
+                    return token
+    return None
 
 
-def bounce_interface(conn, interface, wait_seconds):
-    log.info("Shutting %s", interface)
+def bounce_interface(conn, interface: str, wait: int) -> None:
+    log.info("Shutting down %s", interface)
     conn.send_config_set([f"interface {interface}", "shutdown"])
-    time.sleep(wait_seconds)
-    log.info("Restoring %s after %ds", interface, wait_seconds)
+    log.info("Holding down for %d second(s)", wait)
+    time.sleep(wait)
+    log.info("Bringing up %s", interface)
     conn.send_config_set([f"interface {interface}", "no shutdown"])
 
 
-def wait_for_macs(conn, interface, expected, timeout, poll=5):
+def interface_is_up(conn, interface: str) -> bool:
+    output = conn.send_command(f"show interfaces {interface} | include line protocol")
+    return bool(re.search(r"line protocol is up", output, re.IGNORECASE))
+
+
+def wait_for_up(conn, interface: str, timeout: int = 30) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        current = get_interface_macs(conn, interface)
-        missing = expected - current
-        if not missing:
-            return expected & current, set()
-        log.debug("%s: %d/%d MACs back, continuing to poll", interface, len(expected) - len(missing), len(expected))
-        time.sleep(poll)
-    current = get_interface_macs(conn, interface)
-    return expected & current, expected - current
+        if interface_is_up(conn, interface):
+            return True
+        time.sleep(3)
+    return False
 
 
-def process_interface(conn, interface, wait_seconds, mac_timeout):
-    result = {
-        "interface": interface,
-        "status": "unknown",
-        "pre_macs": set(),
-        "recovered": set(),
-        "missing": set(),
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Locate a device by MAC/IP and bounce its switchport."
+    )
+    parser.add_argument("--host", required=True, help="Switch management IP or hostname")
+    parser.add_argument("--username", required=True)
+    parser.add_argument("--password", required=True)
+    parser.add_argument("--device-type", default="cisco_ios")
+    parser.add_argument("--port", type=int, default=22)
+
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--mac", help="Device MAC address (any separator format)")
+    target.add_argument("--ip", help="Device IP — resolved to MAC via ARP table")
+    target.add_argument("--interface", help="Interface to bounce directly (skips MAC lookup)")
+
+    parser.add_argument(
+        "--wait", type=int, default=5, help="Seconds to hold port down (default: 5)"
+    )
+    parser.add_argument(
+        "--verify-timeout", type=int, default=30,
+        help="Seconds to wait for port to return up (default: 30)"
+    )
+    parser.add_argument(
+        "--no-verify", action="store_true", help="Skip post-bounce link-up check"
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    device = {
+        "device_type": args.device_type,
+        "host": args.host,
+        "username": args.username,
+        "password": args.password,
+        "port": args.port,
     }
 
-    status = get_interface_status(conn, interface)
-    if status != "up":
-        log.warning("%s not up (status: %s) — skipping", interface, status)
-        result["status"] = f"skipped:{status}"
-        return result
+    try:
+        log.info("Connecting to %s", args.host)
+        conn = ConnectHandler(**device)
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s", args.host)
+        return 1
+    except NetmikoTimeoutException:
+        log.error("Connection timed out to %s", args.host)
+        return 1
 
-    pre_macs = get_interface_macs(conn, interface)
-    result["pre_macs"] = pre_macs
-    log.info("%s: %d MAC(s) before bounce: %s", interface, len(pre_macs), pre_macs or "none")
+    try:
+        interface = args.interface
 
-    bounce_interface(conn, interface, wait_seconds)
+        if args.ip:
+            log.info("Resolving IP %s to MAC via ARP table", args.ip)
+            args.mac = ip_to_mac(conn, args.ip)
+            if not args.mac:
+                log.error("IP %s not found in ARP table — is the device reachable?", args.ip)
+                return 1
+            log.info("Resolved %s → MAC %s", args.ip, args.mac)
 
-    if not pre_macs:
-        result["status"] = "bounced:no_macs"
-        log.info("%s: bounce complete (no MACs to track)", interface)
-        return result
+        if args.mac:
+            log.info("Looking up MAC %s in address table", args.mac)
+            interface = mac_to_port(conn, args.mac)
+            if not interface:
+                log.error(
+                    "MAC %s not found in address table — device may be inactive or behind a hub",
+                    args.mac,
+                )
+                return 1
+            log.info("MAC %s is on interface %s", args.mac, interface)
 
-    log.info("%s: polling up to %ds for %d MAC(s)", interface, mac_timeout, len(pre_macs))
-    recovered, missing = wait_for_macs(conn, interface, pre_macs, mac_timeout)
-    result["recovered"] = recovered
-    result["missing"] = missing
+        bounce_interface(conn, interface, args.wait)
 
-    if missing:
-        result["status"] = "incomplete"
-        log.warning("%s: %d MAC(s) did not return: %s", interface, len(missing), missing)
-    else:
-        result["status"] = "success"
-        log.info("%s: all %d MAC(s) recovered", interface, len(recovered))
+        if not args.no_verify:
+            log.info("Waiting up to %ds for %s to return up/up...", args.verify_timeout, interface)
+            if wait_for_up(conn, interface, args.verify_timeout):
+                log.info("SUCCESS: %s is up/up — bounce complete", interface)
+            else:
+                log.warning(
+                    "Interface %s did not return to up/up within %ds",
+                    interface, args.verify_timeout,
+                )
+                return 2
+    finally:
+        conn.disconnect()
 
-    return result
-
-
-def print_summary(results):
-    width = 60
-    print("\n" + "=" * width)
-    print("PORT BOUNCE SUMMARY")
-    print("=" * width)
-    for r in results:
-        print(f"\n  Interface : {r['interface']}")
-        print(f"  Status    : {r['status']}")
-        print(f"  Pre-MACs  : {', '.join(sorted(r['pre_macs'])) or 'none'}")
-        if r["pre_macs"]:
-            print(f"  Recovered : {', '.join(sorted(r['recovered'])) or 'none'}")
-        if r["missing"]:
-            print(f"  MISSING   : {', '.join(sorted(r['missing']))}")
-    print("=" * width)
-
-
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Bounce switch ports and verify connected devices reconnect via MAC tracking."
-    )
-    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", required=True, help="SSH password")
-    p.add_argument("-i", "--interfaces", required=True, nargs="+", metavar="INTF",
-                   help="One or more interfaces to bounce")
-    p.add_argument("--device-type", default="cisco_ios",
-                   help="Netmiko device type (default: cisco_ios)")
-    p.add_argument("--wait", type=int, default=10,
-                   help="Seconds to hold port down (default: 10)")
-    p.add_argument("--timeout", type=int, default=90,
-                   help="Seconds to wait for MACs to return (default: 90)")
-    p.add_argument("--secret", default="", help="Enable secret for privileged mode")
-    p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    return p.parse_args()
+    return 0
 
 
 if __name__ == "__main__":
-    args = parse_args()
-
-    if args.verbose:
-        log.setLevel(logging.DEBUG)
-
-    params = {
-        "device_type": args.device_type,
-        "host": args.device,
-        "username": args.username,
-        "password": args.password,
-        "secret": args.secret,
-    }
-
-    log.info("Connecting to %s", args.device)
-    try:
-        conn = ConnectHandler(**params)
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s", args.device)
-        sys.exit(1)
-    except NetmikoTimeoutException:
-        log.error("Connection timed out for %s", args.device)
-        sys.exit(1)
-
-    if args.secret:
-        conn.enable()
-
-    results = []
-    try:
-        for intf in args.interfaces:
-            log.info("--- %s ---", intf)
-            results.append(process_interface(conn, intf, args.wait, args.timeout))
-    finally:
-        conn.disconnect()
-        log.info("Disconnected from %s", args.device)
-
-    print_summary(results)
-    failed = [r for r in results if r["status"] in ("incomplete", "unknown")]
-    sys.exit(1 if failed else 0)
+    sys.exit(main())
