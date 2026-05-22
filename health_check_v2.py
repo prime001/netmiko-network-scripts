@@ -1,239 +1,174 @@
-The user's explicit instruction is to output only the script content — this overrides the brainstorming workflow. Writing the script now.
-
-#!/usr/bin/env python3
+```python
+#!/usr/bin/env python
 """
-interface_error_monitor.py — Interface error rate monitor for Cisco IOS/IOS-XE devices.
+NTP Synchronization Validator
 
-Purpose:
-    Polls interface error and drop counters at a configurable interval, computes
-    per-second rates between polls, and reports any interface whose rate exceeds
-    a defined threshold. Catches duplex mismatches, bad cables, and hardware faults
-    before they cause outages.
+Validates NTP synchronization status on network devices and reports clock accuracy.
+Supports Cisco IOS, IOS-XE, NXOS platforms.
 
 Usage:
-    python interface_error_monitor.py -H 192.168.1.1 -u admin -p secret
-    python interface_error_monitor.py -H 192.168.1.1 -u admin -p secret \\
-        --interval 30 --duration 300 --threshold 5.0 --device-type cisco_ios
+    python ntp_sync_validator.py --device 192.168.1.1 --username admin --password pass
+    python ntp_sync_validator.py --device 192.168.1.1 -u admin -p pass --device-type cisco_ios
 
 Prerequisites:
-    pip install netmiko
-    SSH access to target device; 'show interfaces' must be available.
+    - netmiko library: pip install netmiko
+    - Network device with SSH enabled
+    - Read-only access credentials
 """
 
 import argparse
 import logging
-import re
 import sys
-import time
-from dataclasses import dataclass
-from typing import Dict, Optional
-
+from datetime import datetime
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
-
-logging.basicConfig(
-    format="%(asctime)s %(levelname)-8s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    level=logging.INFO,
-)
-log = logging.getLogger(__name__)
+from netmiko.exceptions import NetmikoTimeoutException, NetmikoAuthenticationException
 
 
-@dataclass
-class IfCounters:
-    input_errors: int = 0
-    output_errors: int = 0
-    crc: int = 0
-    input_drops: int = 0
-    output_drops: int = 0
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 
-def parse_counters(output: str) -> Dict[str, IfCounters]:
-    counters: Dict[str, IfCounters] = {}
-    iface = None
-
-    for line in output.splitlines():
-        m = re.match(r"^(\S+)\s+is\s+(?:up|down|administratively down)", line)
-        if m:
-            iface = m.group(1)
-            counters[iface] = IfCounters()
-            continue
-
-        if iface is None:
-            continue
-
-        m = re.search(r"(\d+)\s+input errors", line)
-        if m:
-            counters[iface].input_errors = int(m.group(1))
-
-        m = re.search(r"(\d+)\s+CRC", line)
-        if m:
-            counters[iface].crc = int(m.group(1))
-
-        m = re.search(r"(\d+)\s+output errors", line)
-        if m:
-            counters[iface].output_errors = int(m.group(1))
-
-        m = re.search(r"(\d+)\s+input drops", line)
-        if m:
-            counters[iface].input_drops = int(m.group(1))
-
-        m = re.search(r"(\d+)\s+output drops", line)
-        if m:
-            counters[iface].output_drops = int(m.group(1))
-
-    return counters
+def parse_ntp_status(output, device_type):
+    """Extract NTP metrics from device output."""
+    metrics = {'synchronized': False, 'stratum': None, 'offset_ms': None, 'peers': 0}
+    
+    if device_type in ['cisco_ios', 'cisco_xe']:
+        metrics['synchronized'] = 'synchronized' in output.lower()
+        for line in output.split('\n'):
+            if 'Stratum' in line:
+                try:
+                    metrics['stratum'] = int(line.split()[-1])
+                except (IndexError, ValueError):
+                    pass
+            elif 'offset is' in line.lower():
+                try:
+                    metrics['offset_ms'] = float(line.split()[-2])
+                except (IndexError, ValueError):
+                    pass
+        metrics['peers'] = output.count('*') + output.count('+') + output.count('o')
+    elif device_type == 'cisco_nxos':
+        metrics['synchronized'] = 'synchronized' in output.lower()
+        for line in output.split('\n'):
+            if 'stratum' in line.lower():
+                try:
+                    metrics['stratum'] = int(line.split()[-1])
+                except (IndexError, ValueError):
+                    pass
+    
+    return metrics
 
 
-def compute_rates(
-    baseline: Dict[str, IfCounters],
-    current: Dict[str, IfCounters],
-    elapsed: float,
-) -> Dict[str, Dict[str, float]]:
-    rates: Dict[str, Dict[str, float]] = {}
-    for iface, cur in current.items():
-        if iface not in baseline:
-            continue
-        base = baseline[iface]
-        r = {
-            "in_err": (cur.input_errors - base.input_errors) / elapsed,
-            "out_err": (cur.output_errors - base.output_errors) / elapsed,
-            "crc": (cur.crc - base.crc) / elapsed,
-            "in_drop": (cur.input_drops - base.input_drops) / elapsed,
-            "out_drop": (cur.output_drops - base.output_drops) / elapsed,
-        }
-        if any(v > 0 for v in r.values()):
-            rates[iface] = r
-    return rates
-
-
-def print_report(
-    rates: Dict[str, Dict[str, float]],
-    threshold: float,
-    poll: int,
-    host: str,
-) -> int:
-    violations = {i: r for i, r in rates.items() if any(v >= threshold for v in r.values())}
-
-    if not violations:
-        log.info("Poll %d: all interfaces clean on %s", poll, host)
-        return 0
-
-    print(f"\n[Poll {poll}] Interfaces >= {threshold:.1f} errors/sec on {host}:")
-    hdr = f"  {'Interface':<28} {'InErr/s':>8} {'OutErr/s':>9} {'CRC/s':>7} {'InDrp/s':>9} {'OutDrp/s':>9}"
-    print(hdr)
-    print("  " + "-" * (len(hdr) - 2))
-    for iface, r in sorted(violations.items()):
-        print(
-            f"  {iface:<28}"
-            f" {r['in_err']:>8.2f}"
-            f" {r['out_err']:>9.2f}"
-            f" {r['crc']:>7.2f}"
-            f" {r['in_drop']:>9.2f}"
-            f" {r['out_drop']:>9.2f}"
+def validate_ntp(device, device_type, username, password, max_offset, port):
+    """Connect to device and validate NTP synchronization."""
+    try:
+        logger.info(f"Connecting to {device}")
+        conn = ConnectHandler(
+            device_type=device_type,
+            host=device,
+            username=username,
+            password=password,
+            port=port,
+            timeout=10,
+            global_delay_factor=1
         )
-    return len(violations)
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Poll interface error counters and report rate spikes."
-    )
-    p.add_argument("-H", "--host", required=True, help="Device IP or hostname")
-    p.add_argument("-u", "--username", required=True)
-    p.add_argument("-p", "--password", required=True)
-    p.add_argument("--secret", default="", help="Enable secret")
-    p.add_argument("--device-type", default="cisco_ios", help="Netmiko device type")
-    p.add_argument("--port", type=int, default=22)
-    p.add_argument(
-        "--interval", type=int, default=60, metavar="SEC",
-        help="Seconds between polls (default: 60)",
-    )
-    p.add_argument(
-        "--duration", type=int, default=0, metavar="SEC",
-        help="Total run time in seconds; 0 = until Ctrl-C (default: 0)",
-    )
-    p.add_argument(
-        "--threshold", type=float, default=1.0,
-        help="Errors/sec per counter to trigger a report line (default: 1.0)",
-    )
-    p.add_argument("--verbose", action="store_true")
-    return p.parse_args()
-
-
-def main() -> int:
-    args = parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    device = {
-        "device_type": args.device_type,
-        "host": args.host,
-        "username": args.username,
-        "password": args.password,
-        "secret": args.secret,
-        "port": args.port,
-    }
-
-    log.info("Connecting to %s ...", args.host)
-    try:
-        conn = ConnectHandler(**device)
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.host)
-        return 1
-    except NetmikoTimeoutException:
-        log.error("Connection timed out: %s", args.host)
-        return 1
-
-    if args.secret:
-        conn.enable()
-
-    log.info(
-        "Connected. interval=%ds threshold=%.1f/s duration=%s",
-        args.interval,
-        args.threshold,
-        f"{args.duration}s" if args.duration else "until Ctrl-C",
-    )
-
-    start = time.monotonic()
-    poll = 0
-    total_violations = 0
-    baseline: Optional[Dict[str, IfCounters]] = None
-    last_ts: Optional[float] = None
-
-    try:
-        while True:
-            now = time.monotonic()
-            if args.duration and (now - start) >= args.duration:
-                log.info("Duration elapsed. Stopping.")
-                break
-
-            raw = conn.send_command("show interfaces", read_timeout=30)
-            snap_ts = time.monotonic()
-            current = parse_counters(raw)
-
-            if baseline is not None and last_ts is not None:
-                poll += 1
-                elapsed = snap_ts - last_ts
-                rates = compute_rates(baseline, current, elapsed)
-                total_violations += print_report(rates, args.threshold, poll, args.host)
-
-            baseline = current
-            last_ts = snap_ts
-
-            remaining = args.interval - (time.monotonic() - snap_ts)
-            if remaining > 0:
-                time.sleep(remaining)
-
-    except KeyboardInterrupt:
-        log.info("Interrupted.")
-    finally:
+        
+        if device_type in ['cisco_ios', 'cisco_xe']:
+            output = conn.send_command('show ntp status')
+            output += '\n' + conn.send_command('show ntp associations')
+        elif device_type == 'cisco_nxos':
+            output = conn.send_command('show ntp peer-status')
+        else:
+            output = conn.send_command('show ntp status')
+        
         conn.disconnect()
-        log.info("Done. Polls: %d  Violation reports: %d", poll, total_violations)
+        logger.info(f"Disconnected from {device}")
+        
+        metrics = parse_ntp_status(output, device_type)
+        
+        issues = []
+        if not metrics['synchronized']:
+            issues.append('Device NTP not synchronized')
+        if metrics['stratum'] and metrics['stratum'] > 10:
+            issues.append(f'High stratum level: {metrics["stratum"]}')
+        if metrics['offset_ms'] and abs(metrics['offset_ms']) > max_offset:
+            issues.append(f'Clock offset {metrics["offset_ms"]}ms exceeds {max_offset}ms')
+        if metrics['peers'] == 0:
+            issues.append('No NTP peers configured')
+        
+        return {
+            'device': device,
+            'timestamp': datetime.now().isoformat(),
+            'metrics': metrics,
+            'status': 'PASS' if not issues else 'FAIL',
+            'issues': issues
+        }
+    
+    except NetmikoAuthenticationException:
+        logger.error(f"Authentication failed for {device}")
+        return {'device': device, 'status': 'FAILED', 'error': 'Authentication failed'}
+    except NetmikoTimeoutException:
+        logger.error(f"Connection timeout to {device}")
+        return {'device': device, 'status': 'FAILED', 'error': 'Connection timeout'}
+    except Exception as e:
+        logger.error(f"Error validating {device}: {str(e)}")
+        return {'device': device, 'status': 'FAILED', 'error': str(e)}
 
-    return 0 if total_violations == 0 else 2
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Validate NTP synchronization on network devices',
+        epilog=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument('--device', required=True, help='Device IP or hostname')
+    parser.add_argument('-u', '--username', required=True, help='SSH username')
+    parser.add_argument('-p', '--password', required=True, help='SSH password')
+    parser.add_argument('--device-type', default='cisco_ios',
+                        choices=['cisco_ios', 'cisco_xe', 'cisco_nxos'],
+                        help='Device OS type (default: cisco_ios)')
+    parser.add_argument('--port', type=int, default=22, help='SSH port (default: 22)')
+    parser.add_argument('--max-offset', type=float, default=100,
+                        help='Maximum acceptable clock offset in ms (default: 100)')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging')
+    
+    args = parser.parse_args()
+    
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+    
+    results = validate_ntp(
+        device=args.device,
+        device_type=args.device_type,
+        username=args.username,
+        password=args.password,
+        max_offset=args.max_offset,
+        port=args.port
+    )
+    
+    print(f"\n{'='*60}")
+    print(f"NTP Validation Results: {results['device']}")
+    print(f"{'='*60}")
+    print(f"Status: {results['status']}")
+    
+    if 'metrics' in results:
+        m = results['metrics']
+        print(f"Synchronized: {m['synchronized']}")
+        if m['stratum']:
+            print(f"Stratum: {m['stratum']}")
+        if m['offset_ms'] is not None:
+            print(f"Clock Offset: {m['offset_ms']} ms")
+        print(f"NTP Peers Configured: {m['peers']}")
+    
+    if results['status'] == 'FAIL':
+        print("\nIssues Found:")
+        for issue in results.get('issues', []):
+            print(f"  - {issue}")
+        return 1
+    
+    print("\nNo issues detected - NTP synchronization is healthy")
+    return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(main())
+```
