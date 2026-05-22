@@ -1,187 +1,212 @@
-```python
-"""
-mac_table_lookup.py - MAC Address Table Collector and Search
+mac_address_lookup.py - Locate MAC addresses across Cisco switch MAC address tables.
 
 Purpose:
-    Connects to a network switch via SSH, retrieves the MAC address table,
-    parses it with an embedded TextFSM template, and provides search/filter
-    capabilities. Useful for locating end devices, troubleshooting Layer 2
-    connectivity, and auditing port-to-MAC mappings.
+    Given one or more target MAC addresses, connects to a list of Cisco IOS/IOS-XE
+    switches via SSH, retrieves and parses their MAC address tables using TextFSM,
+    and reports which switch, port, and VLAN each MAC was learned on. Useful for
+    tracing endpoints, hunting rogue devices, or verifying port assignments without
+    manually hopping across dozens of switches.
 
 Usage:
-    python mac_table_lookup.py -d 192.168.1.1 -u admin -p secret
-    python mac_table_lookup.py -d 192.168.1.1 -u admin --mac aa:bb:cc:dd:ee:ff
-    python mac_table_lookup.py -d 192.168.1.1 -u admin --vlan 100
-    python mac_table_lookup.py -d 192.168.1.1 -u admin --interface Gi0/1 --csv out.csv
-    python mac_table_lookup.py -d 192.168.1.1 -u admin --device-type cisco_nxos
+    # Single switch
+    python mac_address_lookup.py --host 10.0.0.1 --username admin \
+        --mac aa:bb:cc:dd:ee:ff
+
+    # Inventory file, multiple MACs, JSON output
+    python mac_address_lookup.py --inventory switches.txt --username admin \
+        --mac aa:bb:cc:dd:ee:ff 00:11:22:33:44:55 --output results.json
 
 Prerequisites:
-    pip install netmiko textfsm
+    pip install netmiko
+    pip install textfsm   (optional; built-in regex fallback used if absent)
+
+    Devices must support 'show mac address-table' (Cisco IOS/IOS-XE).
+    SSH must be enabled on each target device.
 """
 
 import argparse
-import csv
-import io
+import json
 import logging
+import re
 import sys
+import textwrap
+from datetime import datetime, timezone
 from getpass import getpass
-from typing import Dict, List, Optional
+from io import StringIO
 
-import textfsm
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
-logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
+try:
+    import textfsm
+    HAS_TEXTFSM = True
+except ImportError:
+    textfsm = None
+    HAS_TEXTFSM = False
 
-# Covers IOS, IOS-XE, EOS, JunOS-like output variants
-TEMPLATE_IOS = """\
-Value VLAN (\\d+)
-Value MAC_ADDRESS ([0-9a-fA-F]{4}\\.[0-9a-fA-F]{4}\\.[0-9a-fA-F]{4}|[0-9a-fA-F:]{17}|[0-9a-fA-F-]{17})
-Value TYPE (\\S+)
-Value PORT (\\S+)
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger(__name__)
 
-Start
-  ^\\s*${VLAN}\\s+${MAC_ADDRESS}\\s+${TYPE}\\s+\\S+\\s+${PORT} -> Record
-  ^\\s*${VLAN}\\s+${MAC_ADDRESS}\\s+${TYPE}\\s+${PORT} -> Record
-  ^.*$$
-"""
+_MAC_TABLE_TEMPLATE = textwrap.dedent("""\
+    Value VLAN (\\d+)
+    Value MAC ([0-9a-f]{4}\\.[0-9a-f]{4}\\.[0-9a-f]{4})
+    Value TYPE (\\w+)
+    Value PORT (\\S+)
 
-TEMPLATE_NXOS = """\
-Value VLAN (\\d+)
-Value MAC_ADDRESS ([0-9a-fA-F]{4}\\.[0-9a-fA-F]{4}\\.[0-9a-fA-F]{4})
-Value TYPE (\\S+)
-Value PORT (\\S+)
+    Start
+      ^\\s*${VLAN}\\s+${MAC}\\s+${TYPE}\\s+${PORT} -> Record
+""")
 
-Start
-  ^\\s*\\*?\\s*${VLAN}\\s+${MAC_ADDRESS}\\s+${TYPE}\\s+\\w+\\s+\\w+\\s+${PORT} -> Record
-  ^.*$$
-"""
+_MAC_TABLE_REGEX = re.compile(
+    r"^\s*(\d+)\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+(\w+)\s+(\S+)",
+    re.MULTILINE | re.IGNORECASE,
+)
 
 
 def normalize_mac(mac: str) -> str:
-    return mac.lower().replace(":", "").replace("-", "").replace(".", "")
+    """Normalize any common MAC format to Cisco dotted-hex (xxxx.xxxx.xxxx)."""
+    digits = re.sub(r"[^0-9a-fA-F]", "", mac).lower()
+    if len(digits) != 12:
+        raise ValueError(f"Invalid MAC address: {mac!r}")
+    return f"{digits[0:4]}.{digits[4:8]}.{digits[8:12]}"
 
 
-def parse_mac_table(raw: str, device_type: str) -> List[Dict[str, str]]:
-    template_str = TEMPLATE_NXOS if "nxos" in device_type else TEMPLATE_IOS
-    fsm = textfsm.TextFSM(io.StringIO(template_str))
-    rows = fsm.ParseText(raw)
-    return [dict(zip(fsm.header, row)) for row in rows]
-
-
-def fetch_mac_table(conn, device_type: str) -> List[Dict[str, str]]:
-    logger.info("Sending: show mac address-table")
-    raw = conn.send_command("show mac address-table")
-    entries = parse_mac_table(raw, device_type)
-    logger.info("Parsed %d MAC table entries", len(entries))
+def parse_mac_table(raw_output: str) -> list:
+    """Return list of dicts from 'show mac address-table' output."""
+    if HAS_TEXTFSM:
+        fsm = textfsm.TextFSM(StringIO(_MAC_TABLE_TEMPLATE))
+        rows = fsm.ParseText(raw_output)
+        return [
+            {"VLAN": r[0], "MAC": r[1].lower(), "TYPE": r[2], "PORT": r[3]}
+            for r in rows
+        ]
+    entries = []
+    for m in _MAC_TABLE_REGEX.finditer(raw_output):
+        entries.append({
+            "VLAN": m.group(1),
+            "MAC": m.group(2).lower(),
+            "TYPE": m.group(3),
+            "PORT": m.group(4),
+        })
     return entries
 
 
-def filter_entries(
-    entries: List[Dict[str, str]],
-    mac: Optional[str],
-    vlan: Optional[str],
-    interface: Optional[str],
-) -> List[Dict[str, str]]:
-    result = entries
-    if mac:
-        target = normalize_mac(mac)
-        result = [e for e in result if normalize_mac(e["MAC_ADDRESS"]) == target]
-    if vlan:
-        result = [e for e in result if e["VLAN"] == str(vlan)]
-    if interface:
-        result = [e for e in result if interface.lower() in e["PORT"].lower()]
-    return result
+def search_device(host: str, username: str, password: str,
+                  device_type: str, targets: set, timeout: int) -> list:
+    """Connect to one switch and return MAC table rows matching targets."""
+    log.info("Connecting to %s", host)
+    device_params = {
+        "device_type": device_type,
+        "host": host,
+        "username": username,
+        "password": password,
+        "timeout": timeout,
+    }
+    matches = []
+    try:
+        with ConnectHandler(**device_params) as conn:
+            raw = conn.send_command("show mac address-table")
+        for entry in parse_mac_table(raw):
+            if entry["MAC"] in targets:
+                matches.append({"host": host, **entry})
+        log.info("%s: %d match(es) found", host, len(matches))
+    except NetmikoAuthenticationException:
+        log.error("%s: authentication failed", host)
+    except NetmikoTimeoutException:
+        log.error("%s: connection timed out", host)
+    except Exception as exc:
+        log.error("%s: %s", host, exc)
+    return matches
 
 
-def print_table(entries: List[Dict[str, str]]) -> None:
-    if not entries:
-        print("No matching entries.")
-        return
-    fields = ["VLAN", "MAC_ADDRESS", "TYPE", "PORT"]
-    widths = {f: max(len(f), max(len(e[f]) for e in entries)) for f in fields}
-    header = "  ".join(f.ljust(widths[f]) for f in fields)
-    separator = "  ".join("-" * widths[f] for f in fields)
-    print(header)
-    print(separator)
-    for entry in entries:
-        print("  ".join(entry[f].ljust(widths[f]) for f in fields))
-    print(f"\n{len(entries)} entry(s) found.")
-
-
-def write_csv(entries: List[Dict[str, str]], path: str) -> None:
-    fields = ["VLAN", "MAC_ADDRESS", "TYPE", "PORT"]
-    with open(path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(entries)
-    print(f"Wrote {len(entries)} entries to {path}")
+def load_inventory(path: str) -> list:
+    """Return non-empty, non-comment lines from an inventory file."""
+    with open(path) as fh:
+        return [
+            line.strip()
+            for line in fh
+            if line.strip() and not line.startswith("#")
+        ]
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Search and export the MAC address table of a network switch."
+        description="Search MAC address tables across Cisco IOS switches.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
-    p.add_argument("--ssh-port", default=22, type=int, help="SSH port (default: 22)")
-    p.add_argument(
-        "--device-type",
-        default="cisco_ios",
-        metavar="TYPE",
-        help="Netmiko device type (default: cisco_ios)",
-    )
-    p.add_argument("--mac", default=None, help="Filter by MAC address (any notation)")
-    p.add_argument("--vlan", default=None, help="Filter by VLAN ID")
-    p.add_argument("--interface", default=None, help="Filter by port/interface substring")
-    p.add_argument("--csv", default=None, metavar="FILE", help="Export results to CSV")
-    p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--host", help="Single device IP or hostname")
+    src.add_argument("--inventory", metavar="FILE",
+                     help="File with one device IP/hostname per line")
+    p.add_argument("--username", required=True, help="SSH username")
+    p.add_argument("--password", help="SSH password (prompted if omitted)")
+    p.add_argument("--mac", nargs="+", required=True, metavar="MAC",
+                   help="One or more MAC addresses to locate (any standard format)")
+    p.add_argument("--device-type", default="cisco_ios",
+                   help="Netmiko device type (default: cisco_ios)")
+    p.add_argument("--timeout", type=int, default=30,
+                   help="SSH timeout in seconds (default: 30)")
+    p.add_argument("--output", metavar="FILE",
+                   help="Write JSON results to this file")
+    p.add_argument("--debug", action="store_true", help="Enable debug logging")
     return p
 
 
-def main() -> None:
+def main():
     args = build_parser().parse_args()
 
-    if args.verbose:
+    if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    password = args.password or getpass(f"Password for {args.username}@{args.device}: ")
+    if not HAS_TEXTFSM:
+        log.warning("textfsm not installed — using regex fallback parser")
 
-    device_params = {
-        "device_type": args.device_type,
-        "host": args.device,
-        "username": args.username,
-        "password": password,
-        "port": args.ssh_port,
-    }
+    password = args.password or getpass(f"Password for {args.username}: ")
 
     try:
-        print(f"Connecting to {args.device}...")
-        with ConnectHandler(**device_params) as conn:
-            entries = fetch_mac_table(conn, args.device_type)
-    except NetmikoAuthenticationException:
-        print(f"ERROR: Authentication failed for {args.username}@{args.device}", file=sys.stderr)
-        sys.exit(1)
-    except NetmikoTimeoutException:
-        print(f"ERROR: Connection timed out to {args.device}", file=sys.stderr)
-        sys.exit(1)
-    except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        targets = {normalize_mac(m) for m in args.mac}
+    except ValueError as exc:
+        log.error("%s", exc)
         sys.exit(1)
 
-    if not entries:
-        print("No MAC table entries retrieved — check device type or SSH output.")
-        sys.exit(0)
+    hosts = [args.host] if args.host else load_inventory(args.inventory)
+    if not hosts:
+        log.error("No hosts to scan.")
+        sys.exit(1)
 
-    filtered = filter_entries(entries, args.mac, args.vlan, args.interface)
-    print_table(filtered)
+    log.info("Scanning %d device(s) for %d target MAC(s)", len(hosts), len(targets))
 
-    if args.csv:
-        write_csv(filtered, args.csv)
+    all_matches = []
+    for host in hosts:
+        all_matches.extend(
+            search_device(host, args.username, password,
+                          args.device_type, targets, args.timeout)
+        )
+
+    if not all_matches:
+        print("No matches found.")
+    else:
+        header = f"{'HOST':<20} {'VLAN':<6} {'MAC':<18} {'TYPE':<10} PORT"
+        print(f"\n{header}")
+        print("-" * len(header))
+        for m in all_matches:
+            print(f"{m['host']:<20} {m['VLAN']:<6} {m['MAC']:<18} {m['TYPE']:<10} {m['PORT']}")
+
+    if args.output:
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "targets": sorted(targets),
+            "matches": all_matches,
+        }
+        with open(args.output, "w") as fh:
+            json.dump(payload, fh, indent=2)
+        log.info("Results written to %s", args.output)
+
+    sys.exit(0 if all_matches else 1)
 
 
 if __name__ == "__main__":
     main()
-```
