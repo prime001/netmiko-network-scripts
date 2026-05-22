@@ -1,191 +1,190 @@
-The task is fully specified with no design ambiguity — outputting the script directly as instructed.
-
+```python
+#!/usr/bin/env python3
 """
-neighbor_map.py — CDP/LLDP Neighbor Topology Mapper
+Network Device Configuration Backup Tool
 
-Connects to a network device via SSH and extracts CDP or LLDP neighbor
-information, producing a structured topology summary useful for audits,
-documentation, and change-impact analysis.
+Purpose:
+    Backup running configurations from network devices to timestamped files.
+    Supports multiple vendors (Cisco IOS, IOS-XE, IOS-XR, Junos, Arista, etc.)
 
 Usage:
-    python neighbor_map.py -d 192.168.1.1 -u admin
-    python neighbor_map.py -d 192.168.1.1 -u admin -p secret --protocol lldp
-    python neighbor_map.py -d 192.168.1.1 -u admin --output json --device-type cisco_ios_xe
+    Single device:
+        python config_backup.py --host 10.0.0.1 --username admin --password secret --device_type cisco_ios
+
+    Multiple devices from file:
+        python config_backup.py --devices devices.txt --username admin --password secret --output_dir ./backups
+
+    Devices file format (one per line):
+        hostname,device_type
+        10.0.0.1,cisco_ios
+        10.0.0.2,cisco_iosxe
 
 Prerequisites:
-    pip install netmiko
-    CDP or LLDP must be enabled on the target device.
+    - netmiko library: pip install netmiko
+    - Network connectivity to target devices
+    - Valid SSH credentials
+    - SSH enabled on target devices
 """
 
 import argparse
-import json
 import logging
-import re
 import sys
-from dataclasses import asdict, dataclass
-from getpass import getpass
-
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
-
-logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.WARNING)
-log = logging.getLogger(__name__)
+from datetime import datetime
+from pathlib import Path
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoTimeoutException, NetmikoAuthenticationException
 
 
-@dataclass
-class Neighbor:
-    device_id: str
-    local_port: str
-    remote_port: str
-    platform: str = ""
-    mgmt_address: str = ""
-    capabilities: str = ""
-
-
-def parse_cdp_neighbors(output: str) -> list[Neighbor]:
-    neighbors = []
-    for block in re.split(r"-{3,}", output):
-        if not block.strip():
-            continue
-        device_id = re.search(r"Device ID:\s*(\S+)", block)
-        local_port = re.search(r"Interface:\s*([^,]+),", block)
-        remote_port = re.search(r"Port ID \(outgoing port\):\s*(.+)", block)
-        platform = re.search(r"Platform:\s*([^,]+)", block)
-        mgmt = re.search(r"(?:IP address|IPv4 Address):\s*(\S+)", block)
-        caps = re.search(r"Capabilities:\s*(.+)", block)
-
-        if not (device_id and local_port and remote_port):
-            continue
-
-        neighbors.append(Neighbor(
-            device_id=device_id.group(1).strip(),
-            local_port=local_port.group(1).strip(),
-            remote_port=remote_port.group(1).strip(),
-            platform=platform.group(1).strip() if platform else "",
-            mgmt_address=mgmt.group(1).strip() if mgmt else "",
-            capabilities=caps.group(1).strip() if caps else "",
-        ))
-    return neighbors
-
-
-def parse_lldp_neighbors(output: str) -> list[Neighbor]:
-    neighbors = []
-    for block in re.split(r"(?=Local Intf:)", output):
-        if not block.strip():
-            continue
-        local_port = re.search(r"Local Intf:\s*(\S+)", block)
-        device_id = re.search(r"System Name:\s*(\S+)", block)
-        remote_port = re.search(r"Port id:\s*(\S+)", block)
-        platform = re.search(r"System Description:\s*(.+)", block)
-        mgmt = re.search(r"Management Addresses[^\n]*\n\s*(\d+\.\d+\.\d+\.\d+)", block)
-        caps = re.search(r"System Capabilities:\s*(.+)", block)
-
-        if not (device_id and local_port and remote_port):
-            continue
-
-        neighbors.append(Neighbor(
-            device_id=device_id.group(1).strip(),
-            local_port=local_port.group(1).strip(),
-            remote_port=remote_port.group(1).strip(),
-            platform=platform.group(1).strip()[:60] if platform else "",
-            mgmt_address=mgmt.group(1).strip() if mgmt else "",
-            capabilities=caps.group(1).strip() if caps else "",
-        ))
-    return neighbors
-
-
-def collect_neighbors(
-    host: str,
-    username: str,
-    password: str,
-    device_type: str,
-    protocol: str,
-) -> list[Neighbor]:
-    device = {
-        "device_type": device_type,
-        "host": host,
-        "username": username,
-        "password": password,
-    }
-    log.info("Connecting to %s", host)
-    with ConnectHandler(**device) as conn:
-        if protocol == "cdp":
-            output = conn.send_command("show cdp neighbors detail")
-            return parse_cdp_neighbors(output)
-        output = conn.send_command("show lldp neighbors detail")
-        return parse_lldp_neighbors(output)
-
-
-def print_table(neighbors: list[Neighbor]) -> None:
-    if not neighbors:
-        print("No neighbors found.")
-        return
-    col = (30, 20, 20, 16)
-    header = (
-        f"{'Device ID':<{col[0]}} {'Local Port':<{col[1]}} "
-        f"{'Remote Port':<{col[2]}} {'Mgmt IP':<{col[3]}} Platform"
+def setup_logging(verbose=False):
+    """Configure logging with timestamps and levels."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
     )
-    print(header)
-    print("-" * (sum(col) + 30))
-    for n in neighbors:
-        print(
-            f"{n.device_id:<{col[0]}} {n.local_port:<{col[1]}} "
-            f"{n.remote_port:<{col[2]}} {n.mgmt_address:<{col[3]}} {n.platform}"
-        )
+    return logging.getLogger(__name__)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Map CDP/LLDP neighbors from a network device"
-    )
-    parser.add_argument("-d", "--device", required=True, help="Target device IP or hostname")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
-    parser.add_argument(
-        "--device-type", default="cisco_ios",
-        help="Netmiko device type (default: cisco_ios)",
-    )
-    parser.add_argument(
-        "--protocol", choices=["cdp", "lldp"], default="cdp",
-        help="Discovery protocol to query (default: cdp)",
-    )
-    parser.add_argument(
-        "--output", choices=["table", "json"], default="table",
-        help="Output format (default: table)",
-    )
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    args = parser.parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    password = args.password or getpass(f"Password for {args.username}@{args.device}: ")
-
+def backup_device(host, device_type, username, password, output_dir, 
+                  port=22, timeout=30):
+    """
+    Backup configuration from a single device.
+    
+    Args:
+        host: Device hostname/IP
+        device_type: Device type (cisco_ios, junos, arista_eos, etc.)
+        username: SSH username
+        password: SSH password
+        output_dir: Directory to store backups
+        port: SSH port (default 22)
+        timeout: Connection timeout in seconds
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    logger = logging.getLogger(__name__)
+    device = None
+    
     try:
-        neighbors = collect_neighbors(
-            host=args.device,
-            username=args.username,
+        logger.info(f"Connecting to {host} ({device_type})...")
+        
+        device = ConnectHandler(
+            host=host,
+            device_type=device_type,
+            username=username,
             password=password,
-            device_type=args.device_type,
-            protocol=args.protocol,
+            port=port,
+            timeout=timeout,
+            global_delay_factor=1
         )
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.device)
-        return 1
+        
+        device_name = host.replace(".", "_")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{device_name}_{timestamp}.txt"
+        filepath = Path(output_dir) / filename
+        
+        if device_type.startswith('cisco'):
+            config = device.send_command("show running-config")
+        elif device_type == 'junos':
+            config = device.send_command("show configuration | display set")
+        elif device_type == 'arista_eos':
+            config = device.send_command("show running-config")
+        else:
+            config = device.send_command("show running-config")
+        
+        filepath.write_text(config)
+        logger.info(f"Backup saved: {filepath} ({len(config)} bytes)")
+        return True
+        
     except NetmikoTimeoutException:
-        log.error("Connection timed out to %s", args.device)
-        return 1
-    except Exception as exc:
-        log.error("Unexpected error: %s", exc)
-        return 1
+        logger.error(f"Timeout connecting to {host}")
+        return False
+    except NetmikoAuthenticationException:
+        logger.error(f"Authentication failed for {host}")
+        return False
+    except Exception as e:
+        logger.error(f"Error backing up {host}: {str(e)}")
+        return False
+    finally:
+        if device:
+            try:
+                device.disconnect()
+            except Exception:
+                pass
 
-    if args.output == "json":
-        print(json.dumps([asdict(n) for n in neighbors], indent=2))
-    else:
-        print(f"\n{args.protocol.upper()} neighbors on {args.device} ({len(neighbors)} found)\n")
-        print_table(neighbors)
 
-    return 0
+def main():
+    parser = argparse.ArgumentParser(
+        description="Backup network device configurations",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Example: python config_backup.py --host 10.0.0.1 --username admin --password secret"
+    )
+    
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--host', help='Single device IP/hostname')
+    group.add_argument('--devices', help='File with device list (hostname,device_type)')
+    
+    parser.add_argument('-u', '--username', required=True, help='SSH username')
+    parser.add_argument('-p', '--password', required=True, help='SSH password')
+    parser.add_argument('-t', '--device_type', default='cisco_ios', 
+                       help='Device type (default: cisco_ios)')
+    parser.add_argument('-o', '--output_dir', default='./backups',
+                       help='Output directory for backups (default: ./backups)')
+    parser.add_argument('--port', type=int, default=22, help='SSH port (default: 22)')
+    parser.add_argument('--timeout', type=int, default=30, help='Connection timeout (default: 30s)')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging')
+    
+    args = parser.parse_args()
+    logger = setup_logging(args.verbose)
+    
+    output_path = Path(args.output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Using output directory: {output_path.absolute()}")
+    
+    success_count = 0
+    failure_count = 0
+    
+    if args.host:
+        if backup_device(
+            args.host, args.device_type, args.username, 
+            args.password, args.output_dir, args.port, args.timeout
+        ):
+            success_count += 1
+        else:
+            failure_count += 1
+    
+    elif args.devices:
+        try:
+            with open(args.devices, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    
+                    parts = line.split(',')
+                    if len(parts) < 2:
+                        logger.warning(f"Invalid line format: {line}")
+                        continue
+                    
+                    host, device_type = parts[0].strip(), parts[1].strip()
+                    
+                    if backup_device(
+                        host, device_type, args.username,
+                        args.password, args.output_dir, args.port, args.timeout
+                    ):
+                        success_count += 1
+                    else:
+                        failure_count += 1
+                        
+        except FileNotFoundError:
+            logger.error(f"Device file not found: {args.devices}")
+            sys.exit(1)
+    
+    logger.info(f"Backup complete: {success_count} succeeded, {failure_count} failed")
+    sys.exit(0 if failure_count == 0 else 1)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
+```
