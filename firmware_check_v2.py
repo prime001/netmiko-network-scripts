@@ -1,239 +1,176 @@
 ```python
+#!/usr/bin/env python3
 """
-firmware_compliance_checker.py - Audit network devices against a firmware baseline.
+NTP Configuration Compliance Checker.
 
-Purpose:
-    Reads a device inventory CSV specifying each host's minimum acceptable
-    firmware version, connects via SSH, extracts the running version, and
-    reports PASS/FAIL compliance.  Unlike a simple version display script,
-    this tool enforces a declared policy and exits non-zero when any device
-    is out of compliance — making it suitable for scheduled audits or CI gates.
-
-Usage:
-    python firmware_compliance_checker.py \
-        --inventory devices.csv \
-        --username admin \
-        --password secret \
-        [--output report.csv] \
-        [--timeout 30] \
-        [--verbose]
-
-    Inventory CSV columns (header row required):
-        host, device_type, min_version
-
-    Example row:
-        10.0.0.1,cisco_ios,15.6(3)M
-
-    Supported device_type values:
-        cisco_ios, cisco_xe, cisco_nxos, cisco_asa, arista_eos,
-        juniper_junos, hp_procurve
+Audits NTP configuration on network devices to ensure compliance with
+organizational standards (NTP servers, stratum levels, authentication).
 
 Prerequisites:
-    pip install netmiko
-    Python 3.8+
+    - netmiko installed (pip install netmiko)
+    - Device SSH access with appropriate credentials
+    - Device must support NTP configuration show commands
+
+Usage:
+    python ntp_compliance.py -d 192.168.1.1 -u admin -p password -t cisco_ios
+    python ntp_compliance.py -d switch.example.com -u admin -k ~/.ssh/id_rsa -t arista_eos --json
 """
 
 import argparse
-import csv
+import json
 import logging
-import re
 import sys
-from typing import Optional
-
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
-VERSION_COMMANDS = {
-    "cisco_ios": "show version",
-    "cisco_xe": "show version",
-    "cisco_nxos": "show version",
-    "cisco_asa": "show version",
-    "arista_eos": "show version",
-    "juniper_junos": "show version",
-    "hp_procurve": "show version",
-}
-
-VERSION_PATTERNS = {
-    "cisco_ios": r"Version\s+([\d\w\(\).]+),",
-    "cisco_xe": r"Cisco IOS XE Software.*?Version\s+([\d\w\(\).]+)",
-    "cisco_nxos": r"NXOS:\s+version\s+([\d\w\(\).]+)",
-    "cisco_asa": r"Software Version\s+([\d\w\(\).]+)",
-    "arista_eos": r"EOS version:\s+([\d\w.]+)",
-    "juniper_junos": r"Junos:\s+([\d\w.R-]+)",
-    "hp_procurve": r"Software revision\s*:\s*([\d\w.]+)",
-}
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 
-def setup_logging(verbose: bool) -> None:
-    logging.basicConfig(
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        level=logging.DEBUG if verbose else logging.INFO,
-        stream=sys.stdout,
-    )
-
-
-def load_inventory(path: str) -> list:
-    devices = []
-    with open(path, newline="") as f:
-        reader = csv.DictReader(f)
-        required = {"host", "device_type", "min_version"}
-        if not required.issubset(set(reader.fieldnames or [])):
-            raise ValueError(f"Inventory CSV must contain columns: {required}")
-        for row in reader:
-            row = {k.strip(): v.strip() for k, v in row.items()}
-            if row["device_type"] not in VERSION_COMMANDS:
-                logging.warning(
-                    "Unsupported device_type '%s' for %s — skipping",
-                    row["device_type"],
-                    row["host"],
-                )
-                continue
-            devices.append(row)
-    return devices
-
-
-def extract_version(output: str, device_type: str) -> Optional[str]:
-    pattern = VERSION_PATTERNS.get(device_type)
-    if not pattern:
-        return None
-    match = re.search(pattern, output, re.IGNORECASE | re.DOTALL)
-    return match.group(1) if match else None
-
-
-def versions_compliant(current: str, minimum: str) -> bool:
-    """Compare versions numerically; fall back to exact string match."""
-    def to_ints(v: str) -> tuple:
-        return tuple(int(x) for x in re.findall(r"\d+", v))
-
-    try:
-        return to_ints(current) >= to_ints(minimum)
-    except (ValueError, TypeError):
-        return current == minimum
-
-
-def check_device(host: str, device_type: str, min_version: str,
-                 username: str, password: str, timeout: int) -> dict:
-    result = {
-        "host": host,
-        "device_type": device_type,
-        "min_version": min_version,
-        "current_version": "N/A",
-        "status": "ERROR",
-        "detail": "",
+def parse_ntp_config(output):
+    """Parse NTP configuration from device output."""
+    ntp_config = {
+        'servers': [],
+        'authenticate': False,
+        'trusted_keys': [],
+        'source': None
     }
+    
+    for line in output.split('\n'):
+        line = line.strip()
+        if not line or line.startswith('!'):
+            continue
+        
+        if line.startswith('ntp server'):
+            parts = line.split()
+            if len(parts) >= 3:
+                ntp_config['servers'].append({
+                    'address': parts[2],
+                    'prefer': 'prefer' in line,
+                    'source': next((p for p in parts if 'source' in p.lower()), None)
+                })
+        
+        if 'ntp authenticate' in line:
+            ntp_config['authenticate'] = True
+        
+        if line.startswith('ntp trusted-key'):
+            key = line.split()[-1]
+            ntp_config['trusted_keys'].append(key)
+        
+        if 'ntp source' in line:
+            ntp_config['source'] = line.split()[-1]
+    
+    return ntp_config
+
+
+def check_compliance(ntp_config):
+    """Verify NTP configuration against compliance standards."""
+    issues = []
+    warnings = []
+    
+    if len(ntp_config['servers']) < 2:
+        issues.append('Less than 2 NTP servers configured')
+    
+    if not ntp_config['authenticate']:
+        warnings.append('NTP authentication not enabled')
+    
+    if not any(s['prefer'] for s in ntp_config['servers']):
+        warnings.append('No preferred NTP server configured')
+    
+    for server in ntp_config['servers']:
+        if server['address'].startswith(('10.', '192.168.', '172.16.')):
+            if not ntp_config['source']:
+                warnings.append(f"Private NTP server {server['address']} without source interface")
+    
+    return {
+        'compliant': len(issues) == 0,
+        'critical_issues': issues,
+        'warnings': warnings
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Check NTP configuration compliance')
+    parser.add_argument('-d', '--device', required=True, help='Device IP or hostname')
+    parser.add_argument('-u', '--username', required=True, help='SSH username')
+    parser.add_argument('-p', '--password', help='SSH password')
+    parser.add_argument('-k', '--key-file', help='SSH private key file')
+    parser.add_argument('-t', '--device-type', default='cisco_ios', help='Netmiko device type')
+    parser.add_argument('--json', action='store_true', help='Output JSON format')
+    parser.add_argument('--timeout', type=int, default=10, help='Connection timeout')
+    
+    args = parser.parse_args()
+    
+    if not args.password and not args.key_file:
+        logger.error('Provide either --password or --key-file')
+        sys.exit(1)
+    
+    device_params = {
+        'device_type': args.device_type,
+        'host': args.device,
+        'username': args.username,
+        'timeout': args.timeout,
+    }
+    
+    if args.password:
+        device_params['password'] = args.password
+    if args.key_file:
+        device_params['use_keys'] = True
+        device_params['key_file'] = args.key_file
+    
     try:
-        logging.debug("Connecting to %s (%s)", host, device_type)
-        with ConnectHandler(
-            device_type=device_type,
-            host=host,
-            username=username,
-            password=password,
-            timeout=timeout,
-        ) as conn:
-            output = conn.send_command(VERSION_COMMANDS[device_type])
-            logging.debug("Output from %s:\n%s", host, output)
-
-            current = extract_version(output, device_type)
-            if not current:
-                result["detail"] = "Version string not found in output"
-                return result
-
-            result["current_version"] = current
-            if versions_compliant(current, min_version):
-                result["status"] = "PASS"
-                result["detail"] = f"{current} >= {min_version}"
-            else:
-                result["status"] = "FAIL"
-                result["detail"] = f"{current} < {min_version} — upgrade required"
-
-    except NetmikoAuthenticationException:
-        result["detail"] = "Authentication failed"
-        logging.error("Auth failure on %s", host)
-    except NetmikoTimeoutException:
-        result["detail"] = "Connection timed out"
-        logging.error("Timeout on %s", host)
-    except Exception as exc:
-        result["detail"] = str(exc)
-        logging.error("Error on %s: %s", host, exc)
-
-    return result
-
-
-def print_summary(results: list) -> None:
-    counts = {"PASS": 0, "FAIL": 0, "ERROR": 0}
-    print("\n" + "=" * 68)
-    print(f"{'HOST':<20} {'STATUS':<8} {'CURRENT':<18} DETAIL")
-    print("-" * 68)
-    for r in results:
-        counts[r["status"]] = counts.get(r["status"], 0) + 1
-        print(
-            f"{r['host']:<20} {r['status']:<8} {r['current_version']:<18} {r['detail']}"
-        )
-    print("=" * 68)
-    print(f"PASS: {counts['PASS']}  FAIL: {counts['FAIL']}  ERROR: {counts['ERROR']}")
-    print("=" * 68 + "\n")
-
-
-def write_report(results: list, path: str) -> None:
-    fields = ["host", "device_type", "min_version", "current_version", "status", "detail"]
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(results)
-    logging.info("Report saved to %s", path)
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Audit network devices against a minimum firmware version baseline."
-    )
-    parser.add_argument("--inventory", required=True,
-                        help="CSV file: host,device_type,min_version")
-    parser.add_argument("--username", required=True, help="SSH username")
-    parser.add_argument("--password", required=True, help="SSH password")
-    parser.add_argument("--output", default=None,
-                        help="Write compliance results to this CSV file")
-    parser.add_argument("--timeout", type=int, default=30,
-                        help="SSH timeout in seconds (default: 30)")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Enable debug-level logging")
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    setup_logging(args.verbose)
-
-    try:
-        inventory = load_inventory(args.inventory)
-    except (FileNotFoundError, ValueError) as exc:
-        logging.error("Inventory error: %s", exc)
+        logger.info(f'Connecting to {args.device}')
+        net_connect = ConnectHandler(**device_params)
+        
+        output = net_connect.send_command('show run | include ntp')
+        ntp_config = parse_ntp_config(output)
+        compliance = check_compliance(ntp_config)
+        
+        result = {
+            'device': args.device,
+            'ntp_servers': ntp_config['servers'],
+            'ntp_source': ntp_config['source'],
+            'authentication_enabled': ntp_config['authenticate'],
+            'compliance': compliance
+        }
+        
+        net_connect.disconnect()
+        
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(f'\nNTP Compliance Report - {args.device}')
+            print('='*60)
+            print(f"NTP Servers Configured: {len(ntp_config['servers'])}")
+            for srv in ntp_config['servers']:
+                prefer = ' (PREFER)' if srv['prefer'] else ''
+                print(f"  - {srv['address']}{prefer}")
+            print(f"NTP Source Interface: {ntp_config['source'] or 'Not configured'}")
+            print(f"Authentication Enabled: {ntp_config['authenticate']}")
+            print(f"Compliance Status: {'PASS' if compliance['compliant'] else 'FAIL'}")
+            
+            if compliance['critical_issues']:
+                print('\nCritical Issues:')
+                for issue in compliance['critical_issues']:
+                    print(f"  ✗ {issue}")
+            
+            if compliance['warnings']:
+                print('\nWarnings:')
+                for warning in compliance['warnings']:
+                    print(f"  ⚠ {warning}")
+            print('='*60)
+    
+    except NetmikoAuthenticationException as e:
+        logger.error(f'Authentication failed: {e}')
+        sys.exit(1)
+    except NetmikoTimeoutException as e:
+        logger.error(f'Connection timeout: {e}')
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f'Error: {e}')
         sys.exit(1)
 
-    if not inventory:
-        logging.error("No valid devices found in inventory.")
-        sys.exit(1)
 
-    logging.info("Auditing %d device(s) against firmware baseline...", len(inventory))
-
-    results = []
-    for device in inventory:
-        logging.info("Checking %s...", device["host"])
-        results.append(check_device(
-            host=device["host"],
-            device_type=device["device_type"],
-            min_version=device["min_version"],
-            username=args.username,
-            password=args.password,
-            timeout=args.timeout,
-        ))
-
-    print_summary(results)
-
-    if args.output:
-        write_report(results, args.output)
-
-    non_passing = sum(1 for r in results if r["status"] != "PASS")
-    sys.exit(0 if non_passing == 0 else 1)
+if __name__ == '__main__':
+    main()
 ```
