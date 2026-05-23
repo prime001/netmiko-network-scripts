@@ -1,169 +1,239 @@
-interface_desc_updater.py — Bulk interface description deployer
+vlan_provisioner.py - Bulk VLAN provisioning on Cisco IOS/IOS-XE switches.
 
 Purpose:
-    Reads a CSV inventory that maps device IPs to interface/description
-    pairs and pushes the descriptions to live devices via netmiko.
-    Useful after a physical audit, cutsheet update, or when standardizing
-    port documentation across a fleet.
+    Add or remove VLANs on one or more switches with pre-check and post-verify.
+    Computes the delta against the current VLAN database and applies only what is
+    missing (or present), then confirms the change landed before exiting.
 
 Usage:
-    python interface_desc_updater.py -u admin -p secret --inventory ports.csv
-    python interface_desc_updater.py -u admin -p secret --inventory ports.csv \
-        --device 10.0.0.1 --dry-run --device-type cisco_ios
+    Add VLANs to a single switch:
+        python vlan_provisioner.py --host 10.0.0.1 --username admin --password secret \
+            --vlans 100,200,300 --names "Data,Voice,Management"
 
-    CSV format (no header; columns: device_ip, interface, description):
-        10.0.0.1,GigabitEthernet0/1,UPLINK-CORE-SW01
-        10.0.0.1,GigabitEthernet0/2,SRV-PROD-001-eth0
-        10.0.0.2,Ethernet1/1,ACCESS-VLAN10-FINANCE
+    Remove VLANs:
+        python vlan_provisioner.py --host 10.0.0.1 --username admin --password secret \
+            --vlans 100,200 --action remove
+
+    Batch from CSV (columns: host,vlan_id,vlan_name,action):
+        python vlan_provisioner.py --csv switches.csv --username admin --password secret
+
+    Dry-run (show commands without applying):
+        python vlan_provisioner.py --host 10.0.0.1 ... --dry-run
 
 Prerequisites:
     pip install netmiko
+    SSH must be enabled; account needs privilege 15 or enable access.
+    Supported device types: cisco_ios, cisco_xe
 """
 
 import argparse
 import csv
 import logging
 import sys
-from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Optional
 
 from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
 )
 log = logging.getLogger(__name__)
 
 
-def load_inventory(path):
-    """Return {device_ip: [(interface, description), ...]} from CSV."""
-    inventory = defaultdict(list)
-    with open(path, newline="") as fh:
-        for row in csv.reader(fh):
-            if not row or row[0].startswith("#"):
-                continue
-            if len(row) < 3:
-                log.warning("Skipping malformed row: %s", row)
-                continue
-            ip, iface, desc = row[0].strip(), row[1].strip(), row[2].strip()
-            if ip and iface:
-                inventory[ip].append((iface, desc))
-    return inventory
+@dataclass
+class VlanTask:
+    vlan_id: int
+    vlan_name: Optional[str] = None
+    action: str = "add"
 
 
-def build_commands(entries):
-    """Return IOS-style config commands for a list of (interface, description) pairs."""
-    cmds = []
-    for iface, desc in entries:
-        cmds.append(f"interface {iface}")
-        cmds.append(f" description {desc}")
-    return cmds
+@dataclass
+class ProvisionResult:
+    host: str
+    applied: list = field(default_factory=list)
+    skipped: list = field(default_factory=list)
+    errors: list = field(default_factory=list)
 
 
-def push_descriptions(device_ip, entries, username, password, device_type,
-                      enable_secret=None, dry_run=False):
-    commands = build_commands(entries)
+def get_existing_vlans(conn) -> dict:
+    """Return {vlan_id: name} for all VLANs in the device database."""
+    output = conn.send_command("show vlan brief", use_textfsm=True)
+    if isinstance(output, list):
+        return {int(e["vlan_id"]): e["name"] for e in output}
+    vlans = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if parts and parts[0].isdigit():
+            vlans[int(parts[0])] = parts[1] if len(parts) > 1 else ""
+    return vlans
 
-    if dry_run:
-        log.info("[DRY-RUN] %s — %d command(s) would be sent:", device_ip, len(commands))
-        for cmd in commands:
-            log.info("    %s", cmd)
-        return True
 
+def build_commands(task: VlanTask, existing: dict) -> list:
+    if task.action == "add":
+        if task.vlan_id in existing:
+            return []
+        cmds = [f"vlan {task.vlan_id}"]
+        if task.vlan_name:
+            cmds.append(f" name {task.vlan_name}")
+        return cmds
+    if task.action == "remove":
+        if task.vlan_id not in existing:
+            return []
+        return [f"no vlan {task.vlan_id}"]
+    return []
+
+
+def provision_host(
+    host: str,
+    username: str,
+    password: str,
+    device_type: str,
+    tasks: list,
+    dry_run: bool,
+) -> ProvisionResult:
+    result = ProvisionResult(host=host)
     params = {
         "device_type": device_type,
-        "host": device_ip,
+        "host": host,
         "username": username,
         "password": password,
+        "timeout": 30,
     }
-    if enable_secret:
-        params["secret"] = enable_secret
-
     try:
+        log.info("[%s] Connecting...", host)
         with ConnectHandler(**params) as conn:
-            if enable_secret:
-                conn.enable()
-            output = conn.send_config_set(commands)
+            existing = get_existing_vlans(conn)
+            log.info("[%s] %d VLANs in database", host, len(existing))
+
+            all_cmds = []
+            pending = []
+            for task in tasks:
+                cmds = build_commands(task, existing)
+                if not cmds:
+                    log.info("[%s] VLAN %d already in desired state", host, task.vlan_id)
+                    result.skipped.append(task.vlan_id)
+                else:
+                    all_cmds.extend(cmds)
+                    pending.append(task)
+
+            if not all_cmds:
+                log.info("[%s] No changes required", host)
+                return result
+
+            if dry_run:
+                log.info("[%s] DRY RUN — would send:\n%s", host, "\n".join(all_cmds))
+                return result
+
+            conn.send_config_set(all_cmds)
             conn.save_config()
-            log.info("%s — pushed descriptions for %d interface(s)", device_ip, len(entries))
-            log.debug("%s raw output:\n%s", device_ip, output)
-        return True
+
+            post = get_existing_vlans(conn)
+            for task in pending:
+                if task.action == "add" and task.vlan_id not in post:
+                    msg = f"VLAN {task.vlan_id} missing after add"
+                    log.error("[%s] %s", host, msg)
+                    result.errors.append(msg)
+                elif task.action == "remove" and task.vlan_id in post:
+                    msg = f"VLAN {task.vlan_id} still present after remove"
+                    log.error("[%s] %s", host, msg)
+                    result.errors.append(msg)
+                else:
+                    log.info("[%s] VLAN %d %sd OK", host, task.vlan_id, task.action)
+                    result.applied.append(task.vlan_id)
+
     except NetmikoAuthenticationException:
-        log.error("%s — authentication failed", device_ip)
+        result.errors.append("authentication failed")
+        log.error("[%s] Authentication failed", host)
     except NetmikoTimeoutException:
-        log.error("%s — connection timed out", device_ip)
+        result.errors.append("connection timed out")
+        log.error("[%s] Connection timed out", host)
     except Exception as exc:
-        log.error("%s — %s: %s", device_ip, type(exc).__name__, exc)
-    return False
+        result.errors.append(str(exc))
+        log.error("[%s] %s", host, exc)
+
+    return result
+
+
+def load_csv(path: str) -> dict:
+    host_tasks: dict = {}
+    with open(path, newline="") as fh:
+        for row in csv.DictReader(fh):
+            host = row["host"].strip()
+            task = VlanTask(
+                vlan_id=int(row["vlan_id"]),
+                vlan_name=row.get("vlan_name", "").strip() or None,
+                action=row.get("action", "add").strip(),
+            )
+            host_tasks.setdefault(host, []).append(task)
+    return host_tasks
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Bulk-update interface descriptions from a CSV inventory."
+        description="Add or remove VLANs on Cisco IOS/IOS-XE switches"
     )
-    p.add_argument("--inventory", required=True,
-                   help="CSV file mapping device_ip,interface,description")
-    p.add_argument("-d", "--device",
-                   help="Limit execution to this device IP (must exist in CSV)")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", required=True, help="SSH password")
-    p.add_argument("-e", "--enable-secret", default=None,
-                   help="Enable/privileged secret (if required)")
-    p.add_argument("--device-type", default="cisco_ios",
-                   help="Netmiko device_type string (default: cisco_ios)")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Print commands without connecting to devices")
-    p.add_argument("-v", "--verbose", action="store_true",
-                   help="Enable debug-level logging")
+    p.add_argument("--host", help="Device IP or hostname (single-device mode)")
+    p.add_argument("--username", required=True)
+    p.add_argument("--password", required=True)
+    p.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        choices=["cisco_ios", "cisco_xe"],
+    )
+    p.add_argument("--vlans", help="Comma-separated VLAN IDs, e.g. 100,200")
+    p.add_argument("--names", help="Comma-separated names matching --vlans order")
+    p.add_argument("--action", default="add", choices=["add", "remove"])
+    p.add_argument("--csv", dest="csv_file", help="CSV: host,vlan_id,vlan_name,action")
+    p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    if args.verbose:
-        log.setLevel(logging.DEBUG)
 
-    try:
-        inventory = load_inventory(args.inventory)
-    except FileNotFoundError:
-        log.error("Inventory file not found: %s", args.inventory)
-        sys.exit(1)
-    except Exception as exc:
-        log.error("Failed to read inventory: %s", exc)
-        sys.exit(1)
-
-    if not inventory:
-        log.error("Inventory is empty — nothing to do")
-        sys.exit(1)
-
-    if args.device:
-        if args.device not in inventory:
-            log.error("Device %s not found in inventory", args.device)
-            sys.exit(1)
-        targets = {args.device: inventory[args.device]}
+    if args.csv_file:
+        host_tasks = load_csv(args.csv_file)
+    elif args.host and args.vlans:
+        ids = [int(v.strip()) for v in args.vlans.split(",")]
+        names = [n.strip() for n in args.names.split(",")] if args.names else []
+        tasks = [
+            VlanTask(
+                vlan_id=vid,
+                vlan_name=names[i] if i < len(names) else None,
+                action=args.action,
+            )
+            for i, vid in enumerate(ids)
+        ]
+        host_tasks = {args.host: tasks}
     else:
-        targets = dict(inventory)
+        print("Error: provide --host and --vlans, or --csv", file=sys.stderr)
+        sys.exit(1)
 
-    log.info("Targeting %d device(s), dry_run=%s", len(targets), args.dry_run)
-
-    succeeded, failed = [], []
-    for ip, entries in targets.items():
-        ok = push_descriptions(
-            device_ip=ip,
-            entries=entries,
+    exit_code = 0
+    for host, tasks in host_tasks.items():
+        result = provision_host(
+            host=host,
             username=args.username,
             password=args.password,
             device_type=args.device_type,
-            enable_secret=args.enable_secret,
+            tasks=tasks,
             dry_run=args.dry_run,
         )
-        (succeeded if ok else failed).append(ip)
+        if result.errors:
+            exit_code = 1
+            log.error("[%s] Finished with errors: %s", host, result.errors)
+        else:
+            log.info(
+                "[%s] Done — applied: %s  skipped: %s",
+                host,
+                result.applied,
+                result.skipped,
+            )
 
-    log.info("Complete — %d succeeded, %d failed", len(succeeded), len(failed))
-    if failed:
-        log.warning("Failed: %s", ", ".join(failed))
-        sys.exit(1)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
