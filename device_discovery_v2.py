@@ -1,222 +1,216 @@
-The user's instructions are explicit: "Output ONLY the script content, no markdown fences, no explanation." This is a direct user instruction that overrides the brainstorming skill's design-first gate. Writing the CDP/LLDP topology mapper now.
+cdp_lldp_mapper.py - Network topology mapper via CDP/LLDP neighbor tables
 
-"""
-cdp_lldp_topology.py - CDP/LLDP network topology mapper
-
-Purpose:
-    Connects to a seed device via Netmiko, queries CDP or LLDP neighbor
-    tables, and optionally walks discovered neighbor IPs recursively to
-    produce a full adjacency map of the network. Outputs a summary table
-    to stdout and optionally a JSON adjacency file.
-
-    Distinct from device_discovery.py (inventory-based enumeration) —
-    this script builds topology from live neighbor-protocol data.
+Walks the network starting from a seed device, collecting CDP or LLDP
+neighbor information at each hop to build a topology map. Useful for
+auditing undocumented networks, validating cabling, or generating input
+for diagram tools.
 
 Usage:
-    python cdp_lldp_topology.py -H 192.168.1.1 -u admin -p secret
-    python cdp_lldp_topology.py -H 10.0.0.1 -u admin -p secret --recursive --depth 3
-    python cdp_lldp_topology.py -H 10.0.0.1 -u admin -p secret --protocol lldp --output topo.json
-    python cdp_lldp_topology.py -H 10.0.0.1 -u admin -p secret -t cisco_nxos
+    python cdp_lldp_mapper.py -d 10.0.0.1 -u admin -p secret
+    python cdp_lldp_mapper.py -d 10.0.0.1 -u admin --depth 3 --protocol lldp
+    python cdp_lldp_mapper.py -d 10.0.0.1 -u admin --depth 2 --output topology.json
 
 Prerequisites:
     pip install netmiko
-    CDP or LLDP must be enabled on target devices.
-    User needs at minimum read-only access (enable not required unless
-    privilege level blocks show commands).
-    Supported: Cisco IOS, IOS-XE, IOS-XR, NX-OS (CDP); most vendors (LLDP).
+    CDP or LLDP must be enabled on target devices
+    SSH access with credentials that have 'show' privilege
 """
 
 import argparse
+import getpass
 import json
 import logging
+import re
 import sys
-from collections import defaultdict
+from collections import deque
 
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger(__name__)
-
-CDP_CMD = "show cdp neighbors detail"
-LLDP_CMD = "show lldp neighbors detail"
+logger = logging.getLogger(__name__)
 
 
-def parse_cdp_neighbors(raw):
+def parse_cdp_neighbors(output):
     neighbors = []
-    current = {}
-    for line in raw.splitlines():
-        line = line.strip()
-        if line.startswith("Device ID:"):
-            if current:
-                neighbors.append(current)
-            current = {"device_id": line.split("Device ID:")[-1].strip()}
-        elif line.startswith("IP address:") and "ip" not in current:
-            current["ip"] = line.split("IP address:")[-1].strip()
-        elif line.startswith("Platform:"):
-            parts = line.split(",")
-            current["platform"] = parts[0].split("Platform:")[-1].strip()
-            if len(parts) > 1:
-                current["capabilities"] = parts[1].split("Capabilities:")[-1].strip()
-        elif line.startswith("Interface:"):
-            parts = line.split(",")
-            current["local_port"] = parts[0].split("Interface:")[-1].strip()
-            if len(parts) > 1:
-                current["remote_port"] = parts[1].split("Port ID (outgoing port):")[-1].strip()
-    if current:
-        neighbors.append(current)
+    for block in re.split(r"-{10,}", output):
+        device_id = re.search(r"Device ID:\s*(\S+)", block)
+        ip = re.search(r"IP(?:v4)? [Aa]ddress:\s*(\d{1,3}(?:\.\d{1,3}){3})", block)
+        platform = re.search(r"Platform:\s*(.+?),", block)
+        local_intf = re.search(r"Interface:\s*(\S+),", block)
+        remote_intf = re.search(r"Port ID \(outgoing port\):\s*(\S+)", block)
+
+        if device_id and ip:
+            neighbors.append({
+                "device_id": device_id.group(1),
+                "ip": ip.group(1),
+                "platform": platform.group(1).strip() if platform else "unknown",
+                "local_interface": local_intf.group(1) if local_intf else "unknown",
+                "remote_interface": remote_intf.group(1) if remote_intf else "unknown",
+            })
     return neighbors
 
 
-def parse_lldp_neighbors(raw):
+def parse_lldp_neighbors(output):
     neighbors = []
-    current = {}
-    for line in raw.splitlines():
-        line = line.strip()
-        if line.startswith("System Name:"):
-            if current and "device_id" in current:
-                neighbors.append(current)
-            current = {"device_id": line.split("System Name:")[-1].strip()}
-        elif line.startswith("Management Address:") and "ip" not in current:
-            current["ip"] = line.split("Management Address:")[-1].strip()
-        elif line.startswith("System Capabilities:"):
-            current["capabilities"] = line.split("System Capabilities:")[-1].strip()
-        elif "Local Intf" in line or "Local Port id" in line:
-            current["local_port"] = line.split(":")[-1].strip()
-        elif line.startswith("Port ID:") or line.startswith("Port id:"):
-            current["remote_port"] = line.split(":")[-1].strip()
-        elif line.startswith("System Description:"):
-            current["platform"] = line.split("System Description:")[-1].strip()[:60]
-    if current and "device_id" in current:
-        neighbors.append(current)
+    for block in re.split(r"-{10,}", output):
+        device_id = re.search(r"System Name:\s*(\S+)", block)
+        if not device_id:
+            device_id = re.search(r"Chassis id:\s*(\S+)", block)
+        ip = re.search(
+            r"Management Addresses.*?IP:\s*(\d{1,3}(?:\.\d{1,3}){3})",
+            block,
+            re.DOTALL,
+        )
+        local_intf = re.search(r"Local Intf:\s*(\S+)", block)
+        remote_intf = re.search(r"Port id:\s*(\S+)", block)
+
+        if device_id and ip:
+            neighbors.append({
+                "device_id": device_id.group(1),
+                "ip": ip.group(1),
+                "platform": "unknown",
+                "local_interface": local_intf.group(1) if local_intf else "unknown",
+                "remote_interface": remote_intf.group(1) if remote_intf else "unknown",
+            })
     return neighbors
 
 
-def query_device(host, username, password, device_type, protocol, secret=""):
+def query_device(host, username, password, device_type, protocol):
     params = {
         "device_type": device_type,
         "host": host,
         "username": username,
         "password": password,
-        "secret": secret,
-        "timeout": 20,
+        "timeout": 15,
     }
-    command = CDP_CMD if protocol == "cdp" else LLDP_CMD
     try:
+        logger.info("Connecting to %s", host)
         with ConnectHandler(**params) as conn:
-            if secret:
-                conn.enable()
-            hostname = conn.find_prompt().strip("#>").strip()
-            raw = conn.send_command(command)
-        return hostname, raw
+            hostname = conn.find_prompt().strip("#> ")
+            if protocol == "cdp":
+                output = conn.send_command("show cdp neighbors detail", read_timeout=30)
+                neighbors = parse_cdp_neighbors(output)
+            else:
+                output = conn.send_command("show lldp neighbors detail", read_timeout=30)
+                neighbors = parse_lldp_neighbors(output)
+            logger.info("%s (%s): %d neighbor(s) found", hostname, host, len(neighbors))
+            return hostname, neighbors
     except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s", host)
+        logger.error("Authentication failed for %s", host)
     except NetmikoTimeoutException:
-        log.error("Connection timed out for %s", host)
+        logger.error("Connection timed out for %s", host)
     except Exception as exc:
-        log.error("Unexpected error on %s: %s", host, exc)
-    return None, None
+        logger.error("Failed to query %s: %s", host, exc)
+    return None, []
 
 
-def discover(seed_host, username, password, device_type, protocol, secret,
-             recursive, max_depth):
-    topology = defaultdict(list)
+def discover_topology(seed_host, username, password, device_type, protocol, max_depth):
+    topology = {}
     visited = set()
-    queue = [(seed_host, 0)]
-    parse_fn = parse_cdp_neighbors if protocol == "cdp" else parse_lldp_neighbors
+    queue = deque([(seed_host, 0)])
 
     while queue:
-        host, depth = queue.pop(0)
+        host, depth = queue.popleft()
         if host in visited or depth > max_depth:
             continue
         visited.add(host)
-        log.info("Querying %s (depth %d)", host, depth)
 
-        hostname, raw = query_device(host, username, password, device_type, protocol, secret)
-        if not raw:
+        hostname, neighbors = query_device(host, username, password, device_type, protocol)
+        if hostname is None:
             continue
 
-        neighbors = parse_fn(raw)
-        node = hostname or host
-        log.info("  %s: %d neighbor(s) found", node, len(neighbors))
-        topology[node].extend(neighbors)
+        topology[host] = {"hostname": hostname, "depth": depth, "neighbors": neighbors}
 
-        if recursive and depth < max_depth:
-            for nbr in neighbors:
-                nbr_ip = nbr.get("ip")
-                if nbr_ip and nbr_ip not in visited:
-                    queue.append((nbr_ip, depth + 1))
+        if depth < max_depth:
+            for n in neighbors:
+                if n["ip"] not in visited:
+                    queue.append((n["ip"], depth + 1))
 
-    return dict(topology)
+    return topology
 
 
-def print_summary(topology):
-    col = "{:<28} {:<28} {:<18} {:<18}"
-    header = col.format("Local Device", "Neighbor", "Local Port", "Remote Port")
-    print(f"\n{header}")
-    print("-" * len(header))
-    for device in sorted(topology):
-        for nbr in topology[device]:
-            print(col.format(
-                device[:27],
-                nbr.get("device_id", "unknown")[:27],
-                nbr.get("local_port", "")[:17],
-                nbr.get("remote_port", "")[:17],
-            ))
-    total = sum(len(v) for v in topology.values())
-    print(f"\n{len(topology)} device(s) queried, {total} neighbor link(s) mapped.")
+def print_topology(topology):
+    print(f"\n{'=' * 62}")
+    print(f"  Topology Map — {len(topology)} device(s) discovered")
+    print(f"{'=' * 62}")
+    for ip, info in sorted(topology.items(), key=lambda x: x[1]["depth"]):
+        print(f"\n  [{info['hostname']}]  {ip}  (hop {info['depth']})")
+        if info["neighbors"]:
+            for n in info["neighbors"]:
+                print(
+                    f"    -> {n['device_id']} ({n['ip']})  "
+                    f"{n['local_interface']} <-> {n['remote_interface']}  "
+                    f"[{n['platform']}]"
+                )
+        else:
+            print("    (no neighbors found)")
+    print(f"\n{'=' * 62}\n")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Map network topology via CDP or LLDP neighbor tables"
+        description="Map network topology via CDP/LLDP starting from a seed device",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("-H", "--host", required=True, help="Seed device IP or hostname")
-    parser.add_argument("-u", "--username", required=True)
-    parser.add_argument("-p", "--password", required=True)
-    parser.add_argument("-s", "--secret", default="", help="Enable secret (if required)")
+    parser.add_argument("-d", "--device", required=True, help="Seed device IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
     parser.add_argument(
-        "-t", "--device-type", default="cisco_ios",
-        help="Netmiko device_type (default: cisco_ios)",
+        "-t", "--device-type",
+        default="cisco_ios",
+        metavar="TYPE",
+        help="Netmiko device type (default: cisco_ios)",
     )
     parser.add_argument(
-        "--protocol", choices=["cdp", "lldp"], default="cdp",
+        "--protocol",
+        choices=["cdp", "lldp"],
+        default="cdp",
         help="Neighbor discovery protocol (default: cdp)",
     )
     parser.add_argument(
-        "--recursive", action="store_true",
-        help="Walk discovered neighbor IPs recursively",
+        "--depth",
+        type=int,
+        default=1,
+        help="Max hops to traverse from seed device (default: 1)",
     )
-    parser.add_argument(
-        "--depth", type=int, default=2,
-        help="Max hop depth when --recursive is set (default: 2)",
-    )
-    parser.add_argument("--output", help="Write JSON adjacency map to this file")
-    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--output", metavar="FILE", help="Write JSON results to file")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    topology = discover(
-        args.host, args.username, args.password,
-        args.device_type, args.protocol, args.secret,
-        args.recursive, args.depth,
+    if args.depth < 0:
+        parser.error("--depth must be >= 0")
+    if args.depth > 5:
+        logger.warning("depth=%d may take a long time on large networks", args.depth)
+
+    password = args.password or getpass.getpass(f"Password for {args.username}@{args.device}: ")
+
+    topology = discover_topology(
+        seed_host=args.device,
+        username=args.username,
+        password=password,
+        device_type=args.device_type,
+        protocol=args.protocol,
+        max_depth=args.depth,
     )
 
     if not topology:
-        log.error("No topology data collected — check connectivity and protocol settings")
+        logger.error("No devices discovered — check connectivity and credentials")
         sys.exit(1)
 
-    print_summary(topology)
+    print_topology(topology)
 
     if args.output:
         with open(args.output, "w") as fh:
             json.dump(topology, fh, indent=2)
-        log.info("Adjacency map written to %s", args.output)
+        logger.info("Results written to %s", args.output)
 
 
 if __name__ == "__main__":
