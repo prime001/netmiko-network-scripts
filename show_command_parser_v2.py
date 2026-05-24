@@ -1,188 +1,207 @@
-```python
-#!/usr/bin/env python3
-"""
-Network Device Configuration Backup Tool
+The script is standalone and doesn't need to live in this repo. Here it is:
 
-Purpose:
-    Backup running configurations from network devices to timestamped files.
-    Supports multiple vendors (Cisco IOS, IOS-XE, IOS-XR, Junos, Arista, etc.)
+```python
+"""
+mac_tracker.py - MAC Address Table Lookup and Export
+
+Connects to one or more network switches via Netmiko and retrieves the MAC
+address table, with optional filtering by MAC or VLAN. Useful for locating
+which switchport a device is connected to without manual CLI hopping.
 
 Usage:
-    Single device:
-        python config_backup.py --host 10.0.0.1 --username admin --password secret --device_type cisco_ios
+    # Locate a specific MAC across one switch
+    python mac_tracker.py -H 192.168.1.1 -u admin -p secret --mac 00:1a:2b:3c:4d:5e
 
-    Multiple devices from file:
-        python config_backup.py --devices devices.txt --username admin --password secret --output_dir ./backups
+    # Dump full MAC table to CSV
+    python mac_tracker.py -H 192.168.1.1 -u admin -p secret --output macs.csv
 
-    Devices file format (one per line):
-        hostname,device_type
-        10.0.0.1,cisco_ios
-        10.0.0.2,cisco_iosxe
+    # Search across multiple switches (comma-separated)
+    python mac_tracker.py -H 10.0.0.1,10.0.0.2 -u admin -p secret --mac aabb.cc11.2233
+
+    # Filter by VLAN
+    python mac_tracker.py -H 192.168.1.1 -u admin -p secret --vlan 100
 
 Prerequisites:
-    - netmiko library: pip install netmiko
-    - Network connectivity to target devices
-    - Valid SSH credentials
-    - SSH enabled on target devices
+    pip install netmiko
+    Supported device types: cisco_ios, cisco_xe, cisco_nxos
 """
 
 import argparse
+import csv
 import logging
+import re
 import sys
-from datetime import datetime
-from pathlib import Path
+
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoTimeoutException, NetmikoAuthenticationException
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger(__name__)
 
 
-def setup_logging(verbose=False):
-    """Configure logging with timestamps and levels."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    return logging.getLogger(__name__)
+def normalize_mac(mac: str) -> str:
+    digits = re.sub(r"[^0-9a-fA-F]", "", mac)
+    if len(digits) != 12:
+        raise ValueError(f"Invalid MAC address: {mac!r}")
+    return ":".join(digits[i:i + 2] for i in range(0, 12, 2)).lower()
 
 
-def backup_device(host, device_type, username, password, output_dir, 
-                  port=22, timeout=30):
-    """
-    Backup configuration from a single device.
-    
-    Args:
-        host: Device hostname/IP
-        device_type: Device type (cisco_ios, junos, arista_eos, etc.)
-        username: SSH username
-        password: SSH password
-        output_dir: Directory to store backups
-        port: SSH port (default 22)
-        timeout: Connection timeout in seconds
-        
-    Returns:
-        True if successful, False otherwise
-    """
-    logger = logging.getLogger(__name__)
-    device = None
-    
-    try:
-        logger.info(f"Connecting to {host} ({device_type})...")
-        
-        device = ConnectHandler(
-            host=host,
-            device_type=device_type,
-            username=username,
-            password=password,
-            port=port,
-            timeout=timeout,
-            global_delay_factor=1
+def parse_mac_table(output: str, device_type: str) -> list[dict]:
+    entries = []
+
+    if "nxos" in device_type:
+        # NX-OS: VLAN  MAC Address  Type  age  Secure  NTFY  Ports
+        pattern = re.compile(
+            r"^\*?\s*(\d+)\s+([0-9a-f.]+)\s+(\w+)\s+\S+\s+\S+\s+\S+\s+(\S+)",
+            re.MULTILINE,
         )
-        
-        device_name = host.replace(".", "_")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{device_name}_{timestamp}.txt"
-        filepath = Path(output_dir) / filename
-        
-        if device_type.startswith('cisco'):
-            config = device.send_command("show running-config")
-        elif device_type == 'junos':
-            config = device.send_command("show configuration | display set")
-        elif device_type == 'arista_eos':
-            config = device.send_command("show running-config")
-        else:
-            config = device.send_command("show running-config")
-        
-        filepath.write_text(config)
-        logger.info(f"Backup saved: {filepath} ({len(config)} bytes)")
-        return True
-        
-    except NetmikoTimeoutException:
-        logger.error(f"Timeout connecting to {host}")
-        return False
-    except NetmikoAuthenticationException:
-        logger.error(f"Authentication failed for {host}")
-        return False
-    except Exception as e:
-        logger.error(f"Error backing up {host}: {str(e)}")
-        return False
-    finally:
-        if device:
-            try:
-                device.disconnect()
-            except Exception:
-                pass
+    else:
+        # IOS/IOS-XE: Vlan  Mac Address  Type  Ports
+        pattern = re.compile(
+            r"^\s*(\d+)\s+([0-9a-f.]+)\s+(\w+)\s+(\S+)",
+            re.MULTILINE,
+        )
 
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Backup network device configurations",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Example: python config_backup.py --host 10.0.0.1 --username admin --password secret"
-    )
-    
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--host', help='Single device IP/hostname')
-    group.add_argument('--devices', help='File with device list (hostname,device_type)')
-    
-    parser.add_argument('-u', '--username', required=True, help='SSH username')
-    parser.add_argument('-p', '--password', required=True, help='SSH password')
-    parser.add_argument('-t', '--device_type', default='cisco_ios', 
-                       help='Device type (default: cisco_ios)')
-    parser.add_argument('-o', '--output_dir', default='./backups',
-                       help='Output directory for backups (default: ./backups)')
-    parser.add_argument('--port', type=int, default=22, help='SSH port (default: 22)')
-    parser.add_argument('--timeout', type=int, default=30, help='Connection timeout (default: 30s)')
-    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging')
-    
-    args = parser.parse_args()
-    logger = setup_logging(args.verbose)
-    
-    output_path = Path(args.output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Using output directory: {output_path.absolute()}")
-    
-    success_count = 0
-    failure_count = 0
-    
-    if args.host:
-        if backup_device(
-            args.host, args.device_type, args.username, 
-            args.password, args.output_dir, args.port, args.timeout
-        ):
-            success_count += 1
-        else:
-            failure_count += 1
-    
-    elif args.devices:
+    for match in pattern.finditer(output):
+        vlan, mac_raw, entry_type, port = match.groups()
         try:
-            with open(args.devices, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith('#'):
-                        continue
-                    
-                    parts = line.split(',')
-                    if len(parts) < 2:
-                        logger.warning(f"Invalid line format: {line}")
-                        continue
-                    
-                    host, device_type = parts[0].strip(), parts[1].strip()
-                    
-                    if backup_device(
-                        host, device_type, args.username,
-                        args.password, args.output_dir, args.port, args.timeout
-                    ):
-                        success_count += 1
-                    else:
-                        failure_count += 1
-                        
-        except FileNotFoundError:
-            logger.error(f"Device file not found: {args.devices}")
+            mac_normalized = normalize_mac(mac_raw)
+        except ValueError:
+            continue
+        entries.append({
+            "vlan": vlan,
+            "mac": mac_normalized,
+            "type": entry_type,
+            "port": port,
+        })
+
+    return entries
+
+
+def query_device(
+    host: str,
+    username: str,
+    password: str,
+    device_type: str,
+    port: int,
+    use_keys: bool,
+) -> list[dict]:
+    connection_params = {
+        "device_type": device_type,
+        "host": host,
+        "username": username,
+        "password": password,
+        "port": port,
+    }
+    if use_keys:
+        connection_params["use_keys"] = True
+
+    log.info("Connecting to %s (%s)", host, device_type)
+    try:
+        with ConnectHandler(**connection_params) as conn:
+            output = conn.send_command("show mac address-table")
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s", host)
+        return []
+    except NetmikoTimeoutException:
+        log.error("Connection timed out for %s", host)
+        return []
+    except Exception as exc:
+        log.error("Failed to connect to %s: %s", host, exc)
+        return []
+
+    entries = parse_mac_table(output, device_type)
+    log.info("Retrieved %d MAC entries from %s", len(entries), host)
+    for entry in entries:
+        entry["host"] = host
+    return entries
+
+
+def write_csv(entries: list[dict], path: str) -> None:
+    fields = ["host", "vlan", "mac", "type", "port"]
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(entries)
+    log.info("Wrote %d entries to %s", len(entries), path)
+
+
+def print_table(entries: list[dict]) -> None:
+    header = f"{'HOST':<18} {'VLAN':<6} {'MAC':<18} {'TYPE':<10} {'PORT'}"
+    print(header)
+    print("-" * 70)
+    for e in entries:
+        print(
+            f"{e['host']:<18} {e['vlan']:<6} {e['mac']:<18} "
+            f"{e['type']:<10} {e['port']}"
+        )
+    print(f"\nTotal: {len(entries)} entries")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="MAC address table lookup and export via Netmiko"
+    )
+    parser.add_argument("-H", "--hosts", required=True,
+                        help="Comma-separated device IPs or hostnames")
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", required=True)
+    parser.add_argument(
+        "-t", "--device-type", default="cisco_ios",
+        choices=["cisco_ios", "cisco_xe", "cisco_nxos"],
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument("--use-keys", action="store_true",
+                        help="Use SSH key authentication instead of password")
+    parser.add_argument("--mac", help="Search for a specific MAC address")
+    parser.add_argument("--vlan", help="Filter results to a specific VLAN ID")
+    parser.add_argument("--output", help="Write results to a CSV file")
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
+    all_entries: list[dict] = []
+
+    for host in hosts:
+        entries = query_device(
+            host=host,
+            username=args.username,
+            password=args.password,
+            device_type=args.device_type,
+            port=args.port,
+            use_keys=args.use_keys,
+        )
+        all_entries.extend(entries)
+
+    if not all_entries:
+        log.error("No MAC entries retrieved from any device")
+        sys.exit(1)
+
+    if args.mac:
+        try:
+            search_mac = normalize_mac(args.mac)
+        except ValueError as exc:
+            log.error("%s", exc)
             sys.exit(1)
-    
-    logger.info(f"Backup complete: {success_count} succeeded, {failure_count} failed")
-    sys.exit(0 if failure_count == 0 else 1)
+        all_entries = [e for e in all_entries if e["mac"] == search_mac]
+        if not all_entries:
+            print(f"MAC {search_mac} not found on any queried device.")
+            sys.exit(0)
+
+    if args.vlan:
+        all_entries = [e for e in all_entries if e["vlan"] == args.vlan]
+
+    if args.output:
+        write_csv(all_entries, args.output)
+    else:
+        print_table(all_entries)
 
 
 if __name__ == "__main__":
