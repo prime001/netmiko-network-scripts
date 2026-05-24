@@ -1,212 +1,230 @@
-mac_address_lookup.py - Locate MAC addresses across Cisco switch MAC address tables.
+```python
+#!/usr/bin/env python3
+"""
+Configuration Backup Manager with Version Control.
 
-Purpose:
-    Given one or more target MAC addresses, connects to a list of Cisco IOS/IOS-XE
-    switches via SSH, retrieves and parses their MAC address tables using TextFSM,
-    and reports which switch, port, and VLAN each MAC was learned on. Useful for
-    tracing endpoints, hunting rogue devices, or verifying port assignments without
-    manually hopping across dozens of switches.
-
-Usage:
-    # Single switch
-    python mac_address_lookup.py --host 10.0.0.1 --username admin \
-        --mac aa:bb:cc:dd:ee:ff
-
-    # Inventory file, multiple MACs, JSON output
-    python mac_address_lookup.py --inventory switches.txt --username admin \
-        --mac aa:bb:cc:dd:ee:ff 00:11:22:33:44:55 --output results.json
+Captures running configurations from network devices and maintains a versioned
+archive with diff capability. Useful for change tracking, compliance auditing,
+and quick rollback comparisons.
 
 Prerequisites:
-    pip install netmiko
-    pip install textfsm   (optional; built-in regex fallback used if absent)
+    - netmiko >= 4.0
+    - paramiko
 
-    Devices must support 'show mac address-table' (Cisco IOS/IOS-XE).
-    SSH must be enabled on each target device.
+Usage:
+    python config_backup_manager.py --device 192.168.1.1 --device-type cisco_ios \\
+        --username admin --password secret --backup-dir ./backups
+
+    python config_backup_manager.py --device 192.168.1.1 --device-type cisco_ios \\
+        --username admin --password secret --backup-dir ./backups --compare latest
+
+Examples:
+    - Backup a single device: --device <ip> --device-type <type> ...
+    - Compare current vs backup: --device <ip> ... --compare <version>
+    - List available backups: --device <ip> ... --list-backups
+
 """
 
 import argparse
-import json
 import logging
-import re
+import os
 import sys
-import textwrap
-from datetime import datetime, timezone
-from getpass import getpass
-from io import StringIO
-
+import json
+from datetime import datetime
+from pathlib import Path
+from difflib import unified_diff
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
-
-try:
-    import textfsm
-    HAS_TEXTFSM = True
-except ImportError:
-    textfsm = None
-    HAS_TEXTFSM = False
-
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger(__name__)
-
-_MAC_TABLE_TEMPLATE = textwrap.dedent("""\
-    Value VLAN (\\d+)
-    Value MAC ([0-9a-f]{4}\\.[0-9a-f]{4}\\.[0-9a-f]{4})
-    Value TYPE (\\w+)
-    Value PORT (\\S+)
-
-    Start
-      ^\\s*${VLAN}\\s+${MAC}\\s+${TYPE}\\s+${PORT} -> Record
-""")
-
-_MAC_TABLE_REGEX = re.compile(
-    r"^\s*(\d+)\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+(\w+)\s+(\S+)",
-    re.MULTILINE | re.IGNORECASE,
-)
 
 
-def normalize_mac(mac: str) -> str:
-    """Normalize any common MAC format to Cisco dotted-hex (xxxx.xxxx.xxxx)."""
-    digits = re.sub(r"[^0-9a-fA-F]", "", mac).lower()
-    if len(digits) != 12:
-        raise ValueError(f"Invalid MAC address: {mac!r}")
-    return f"{digits[0:4]}.{digits[4:8]}.{digits[8:12]}"
+def setup_logging(log_file=None):
+    """Configure logging with file and console handlers."""
+    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    handlers = [logging.StreamHandler()]
 
+    if log_file:
+        handlers.append(logging.FileHandler(log_file))
 
-def parse_mac_table(raw_output: str) -> list:
-    """Return list of dicts from 'show mac address-table' output."""
-    if HAS_TEXTFSM:
-        fsm = textfsm.TextFSM(StringIO(_MAC_TABLE_TEMPLATE))
-        rows = fsm.ParseText(raw_output)
-        return [
-            {"VLAN": r[0], "MAC": r[1].lower(), "TYPE": r[2], "PORT": r[3]}
-            for r in rows
-        ]
-    entries = []
-    for m in _MAC_TABLE_REGEX.finditer(raw_output):
-        entries.append({
-            "VLAN": m.group(1),
-            "MAC": m.group(2).lower(),
-            "TYPE": m.group(3),
-            "PORT": m.group(4),
-        })
-    return entries
-
-
-def search_device(host: str, username: str, password: str,
-                  device_type: str, targets: set, timeout: int) -> list:
-    """Connect to one switch and return MAC table rows matching targets."""
-    log.info("Connecting to %s", host)
-    device_params = {
-        "device_type": device_type,
-        "host": host,
-        "username": username,
-        "password": password,
-        "timeout": timeout,
-    }
-    matches = []
-    try:
-        with ConnectHandler(**device_params) as conn:
-            raw = conn.send_command("show mac address-table")
-        for entry in parse_mac_table(raw):
-            if entry["MAC"] in targets:
-                matches.append({"host": host, **entry})
-        log.info("%s: %d match(es) found", host, len(matches))
-    except NetmikoAuthenticationException:
-        log.error("%s: authentication failed", host)
-    except NetmikoTimeoutException:
-        log.error("%s: connection timed out", host)
-    except Exception as exc:
-        log.error("%s: %s", host, exc)
-    return matches
-
-
-def load_inventory(path: str) -> list:
-    """Return non-empty, non-comment lines from an inventory file."""
-    with open(path) as fh:
-        return [
-            line.strip()
-            for line in fh
-            if line.strip() and not line.startswith("#")
-        ]
-
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Search MAC address tables across Cisco IOS switches.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+    logging.basicConfig(
+        level=logging.INFO,
+        format=log_format,
+        handlers=handlers
     )
-    src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--host", help="Single device IP or hostname")
-    src.add_argument("--inventory", metavar="FILE",
-                     help="File with one device IP/hostname per line")
-    p.add_argument("--username", required=True, help="SSH username")
-    p.add_argument("--password", help="SSH password (prompted if omitted)")
-    p.add_argument("--mac", nargs="+", required=True, metavar="MAC",
-                   help="One or more MAC addresses to locate (any standard format)")
-    p.add_argument("--device-type", default="cisco_ios",
-                   help="Netmiko device type (default: cisco_ios)")
-    p.add_argument("--timeout", type=int, default=30,
-                   help="SSH timeout in seconds (default: 30)")
-    p.add_argument("--output", metavar="FILE",
-                   help="Write JSON results to this file")
-    p.add_argument("--debug", action="store_true", help="Enable debug logging")
-    return p
+    return logging.getLogger(__name__)
+
+
+def connect_to_device(device_params):
+    """Establish SSH connection to network device."""
+    logger = logging.getLogger(__name__)
+    try:
+        logger.info(f"Connecting to {device_params['host']}")
+        connection = ConnectHandler(**device_params)
+        logger.info(f"Successfully connected to {device_params['host']}")
+        return connection
+    except Exception as e:
+        logger.error(f"Failed to connect to {device_params['host']}: {e}")
+        raise
+
+
+def backup_config(connection, device_ip, backup_dir):
+    """Capture running configuration from device."""
+    logger = logging.getLogger(__name__)
+
+    try:
+        config = connection.send_command('show running-config')
+        logger.info("Retrieved running configuration")
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_file = Path(backup_dir) / f"{device_ip}_{timestamp}.conf"
+
+        with open(backup_file, 'w') as f:
+            f.write(config)
+
+        logger.info(f"Backup saved to {backup_file}")
+
+        metadata_file = Path(backup_dir) / f"{device_ip}_backups.json"
+        metadata = {
+            'timestamp': timestamp,
+            'file': backup_file.name,
+            'size': len(config)
+        }
+
+        backups_list = []
+        if metadata_file.exists():
+            with open(metadata_file, 'r') as f:
+                backups_list = json.load(f)
+
+        backups_list.append(metadata)
+        with open(metadata_file, 'w') as f:
+            json.dump(backups_list, f, indent=2)
+
+        return backup_file
+    except Exception as e:
+        logger.error(f"Failed to backup configuration: {e}")
+        raise
+
+
+def compare_configs(device_ip, backup_dir, version='latest'):
+    """Compare current config with a previous backup."""
+    logger = logging.getLogger(__name__)
+
+    try:
+        backups = sorted(
+            Path(backup_dir).glob(f"{device_ip}_*.conf"),
+            reverse=True
+        )
+
+        if len(backups) < 2:
+            logger.warning("Not enough backups to compare")
+            return
+
+        if version == 'latest':
+            older = backups[1]
+        else:
+            matching = [b for b in backups if version in b.name]
+            if not matching:
+                logger.error(f"No backup found matching {version}")
+                return
+            older = matching[0]
+
+        with open(backups[0]) as f:
+            current = f.readlines()
+        with open(older) as f:
+            previous = f.readlines()
+
+        diff = unified_diff(
+            previous,
+            current,
+            fromfile=older.name,
+            tofile=backups[0].name
+        )
+
+        print("\n".join(diff))
+        logger.info(f"Compared {older.name} with {backups[0].name}")
+    except Exception as e:
+        logger.error(f"Failed to compare configs: {e}")
+        raise
+
+
+def list_backups(device_ip, backup_dir):
+    """List all available backups for a device."""
+    logger = logging.getLogger(__name__)
+
+    try:
+        metadata_file = Path(backup_dir) / f"{device_ip}_backups.json"
+
+        if not metadata_file.exists():
+            logger.info("No backups found")
+            return
+
+        with open(metadata_file) as f:
+            backups = json.load(f)
+
+        print(f"\nBackups for {device_ip}:")
+        for i, backup in enumerate(
+            sorted(backups, key=lambda x: x['timestamp'], reverse=True), 1
+        ):
+            size_kb = backup['size'] / 1024
+            print(f"  {i}. {backup['timestamp']} - {backup['file']} "
+                  f"({size_kb:.1f} KB)")
+    except Exception as e:
+        logger.error(f"Failed to list backups: {e}")
+        raise
 
 
 def main():
-    args = build_parser().parse_args()
+    parser = argparse.ArgumentParser(
+        description='Network device configuration backup manager',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
 
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
+    parser.add_argument('--device', required=True,
+                       help='Target device IP or hostname')
+    parser.add_argument('--device-type', required=True,
+                       help='Netmiko device type (e.g., cisco_ios)')
+    parser.add_argument('--username', required=True, help='SSH username')
+    parser.add_argument('--password', required=True, help='SSH password')
+    parser.add_argument('--port', type=int, default=22,
+                       help='SSH port (default: 22)')
+    parser.add_argument('--backup-dir', default='./backups',
+                       help='Backup directory (default: ./backups)')
+    parser.add_argument('--compare', nargs='?', const='latest',
+                       help='Compare with backup (latest or timestamp)')
+    parser.add_argument('--list-backups', action='store_true',
+                       help='List all backups')
+    parser.add_argument('--log-file', help='Log file path')
 
-    if not HAS_TEXTFSM:
-        log.warning("textfsm not installed — using regex fallback parser")
+    args = parser.parse_args()
 
-    password = args.password or getpass(f"Password for {args.username}: ")
+    logger = setup_logging(args.log_file)
+
+    Path(args.backup_dir).mkdir(parents=True, exist_ok=True)
+
+    if args.list_backups:
+        list_backups(args.device, args.backup_dir)
+        return
+
+    device_params = {
+        'device_type': args.device_type,
+        'host': args.device,
+        'username': args.username,
+        'password': args.password,
+        'port': args.port,
+        'timeout': 30
+    }
 
     try:
-        targets = {normalize_mac(m) for m in args.mac}
-    except ValueError as exc:
-        log.error("%s", exc)
+        connection = connect_to_device(device_params)
+        backup_config(connection, args.device, args.backup_dir)
+        connection.disconnect()
+        logger.info("Connection closed")
+
+        if args.compare:
+            compare_configs(args.device, args.backup_dir, args.compare)
+    except Exception as e:
+        logger.critical(f"Script failed: {e}")
         sys.exit(1)
 
-    hosts = [args.host] if args.host else load_inventory(args.inventory)
-    if not hosts:
-        log.error("No hosts to scan.")
-        sys.exit(1)
 
-    log.info("Scanning %d device(s) for %d target MAC(s)", len(hosts), len(targets))
-
-    all_matches = []
-    for host in hosts:
-        all_matches.extend(
-            search_device(host, args.username, password,
-                          args.device_type, targets, args.timeout)
-        )
-
-    if not all_matches:
-        print("No matches found.")
-    else:
-        header = f"{'HOST':<20} {'VLAN':<6} {'MAC':<18} {'TYPE':<10} PORT"
-        print(f"\n{header}")
-        print("-" * len(header))
-        for m in all_matches:
-            print(f"{m['host']:<20} {m['VLAN']:<6} {m['MAC']:<18} {m['TYPE']:<10} {m['PORT']}")
-
-    if args.output:
-        payload = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "targets": sorted(targets),
-            "matches": all_matches,
-        }
-        with open(args.output, "w") as fh:
-            json.dump(payload, fh, indent=2)
-        log.info("Results written to %s", args.output)
-
-    sys.exit(0 if all_matches else 1)
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
+```
