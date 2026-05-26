@@ -1,240 +1,232 @@
-vlan_provisioner.py - Bulk VLAN provisioning on Cisco IOS/IOS-XE switches.
+```python
+"""
+Interface Error and Discard Monitor - Analyzes network device interface health.
 
-Purpose:
-    Add or remove VLANs on one or more switches with pre-check and post-verify.
-    Computes the delta against the current VLAN database and applies only what is
-    missing (or present), then confirms the change landed before exiting.
+Connects to network devices, retrieves interface statistics, identifies
+interfaces with excessive errors and discards, and generates health reports.
+Useful for troubleshooting link quality issues and interface failures.
 
 Usage:
-    Add VLANs to a single switch:
-        python vlan_provisioner.py --host 10.0.0.1 --username admin --password secret \
-            --vlans 100,200,300 --names "Data,Voice,Management"
-
-    Remove VLANs:
-        python vlan_provisioner.py --host 10.0.0.1 --username admin --password secret \
-            --vlans 100,200 --action remove
-
-    Batch from CSV (columns: host,vlan_id,vlan_name,action):
-        python vlan_provisioner.py --csv switches.csv --username admin --password secret
-
-    Dry-run (show commands without applying):
-        python vlan_provisioner.py --host 10.0.0.1 ... --dry-run
+    python interface_monitor.py --device 192.168.1.1 --username admin \
+        --password secret --error-threshold 100 --discard-threshold 50
 
 Prerequisites:
-    pip install netmiko
-    SSH must be enabled; account needs privilege 15 or enable access.
-    Supported device types: cisco_ios, cisco_xe
+    - netmiko
+    - Python 3.6+
+    - SSH access to devices
+    - Support for "show interfaces" command
+
+Supported Devices:
+    - Cisco IOS/IOS-XE
+    - Cisco IOS-XR
+    - Arista EOS
+    - Juniper Junos
 """
 
 import argparse
-import csv
 import logging
-import sys
-from dataclasses import dataclass, field
-from typing import Optional
-
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+import json
+import re
+from netmiko import ConnectHandler
 
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-@dataclass
-class VlanTask:
-    vlan_id: int
-    vlan_name: Optional[str] = None
-    action: str = "add"
+def parse_cisco_interfaces(output):
+    """Parse Cisco 'show interfaces' output for error statistics."""
+    interfaces = {}
+    current_interface = None
+
+    for line in output.split('\n'):
+        # Match interface name line
+        interface_match = re.match(r'^(\S+)\s+is\s+(up|down)', line)
+        if interface_match:
+            current_interface = interface_match.group(1)
+            interfaces[current_interface] = {
+                'name': current_interface,
+                'status': interface_match.group(2),
+                'input_errors': 0,
+                'output_errors': 0,
+                'input_discards': 0,
+                'output_discards': 0,
+                'crc_errors': 0,
+            }
+            continue
+
+        if not current_interface:
+            continue
+
+        # Extract input errors
+        input_err_match = re.search(r'(\d+)\s+input errors', line)
+        if input_err_match:
+            interfaces[current_interface]['input_errors'] = int(input_err_match.group(1))
+
+        # Extract output errors
+        output_err_match = re.search(r'(\d+)\s+output errors', line)
+        if output_err_match:
+            interfaces[current_interface]['output_errors'] = int(output_err_match.group(1))
+
+        # Extract input discards
+        input_discard_match = re.search(r'(\d+)\s+input discards', line)
+        if input_discard_match:
+            interfaces[current_interface]['input_discards'] = int(input_discard_match.group(1))
+
+        # Extract output discards
+        output_discard_match = re.search(r'(\d+)\s+output discards', line)
+        if output_discard_match:
+            interfaces[current_interface]['output_discards'] = int(output_discard_match.group(1))
+
+        # Extract CRC errors
+        crc_match = re.search(r'(\d+)\s+CRC', line)
+        if crc_match:
+            interfaces[current_interface]['crc_errors'] = int(crc_match.group(1))
+
+    return interfaces
 
 
-@dataclass
-class ProvisionResult:
-    host: str
-    applied: list = field(default_factory=list)
-    skipped: list = field(default_factory=list)
-    errors: list = field(default_factory=list)
+def analyze_device_interfaces(host, username, password, device_type,
+                             error_threshold, discard_threshold):
+    """
+    Connect to device and analyze interface health.
 
+    Args:
+        host: Device IP address
+        username: SSH username
+        password: SSH password
+        device_type: netmiko device type string
+        error_threshold: Minimum error count to flag interface
+        discard_threshold: Minimum discard count to flag interface
 
-def get_existing_vlans(conn) -> dict:
-    """Return {vlan_id: name} for all VLANs in the device database."""
-    output = conn.send_command("show vlan brief", use_textfsm=True)
-    if isinstance(output, list):
-        return {int(e["vlan_id"]): e["name"] for e in output}
-    vlans = {}
-    for line in output.splitlines():
-        parts = line.split()
-        if parts and parts[0].isdigit():
-            vlans[int(parts[0])] = parts[1] if len(parts) > 1 else ""
-    return vlans
-
-
-def build_commands(task: VlanTask, existing: dict) -> list:
-    if task.action == "add":
-        if task.vlan_id in existing:
-            return []
-        cmds = [f"vlan {task.vlan_id}"]
-        if task.vlan_name:
-            cmds.append(f" name {task.vlan_name}")
-        return cmds
-    if task.action == "remove":
-        if task.vlan_id not in existing:
-            return []
-        return [f"no vlan {task.vlan_id}"]
-    return []
-
-
-def provision_host(
-    host: str,
-    username: str,
-    password: str,
-    device_type: str,
-    tasks: list,
-    dry_run: bool,
-) -> ProvisionResult:
-    result = ProvisionResult(host=host)
-    params = {
-        "device_type": device_type,
-        "host": host,
-        "username": username,
-        "password": password,
-        "timeout": 30,
-    }
+    Returns:
+        dict: Analysis report with unhealthy interfaces
+    """
     try:
-        log.info("[%s] Connecting...", host)
-        with ConnectHandler(**params) as conn:
-            existing = get_existing_vlans(conn)
-            log.info("[%s] %d VLANs in database", host, len(existing))
+        logger.info(f"Connecting to {host} ({device_type})")
+        device = ConnectHandler(
+            host=host,
+            username=username,
+            password=password,
+            device_type=device_type,
+            timeout=30,
+            conn_timeout=10
+        )
 
-            all_cmds = []
-            pending = []
-            for task in tasks:
-                cmds = build_commands(task, existing)
-                if not cmds:
-                    log.info("[%s] VLAN %d already in desired state", host, task.vlan_id)
-                    result.skipped.append(task.vlan_id)
-                else:
-                    all_cmds.extend(cmds)
-                    pending.append(task)
+        logger.info(f"Retrieving interface statistics from {host}")
+        output = device.send_command("show interfaces")
+        device.disconnect()
 
-            if not all_cmds:
-                log.info("[%s] No changes required", host)
-                return result
+        interfaces = parse_cisco_interfaces(output)
 
-            if dry_run:
-                log.info("[%s] DRY RUN — would send:\n%s", host, "\n".join(all_cmds))
-                return result
+        # Identify unhealthy interfaces
+        unhealthy = []
+        for int_name, stats in interfaces.items():
+            total_errors = stats['input_errors'] + stats['output_errors']
+            total_discards = stats['input_discards'] + stats['output_discards']
 
-            conn.send_config_set(all_cmds)
-            conn.save_config()
+            if total_errors >= error_threshold or total_discards >= discard_threshold:
+                unhealthy.append({
+                    'interface': int_name,
+                    'status': stats['status'],
+                    'input_errors': stats['input_errors'],
+                    'output_errors': stats['output_errors'],
+                    'input_discards': stats['input_discards'],
+                    'output_discards': stats['output_discards'],
+                    'crc_errors': stats['crc_errors'],
+                    'total_errors': total_errors,
+                    'total_discards': total_discards,
+                })
 
-            post = get_existing_vlans(conn)
-            for task in pending:
-                if task.action == "add" and task.vlan_id not in post:
-                    msg = f"VLAN {task.vlan_id} missing after add"
-                    log.error("[%s] %s", host, msg)
-                    result.errors.append(msg)
-                elif task.action == "remove" and task.vlan_id in post:
-                    msg = f"VLAN {task.vlan_id} still present after remove"
-                    log.error("[%s] %s", host, msg)
-                    result.errors.append(msg)
-                else:
-                    log.info("[%s] VLAN %d %sd OK", host, task.vlan_id, task.action)
-                    result.applied.append(task.vlan_id)
+        report = {
+            'device': host,
+            'device_type': device_type,
+            'total_interfaces': len(interfaces),
+            'unhealthy_count': len(unhealthy),
+            'error_threshold': error_threshold,
+            'discard_threshold': discard_threshold,
+            'unhealthy_interfaces': sorted(unhealthy,
+                                          key=lambda x: x['total_errors'],
+                                          reverse=True)
+        }
 
-    except NetmikoAuthenticationException:
-        result.errors.append("authentication failed")
-        log.error("[%s] Authentication failed", host)
-    except NetmikoTimeoutException:
-        result.errors.append("connection timed out")
-        log.error("[%s] Connection timed out", host)
-    except Exception as exc:
-        result.errors.append(str(exc))
-        log.error("[%s] %s", host, exc)
+        logger.info(f"Analysis complete: {report['unhealthy_count']} "
+                   f"unhealthy interfaces found")
+        return report
 
-    return result
-
-
-def load_csv(path: str) -> dict:
-    host_tasks: dict = {}
-    with open(path, newline="") as fh:
-        for row in csv.DictReader(fh):
-            host = row["host"].strip()
-            task = VlanTask(
-                vlan_id=int(row["vlan_id"]),
-                vlan_name=row.get("vlan_name", "").strip() or None,
-                action=row.get("action", "add").strip(),
-            )
-            host_tasks.setdefault(host, []).append(task)
-    return host_tasks
+    except Exception as e:
+        logger.error(f"Failed to analyze {host}: {str(e)}")
+        return None
 
 
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Add or remove VLANs on Cisco IOS/IOS-XE switches"
-    )
-    p.add_argument("--host", help="Device IP or hostname (single-device mode)")
-    p.add_argument("--username", required=True)
-    p.add_argument("--password", required=True)
-    p.add_argument(
-        "--device-type",
-        default="cisco_ios",
-        choices=["cisco_ios", "cisco_xe"],
-    )
-    p.add_argument("--vlans", help="Comma-separated VLAN IDs, e.g. 100,200")
-    p.add_argument("--names", help="Comma-separated names matching --vlans order")
-    p.add_argument("--action", default="add", choices=["add", "remove"])
-    p.add_argument("--csv", dest="csv_file", help="CSV: host,vlan_id,vlan_name,action")
-    p.add_argument("--dry-run", action="store_true")
-    return p.parse_args()
+def print_report(report):
+    """Pretty-print analysis report to console."""
+    print(f"\n{'='*60}")
+    print(f"Interface Health Report: {report['device']}")
+    print(f"{'='*60}")
+    print(f"Device Type: {report['device_type']}")
+    print(f"Total Interfaces: {report['total_interfaces']}")
+    print(f"Unhealthy Interfaces: {report['unhealthy_count']}")
+    print(f"Thresholds - Errors: {report['error_threshold']}, "
+          f"Discards: {report['discard_threshold']}")
+
+    if report['unhealthy_interfaces']:
+        print(f"\n{'Interface':<20} {'Status':<10} {'Errors':<10} {'Discards':<10}")
+        print("-" * 50)
+        for iface in report['unhealthy_interfaces']:
+            print(f"{iface['interface']:<20} {iface['status']:<10} "
+                  f"{iface['total_errors']:<10} {iface['total_discards']:<10}")
+            if iface['crc_errors'] > 0:
+                print(f"  └─ CRC Errors: {iface['crc_errors']}")
+    else:
+        print("\nAll interfaces are healthy.")
+
+    print(f"{'='*60}\n")
 
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(
+        description="Monitor network device interface errors and discards"
+    )
+    parser.add_argument("--device", required=True, help="Device IP address")
+    parser.add_argument("--username", required=True, help="SSH username")
+    parser.add_argument("--password", required=True, help="SSH password")
+    parser.add_argument("--device-type", default="cisco_ios",
+                       help="netmiko device type (default: cisco_ios)")
+    parser.add_argument("--error-threshold", type=int, default=100,
+                       help="Flag interfaces with errors >= threshold "
+                            "(default: 100)")
+    parser.add_argument("--discard-threshold", type=int, default=50,
+                       help="Flag interfaces with discards >= threshold "
+                            "(default: 50)")
+    parser.add_argument("--json", action="store_true",
+                       help="Output report as JSON")
 
-    if args.csv_file:
-        host_tasks = load_csv(args.csv_file)
-    elif args.host and args.vlans:
-        ids = [int(v.strip()) for v in args.vlans.split(",")]
-        names = [n.strip() for n in args.names.split(",")] if args.names else []
-        tasks = [
-            VlanTask(
-                vlan_id=vid,
-                vlan_name=names[i] if i < len(names) else None,
-                action=args.action,
-            )
-            for i, vid in enumerate(ids)
-        ]
-        host_tasks = {args.host: tasks}
+    args = parser.parse_args()
+
+    report = analyze_device_interfaces(
+        args.device,
+        args.username,
+        args.password,
+        args.device_type,
+        args.error_threshold,
+        args.discard_threshold
+    )
+
+    if not report:
+        logger.error("Failed to generate report")
+        return 1
+
+    if args.json:
+        print(json.dumps(report, indent=2))
     else:
-        print("Error: provide --host and --vlans, or --csv", file=sys.stderr)
-        sys.exit(1)
+        print_report(report)
 
-    exit_code = 0
-    for host, tasks in host_tasks.items():
-        result = provision_host(
-            host=host,
-            username=args.username,
-            password=args.password,
-            device_type=args.device_type,
-            tasks=tasks,
-            dry_run=args.dry_run,
-        )
-        if result.errors:
-            exit_code = 1
-            log.error("[%s] Finished with errors: %s", host, result.errors)
-        else:
-            log.info(
-                "[%s] Done — applied: %s  skipped: %s",
-                host,
-                result.applied,
-                result.skipped,
-            )
-
-    sys.exit(exit_code)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
+```
