@@ -1,203 +1,193 @@
-```python
-"""
-Network Device Services Auditor - Syslog, NTP, and DNS Configuration Validator.
+config_commit_confirm.py - Commit-confirm with auto-rollback for network devices.
 
-Audits critical network services (syslog, NTP, DNS) configuration on network
-devices to ensure logging, time synchronization, and name resolution are properly
-configured. Supports multi-vendor devices through netmiko and SSH auto-detection.
+Applies configuration changes and starts a countdown timer. If the operator
+does not confirm within the timeout window, the original configuration is
+automatically restored. Mirrors the commit-confirmed / rollback-on-timeout
+pattern found in Junos and IOS-XR, implemented in software for IOS/IOS-XE.
 
 Usage:
-    python device_services_auditor.py --device 192.168.1.1 --username admin --password secret
-    python device_services_auditor.py --device 192.168.1.1 --username admin --password secret --services ntp dns
-    python device_services_auditor.py --device 192.168.1.1 --username admin --password secret --output audit.json
+    python config_commit_confirm.py -d 192.168.1.1 -u admin -p secret \
+        -c changes.txt --timeout 120
+
+    # Preview without connecting:
+    python config_commit_confirm.py -d 192.168.1.1 -u admin -p secret \
+        -c changes.txt --dry-run
 
 Prerequisites:
-    - netmiko installed: pip install netmiko paramiko
-    - Device SSH access enabled with specified credentials
-    - Supported device types: Cisco IOS, NXOS, Arista EOS, and others supported by netmiko
+    pip install netmiko
+    Config file: one IOS command per line, blank lines and ! comments ignored.
 """
 
 import argparse
-import json
 import logging
+import select
 import sys
-from datetime import datetime
+import time
+from pathlib import Path
+
 from netmiko import ConnectHandler
-from netmiko.ssh_autodetect import SSHDetect
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
 
-def setup_logging(verbose=False):
-    """Configure logging with optional verbosity."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s - %(levelname)s - %(message)s'
+def capture_running_config(conn):
+    log.info("Capturing current running configuration")
+    output = conn.send_command("show running-config", read_timeout=60)
+    if not output or "Invalid input" in output:
+        raise RuntimeError("Failed to capture running configuration")
+    return output
+
+
+def apply_config(conn, config_lines):
+    log.info("Applying %d configuration line(s)", len(config_lines))
+    return conn.send_config_set(config_lines, read_timeout=30)
+
+
+def restore_config(conn, saved_config):
+    """Push saved config lines back to the device and write memory."""
+    log.warning("Restoring original configuration")
+    lines = []
+    for line in saved_config.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("!"):
+            continue
+        if stripped.startswith("Building configuration") or stripped.startswith("Current configuration"):
+            continue
+        lines.append(line.rstrip())
+    conn.send_config_set(lines, read_timeout=120)
+    conn.save_config()
+    log.info("Rollback complete — original configuration saved")
+
+
+def wait_for_confirm(timeout_seconds):
+    """
+    Block up to timeout_seconds waiting for operator to type 'confirm'.
+    Returns True if confirmed, False on timeout.
+    Uses select() for non-blocking stdin (Linux/macOS only).
+    """
+    deadline = time.time() + timeout_seconds
+    print(
+        f"\n[COMMIT-CONFIRM] Changes applied. You have {timeout_seconds}s to confirm.\n"
+        "  Type 'confirm' and press Enter to keep changes, or wait for auto-rollback.\n"
     )
-    return logging.getLogger(__name__)
+    while time.time() < deadline:
+        remaining = int(deadline - time.time())
+        print(f"\r  Auto-rollback in {remaining:3d}s  |  type 'confirm' to keep: ", end="", flush=True)
+        ready, _, _ = select.select([sys.stdin], [], [], 1.0)
+        if ready:
+            user_input = sys.stdin.readline().strip().lower()
+            if user_input == "confirm":
+                print()
+                return True
+    print("\n  Timeout expired — rolling back.")
+    return False
 
 
-def audit_syslog(net_connect):
-    """Audit syslog server configuration."""
-    try:
-        output = net_connect.send_command('show logging')
-        
-        has_syslog = any(
-            keyword in output for keyword in
-            ['Syslog logging', 'Logging to', 'Log Buffer', 'Server']
-        )
-        
-        servers = []
-        for line in output.split('\n'):
-            if 'Logging to' in line or 'server' in line.lower():
-                servers.append(line.strip())
-        
-        result = {
-            'status': 'PASS' if has_syslog else 'FAIL',
-            'configured': has_syslog,
-            'servers': servers if servers else [],
-            'details': output.split('\n')[:5]
-        }
-        return result
-    except Exception as e:
-        logging.error(f"Syslog audit failed: {e}")
-        return {'status': 'ERROR', 'error': str(e)}
+def load_config_file(path):
+    lines = []
+    for line in Path(path).read_text().splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("!"):
+            lines.append(line.rstrip())
+    return lines
 
 
-def audit_ntp(net_connect):
-    """Audit NTP synchronization status."""
-    try:
-        output = net_connect.send_command('show ntp status')
-        
-        is_synced = any(
-            keyword in output.lower() for keyword in
-            ['synchronized', 'synced', 'master']
-        )
-        
-        servers = []
-        for line in output.split('\n'):
-            if 'server' in line.lower() or 'peer' in line.lower():
-                servers.append(line.strip())
-        
-        result = {
-            'status': 'PASS' if is_synced else 'FAIL',
-            'synchronized': is_synced,
-            'servers': servers if servers else [],
-            'details': output.split('\n')[:5]
-        }
-        return result
-    except Exception as e:
-        logging.error(f"NTP audit failed: {e}")
-        return {'status': 'ERROR', 'error': str(e)}
+def build_connection_params(args):
+    params = {
+        "device_type": args.device_type,
+        "host": args.device,
+        "username": args.username,
+        "password": args.password,
+        "port": args.port,
+    }
+    if args.secret:
+        params["secret"] = args.secret
+    return params
 
 
-def audit_dns(net_connect):
-    """Audit DNS server configuration."""
-    try:
-        output = net_connect.send_command('show ip name-server')
-        
-        dns_lines = [line.strip() for line in output.split('\n') if line.strip()]
-        has_dns = len(dns_lines) > 0
-        
-        result = {
-            'status': 'PASS' if has_dns else 'FAIL',
-            'configured': has_dns,
-            'servers': dns_lines if dns_lines else [],
-            'details': dns_lines[:5]
-        }
-        return result
-    except Exception as e:
-        logging.error(f"DNS audit failed: {e}")
-        return {'status': 'ERROR', 'error': str(e)}
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Apply config with auto-rollback if operator does not confirm in time."
+    )
+    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
+    parser.add_argument("-c", "--config-file", required=True, help="File with IOS commands to apply")
+    parser.add_argument("--secret", default=None, help="Enable secret")
+    parser.add_argument(
+        "--device-type", default="cisco_ios",
+        help="Netmiko device type (default: cisco_ios)"
+    )
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument(
+        "--timeout", type=int, default=60,
+        help="Seconds before auto-rollback triggers (default: 60)"
+    )
+    parser.add_argument("--no-save", action="store_true", help="Skip write mem after confirming")
+    parser.add_argument("--dry-run", action="store_true", help="Print commands and exit without connecting")
+    return parser.parse_args()
 
 
 def main():
-    """Main execution function."""
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    parser.add_argument('--device', required=True, help='Target device IP address')
-    parser.add_argument('--username', required=True, help='SSH username')
-    parser.add_argument('--password', required=True, help='SSH password')
-    parser.add_argument('--device-type', help='Device type (auto-detected if omitted)')
-    parser.add_argument('--port', type=int, default=22, help='SSH port (default: 22)')
-    parser.add_argument('--timeout', type=int, default=30, help='Connection timeout in seconds')
-    parser.add_argument('--services', nargs='+', default=['syslog', 'ntp', 'dns'],
-                        choices=['syslog', 'ntp', 'dns'],
-                        help='Services to audit (default: all)')
-    parser.add_argument('--output', help='Save results to JSON file')
-    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging')
+    args = parse_args()
 
-    args = parser.parse_args()
-    logger = setup_logging(args.verbose)
+    config_path = Path(args.config_file)
+    if not config_path.exists():
+        log.error("Config file not found: %s", config_path)
+        sys.exit(1)
 
-    device_dict = {
-        'host': args.device,
-        'username': args.username,
-        'password': args.password,
-        'port': args.port,
-        'timeout': args.timeout,
-    }
+    config_lines = load_config_file(config_path)
+    if not config_lines:
+        log.error("Config file is empty or contains only comments")
+        sys.exit(1)
 
-    # Auto-detect device type if not specified
-    if not args.device_type:
-        try:
-            logger.info(f"Auto-detecting device type for {args.device}...")
-            guesser = SSHDetect(**device_dict)
-            device_dict['device_type'] = guesser.autodetect()
-            logger.info(f"Detected device type: {device_dict['device_type']}")
-        except Exception as e:
-            logger.error(f"Auto-detection failed: {e}")
-            sys.exit(1)
-    else:
-        device_dict['device_type'] = args.device_type
+    if args.dry_run:
+        print(f"DRY RUN — {len(config_lines)} line(s) to apply to {args.device}:")
+        for line in config_lines:
+            print(f"  {line}")
+        sys.exit(0)
 
     try:
-        net_connect = ConnectHandler(**device_dict)
-        logger.info(f"Successfully connected to {args.device}")
+        log.info("Connecting to %s (%s)", args.device, args.device_type)
+        with ConnectHandler(**build_connection_params(args)) as conn:
+            if args.secret:
+                conn.enable()
 
-        audit_results = {
-            'device': args.device,
-            'timestamp': datetime.now().isoformat(),
-            'device_type': device_dict['device_type'],
-            'audits': {}
-        }
+            original_config = capture_running_config(conn)
+            apply_config(conn, config_lines)
 
-        # Run requested audits
-        if 'syslog' in args.services:
-            logger.info("Running syslog audit...")
-            audit_results['audits']['syslog'] = audit_syslog(net_connect)
-        if 'ntp' in args.services:
-            logger.info("Running NTP audit...")
-            audit_results['audits']['ntp'] = audit_ntp(net_connect)
-        if 'dns' in args.services:
-            logger.info("Running DNS audit...")
-            audit_results['audits']['dns'] = audit_dns(net_connect)
+            confirmed = wait_for_confirm(args.timeout)
 
-        net_connect.disconnect()
+            if confirmed:
+                if not args.no_save:
+                    conn.save_config()
+                    log.info("Configuration saved")
+                log.info("Change confirmed and committed")
+                print("\nSuccess: changes committed.")
+            else:
+                restore_config(conn, original_config)
+                print("\nRollback complete. Device restored to pre-change state.")
+                sys.exit(2)
 
-        # Display results
-        passed = sum(1 for a in audit_results['audits'].values() if a.get('status') == 'PASS')
-        total = len(audit_results['audits'])
-        logger.info(f"\nAudit Summary: {passed}/{total} services PASS")
-
-        for service, result in audit_results['audits'].items():
-            status_symbol = '✓' if result.get('status') == 'PASS' else '✗'
-            logger.info(f"{status_symbol} {service.upper()}: {result.get('status')}")
-
-        # Save results if output file specified
-        if args.output:
-            with open(args.output, 'w') as f:
-                json.dump(audit_results, f, indent=2)
-            logger.info(f"Results saved to {args.output}")
-
-        sys.exit(0 if passed == total else 1)
-
-    except Exception as e:
-        logger.error(f"Audit failed: {e}")
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.device)
+        sys.exit(1)
+    except NetmikoTimeoutException:
+        log.error("Connection timed out to %s", args.device)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nInterrupted — manual rollback may be required.")
+        sys.exit(130)
+    except Exception as exc:
+        log.error("Unexpected error: %s", exc)
         sys.exit(1)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-```
