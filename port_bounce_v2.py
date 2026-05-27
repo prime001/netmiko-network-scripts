@@ -1,198 +1,229 @@
 ```python
-#!/usr/bin/env python3
 """
-Configuration Backup and Change Tracker
+interface_error_recovery.py - Detect and remediate interfaces with incrementing error counters.
 
-Backs up device running configuration to timestamped files and detects changes
-between snapshots. Useful for compliance auditing and change management.
+Purpose:
+    Connects to a Cisco IOS/IOS-XE device, inspects interface error counters
+    (CRC, input errors, output errors, runts, giants), and performs a controlled
+    shutdown/no-shutdown on interfaces whose error counts exceed a configurable
+    threshold. Pre/post counter snapshots confirm whether the bounce resolved
+    the condition.
 
 Usage:
-    python config_backup_tracker.py --host 192.168.1.1 --device-type cisco_ios \
-        --username admin --password secret --backup-dir ./backups
+    python interface_error_recovery.py -d 192.168.1.1 -u admin -p secret
+    python interface_error_recovery.py -d 192.168.1.1 -u admin -p secret \
+        --interface GigabitEthernet0/1 --threshold 100 --dry-run
 
 Prerequisites:
-    - netmiko installed
-    - Network device SSH/telnet access
-    - Backup directory must exist or be creatable
-
-Features:
-    - Backs up running configuration with timestamp
-    - Auto-detects device type if not specified
-    - Compares with previous backup and shows changes
-    - Generates historical backup files for audit trail
+    pip install netmiko
+    Device must allow SSH and have enable access if needed.
 """
 
 import argparse
 import logging
+import re
 import sys
-from datetime import datetime
-from pathlib import Path
-from difflib import unified_diff
+import time
+from dataclasses import dataclass, field
+from typing import Optional
 
 from netmiko import ConnectHandler
-from netmiko.ssh_dispatcher import SSHDetect
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+ERROR_PATTERN = re.compile(
+    r"(\S+)\s+is\s+(?:up|down).*?\n"
+    r".*?(\d+)\s+input errors.*?\n"
+    r".*?(\d+)\s+CRC.*?\n"
+    r".*?(\d+)\s+output errors",
+    re.DOTALL,
+)
+
+COUNTER_RE = re.compile(
+    r"(\d+) input errors.*?(\d+) CRC.*?(\d+) output errors.*?(\d+) runts.*?(\d+) giants",
+    re.DOTALL,
+)
 
 
-def setup_logging(verbose=False):
-    """Configure logging with appropriate level."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        level=level
-    )
-    return logging.getLogger(__name__)
+@dataclass
+class InterfaceCounters:
+    name: str
+    input_errors: int = 0
+    crc: int = 0
+    output_errors: int = 0
+    runts: int = 0
+    giants: int = 0
+
+    def total_errors(self) -> int:
+        return self.input_errors + self.crc + self.output_errors + self.runts + self.giants
 
 
-def detect_device_type(host, username, password, secret=None):
-    """Auto-detect device type using netmiko's SSHDetect."""
-    try:
-        device = {
-            'device_type': 'autodetect',
-            'host': host,
-            'username': username,
-            'password': password,
-            'secret': secret,
-            'timeout': 10,
-        }
-        guesser = SSHDetect(**device)
-        best_match = guesser.autodetect()
-        return best_match
-    except Exception as e:
-        logging.error(f"Device type detection failed: {e}")
+def parse_counters(interface: str, output: str) -> Optional[InterfaceCounters]:
+    m = COUNTER_RE.search(output)
+    if not m:
         return None
-
-
-def backup_device_config(host, device_type, username, password, secret=None):
-    """Connect to device and retrieve running configuration."""
-    try:
-        device = {
-            'device_type': device_type,
-            'host': host,
-            'username': username,
-            'password': password,
-            'secret': secret,
-            'timeout': 30,
-        }
-
-        logging.info(f"Connecting to {host} ({device_type})")
-        net_connect = ConnectHandler(**device)
-
-        config = net_connect.send_command('show running-config')
-        net_connect.disconnect()
-
-        logging.info(f"Successfully retrieved config from {host}")
-        return config
-
-    except Exception as e:
-        logging.error(f"Failed to backup config from {host}: {e}")
-        return None
-
-
-def get_previous_backup(backup_dir, hostname):
-    """Find the most recent previous backup for this host."""
-    try:
-        pattern = f"{hostname}_*.txt"
-        backups = sorted(Path(backup_dir).glob(pattern))
-        return backups[-1] if backups else None
-    except Exception as e:
-        logging.warning(f"Could not find previous backup: {e}")
-        return None
-
-
-def compare_configs(old_config, new_config):
-    """Generate unified diff between old and new configurations."""
-    old_lines = old_config.splitlines(keepends=True) if old_config else []
-    new_lines = new_config.splitlines(keepends=True)
-
-    diff = list(unified_diff(
-        old_lines,
-        new_lines,
-        fromfile='Previous',
-        tofile='Current',
-        lineterm=''
-    ))
-
-    added = sum(1 for line in diff if line.startswith('+') and not line.startswith('+++'))
-    removed = sum(1 for line in diff if line.startswith('-') and not line.startswith('---'))
-
-    return ''.join(diff), added, removed
-
-
-def save_backup(backup_dir, hostname, config):
-    """Save configuration backup with timestamp."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{hostname}_{timestamp}.txt"
-    filepath = Path(backup_dir) / filename
-
-    try:
-        filepath.write_text(config)
-        logging.info(f"Backup saved to {filepath}")
-        return filepath
-    except Exception as e:
-        logging.error(f"Failed to save backup: {e}")
-        return None
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description='Backup device configuration and track changes'
-    )
-    parser.add_argument('--host', required=True, help='Device IP address or hostname')
-    parser.add_argument('--device-type', help='Device type (auto-detect if not specified)')
-    parser.add_argument('--username', required=True, help='SSH username')
-    parser.add_argument('--password', required=True, help='SSH password')
-    parser.add_argument('--secret', help='Enable secret/password')
-    parser.add_argument('--backup-dir', default='./backups', help='Backup directory')
-    parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
-    parser.add_argument('--compare-only', action='store_true',
-                       help='Only show comparison with previous backup')
-
-    args = parser.parse_args()
-    logger = setup_logging(args.verbose)
-
-    try:
-        Path(args.backup_dir).mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        logger.error(f"Failed to create backup directory: {e}")
-        sys.exit(1)
-
-    device_type = args.device_type
-    if not device_type:
-        logger.info("Detecting device type...")
-        device_type = detect_device_type(
-            args.host, args.username, args.password, args.secret
-        )
-        if not device_type:
-            sys.exit(1)
-        logger.info(f"Detected device type: {device_type}")
-
-    hostname = args.host.replace('.', '_')
-
-    current_config = backup_device_config(
-        args.host, device_type, args.username, args.password, args.secret
+    return InterfaceCounters(
+        name=interface,
+        input_errors=int(m.group(1)),
+        crc=int(m.group(2)),
+        output_errors=int(m.group(3)),
+        runts=int(m.group(4)),
+        giants=int(m.group(5)),
     )
 
-    if not current_config:
-        sys.exit(1)
 
-    prev_backup_path = get_previous_backup(args.backup_dir, hostname)
-    if prev_backup_path:
-        logger.info(f"Found previous backup: {prev_backup_path.name}")
-        previous_config = prev_backup_path.read_text()
+def get_interface_list(conn) -> list[str]:
+    output = conn.send_command("show interfaces | include ^[A-Za-z]")
+    interfaces = []
+    for line in output.splitlines():
+        m = re.match(r"^(\S+)\s+is\s+(?:up|down)", line)
+        if m:
+            interfaces.append(m.group(1))
+    return interfaces
 
-        diff, added, removed = compare_configs(previous_config, current_config)
-        if diff:
-            logger.warning(f"Configuration changes detected: +{added} -{removed} lines")
-            print("\n" + diff)
+
+def get_counters(conn, interface: str) -> Optional[InterfaceCounters]:
+    output = conn.send_command(f"show interfaces {interface}")
+    return parse_counters(interface, output)
+
+
+def bounce_interface(conn, interface: str, wait: int = 5, dry_run: bool = False) -> bool:
+    if dry_run:
+        log.info("[DRY-RUN] Would bounce %s (shutdown + %ds + no shutdown)", interface, wait)
+        return True
+    log.info("Bouncing %s ...", interface)
+    try:
+        conn.send_config_set([f"interface {interface}", "shutdown"])
+        time.sleep(wait)
+        conn.send_config_set([f"interface {interface}", "no shutdown"])
+        time.sleep(3)
+        return True
+    except Exception as exc:
+        log.error("Failed to bounce %s: %s", interface, exc)
+        return False
+
+
+def check_interface_up(conn, interface: str) -> bool:
+    output = conn.send_command(f"show interfaces {interface} | include line protocol")
+    return "up" in output.lower()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Recover interfaces with high error counters")
+    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", required=True, help="SSH password")
+    p.add_argument("--secret", default="", help="Enable secret (if needed)")
+    p.add_argument("--device-type", default="cisco_ios", help="Netmiko device type")
+    p.add_argument("--interface", help="Target a single interface (default: all)")
+    p.add_argument(
+        "--threshold",
+        type=int,
+        default=50,
+        help="Total error count that triggers a bounce (default: 50)",
+    )
+    p.add_argument(
+        "--wait",
+        type=int,
+        default=5,
+        help="Seconds to hold interface down during bounce (default: 5)",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report errors and bounce candidates without making changes",
+    )
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+
+    device_params = {
+        "device_type": args.device_type,
+        "host": args.device,
+        "username": args.username,
+        "password": args.password,
+        "secret": args.secret,
+        "timeout": 30,
+    }
+
+    log.info("Connecting to %s ...", args.device)
+    try:
+        conn = ConnectHandler(**device_params)
+        if args.secret:
+            conn.enable()
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s", args.device)
+        return 1
+    except NetmikoTimeoutException:
+        log.error("Connection timed out for %s", args.device)
+        return 1
+
+    interfaces = [args.interface] if args.interface else get_interface_list(conn)
+    log.info("Checking %d interface(s) against threshold=%d", len(interfaces), args.threshold)
+
+    candidates = []
+    for iface in interfaces:
+        counters = get_counters(conn, iface)
+        if counters is None:
+            log.warning("Could not parse counters for %s", iface)
+            continue
+        total = counters.total_errors()
+        if total >= args.threshold:
+            log.warning(
+                "%s: %d total errors (input=%d crc=%d output=%d runts=%d giants=%d)",
+                iface, total, counters.input_errors, counters.crc,
+                counters.output_errors, counters.runts, counters.giants,
+            )
+            candidates.append(counters)
+
+    if not candidates:
+        log.info("No interfaces exceeded threshold. Nothing to do.")
+        conn.disconnect()
+        return 0
+
+    log.info("%d interface(s) queued for bounce", len(candidates))
+    exit_code = 0
+
+    for pre in candidates:
+        bounced = bounce_interface(conn, pre.name, wait=args.wait, dry_run=args.dry_run)
+        if not bounced:
+            exit_code = 1
+            continue
+
+        if args.dry_run:
+            continue
+
+        if not check_interface_up(conn, pre.name):
+            log.error("%s did not come back up after bounce", pre.name)
+            exit_code = 1
+            continue
+
+        post = get_counters(conn, pre.name)
+        if post is None:
+            log.warning("Could not read post-bounce counters for %s", pre.name)
+            continue
+
+        delta = post.total_errors() - pre.total_errors()
+        if delta == 0:
+            log.info("%s: counters cleared — bounce resolved the condition", pre.name)
         else:
-            logger.info("No configuration changes detected")
+            log.warning(
+                "%s: %d new errors accumulated post-bounce (may need further investigation)",
+                pre.name, delta,
+            )
 
-    if not args.compare_only:
-        save_backup(args.backup_dir, hostname, current_config)
-
-    logger.info("Backup operation completed successfully")
+    conn.disconnect()
+    return exit_code
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())
 ```
