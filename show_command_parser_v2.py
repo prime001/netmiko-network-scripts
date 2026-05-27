@@ -1,29 +1,20 @@
-The script is standalone and doesn't need to live in this repo. Here it is:
+interface_error_monitor.py - Monitor interface error counters on network devices.
 
-```python
-"""
-mac_tracker.py - MAC Address Table Lookup and Export
-
-Connects to one or more network switches via Netmiko and retrieves the MAC
-address table, with optional filtering by MAC or VLAN. Useful for locating
-which switchport a device is connected to without manual CLI hopping.
+Purpose:
+    Connects to a network device via SSH, collects interface error counters
+    (input errors, CRC, output drops, giants, runts), and flags interfaces
+    exceeding a configurable threshold. Useful for triaging link quality
+    degradation before errors escalate into outages.
 
 Usage:
-    # Locate a specific MAC across one switch
-    python mac_tracker.py -H 192.168.1.1 -u admin -p secret --mac 00:1a:2b:3c:4d:5e
-
-    # Dump full MAC table to CSV
-    python mac_tracker.py -H 192.168.1.1 -u admin -p secret --output macs.csv
-
-    # Search across multiple switches (comma-separated)
-    python mac_tracker.py -H 10.0.0.1,10.0.0.2 -u admin -p secret --mac aabb.cc11.2233
-
-    # Filter by VLAN
-    python mac_tracker.py -H 192.168.1.1 -u admin -p secret --vlan 100
+    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret
+    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret \
+        --device-type cisco_ios --threshold 100 --output errors.csv --all
 
 Prerequisites:
     pip install netmiko
-    Supported device types: cisco_ios, cisco_xe, cisco_nxos
+    SSH access with privilege to run 'show interfaces' (or vendor equivalent).
+    Tested against Cisco IOS / IOS-XE. Arista EOS uses the same counter format.
 """
 
 import argparse
@@ -31,179 +22,181 @@ import csv
 import logging
 import re
 import sys
+from dataclasses import dataclass
+from typing import List, Optional
 
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko.exceptions import AuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
+_IFACE_HEADER = re.compile(
+    r"^(\S+) is (up|down|administratively down)", re.MULTILINE
+)
+_COUNTERS = {
+    "input_errors": re.compile(r"(\d+) input errors"),
+    "crc": re.compile(r"(\d+) CRC"),
+    "output_drops": re.compile(r"(\d+) output drops"),
+    "giants": re.compile(r"(\d+) giants"),
+    "runts": re.compile(r"(\d+) runts"),
+}
 
-def normalize_mac(mac: str) -> str:
-    digits = re.sub(r"[^0-9a-fA-F]", "", mac)
-    if len(digits) != 12:
-        raise ValueError(f"Invalid MAC address: {mac!r}")
-    return ":".join(digits[i:i + 2] for i in range(0, 12, 2)).lower()
+
+@dataclass
+class InterfaceErrors:
+    name: str
+    input_errors: int = 0
+    crc: int = 0
+    output_drops: int = 0
+    giants: int = 0
+    runts: int = 0
+
+    def total(self) -> int:
+        return self.input_errors + self.crc + self.output_drops + self.giants + self.runts
 
 
-def parse_mac_table(output: str, device_type: str) -> list[dict]:
-    entries = []
-
-    if "nxos" in device_type:
-        # NX-OS: VLAN  MAC Address  Type  age  Secure  NTFY  Ports
-        pattern = re.compile(
-            r"^\*?\s*(\d+)\s+([0-9a-f.]+)\s+(\w+)\s+\S+\s+\S+\s+\S+\s+(\S+)",
-            re.MULTILINE,
-        )
-    else:
-        # IOS/IOS-XE: Vlan  Mac Address  Type  Ports
-        pattern = re.compile(
-            r"^\s*(\d+)\s+([0-9a-f.]+)\s+(\w+)\s+(\S+)",
-            re.MULTILINE,
-        )
-
-    for match in pattern.finditer(output):
-        vlan, mac_raw, entry_type, port = match.groups()
-        try:
-            mac_normalized = normalize_mac(mac_raw)
-        except ValueError:
+def parse_show_interfaces(raw: str) -> List[InterfaceErrors]:
+    results: List[InterfaceErrors] = []
+    blocks = re.split(r"(?=^\S+\s+is\s+(?:up|down|administratively down))", raw, flags=re.MULTILINE)
+    for block in blocks:
+        m = _IFACE_HEADER.match(block.strip())
+        if not m:
             continue
-        entries.append({
-            "vlan": vlan,
-            "mac": mac_normalized,
-            "type": entry_type,
-            "port": port,
-        })
+        iface = InterfaceErrors(name=m.group(1))
+        for attr, pattern in _COUNTERS.items():
+            hit = pattern.search(block)
+            if hit:
+                setattr(iface, attr, int(hit.group(1)))
+        results.append(iface)
+    return results
 
-    return entries
 
-
-def query_device(
+def fetch_interface_data(
     host: str,
     username: str,
     password: str,
     device_type: str,
     port: int,
-    use_keys: bool,
-) -> list[dict]:
-    connection_params = {
+    enable_secret: Optional[str],
+) -> List[InterfaceErrors]:
+    params = {
         "device_type": device_type,
         "host": host,
         "username": username,
         "password": password,
         "port": port,
     }
-    if use_keys:
-        connection_params["use_keys"] = True
+    if enable_secret:
+        params["secret"] = enable_secret
 
-    log.info("Connecting to %s (%s)", host, device_type)
-    try:
-        with ConnectHandler(**connection_params) as conn:
-            output = conn.send_command("show mac address-table")
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s", host)
-        return []
-    except NetmikoTimeoutException:
-        log.error("Connection timed out for %s", host)
-        return []
-    except Exception as exc:
-        log.error("Failed to connect to %s: %s", host, exc)
-        return []
+    log.info("Connecting to %s (%s:%d)", host, device_type, port)
+    with ConnectHandler(**params) as conn:
+        if enable_secret:
+            conn.enable()
+        log.info("Sending 'show interfaces'")
+        raw = conn.send_command("show interfaces", read_timeout=60)
 
-    entries = parse_mac_table(output, device_type)
-    log.info("Retrieved %d MAC entries from %s", len(entries), host)
-    for entry in entries:
-        entry["host"] = host
-    return entries
+    interfaces = parse_show_interfaces(raw)
+    log.info("Parsed %d interfaces", len(interfaces))
+    return interfaces
 
 
-def write_csv(entries: list[dict], path: str) -> None:
-    fields = ["host", "vlan", "mac", "type", "port"]
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(entries)
-    log.info("Wrote %d entries to %s", len(entries), path)
-
-
-def print_table(entries: list[dict]) -> None:
-    header = f"{'HOST':<18} {'VLAN':<6} {'MAC':<18} {'TYPE':<10} {'PORT'}"
-    print(header)
-    print("-" * 70)
-    for e in entries:
+def print_table(interfaces: List[InterfaceErrors]) -> None:
+    col = f"{'Interface':<35} {'Input Err':>10} {'CRC':>6} {'Out Drops':>10} {'Giants':>7} {'Runts':>6} {'Total':>7}"
+    print(col)
+    print("-" * len(col))
+    for iface in sorted(interfaces, key=lambda x: x.total(), reverse=True):
+        flag = " !" if iface.total() > 0 else ""
         print(
-            f"{e['host']:<18} {e['vlan']:<6} {e['mac']:<18} "
-            f"{e['type']:<10} {e['port']}"
+            f"{iface.name:<35} {iface.input_errors:>10} {iface.crc:>6} "
+            f"{iface.output_drops:>10} {iface.giants:>7} {iface.runts:>6} "
+            f"{iface.total():>7}{flag}"
         )
-    print(f"\nTotal: {len(entries)} entries")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="MAC address table lookup and export via Netmiko"
+def write_csv(interfaces: List[InterfaceErrors], path: str) -> None:
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["interface", "input_errors", "crc", "output_drops", "giants", "runts", "total"])
+        for i in interfaces:
+            writer.writerow([i.name, i.input_errors, i.crc, i.output_drops, i.giants, i.runts, i.total()])
+    log.info("Results written to %s", path)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Report interface error counters from a network device.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("-H", "--hosts", required=True,
-                        help="Comma-separated device IPs or hostnames")
-    parser.add_argument("-u", "--username", required=True)
-    parser.add_argument("-p", "--password", required=True)
-    parser.add_argument(
-        "-t", "--device-type", default="cisco_ios",
-        choices=["cisco_ios", "cisco_xe", "cisco_nxos"],
-        help="Netmiko device type (default: cisco_ios)",
+    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", required=True, help="SSH password")
+    p.add_argument("--device-type", default="cisco_ios", help="Netmiko device type (default: cisco_ios)")
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("--enable-secret", default=None, help="Enable/privileged mode password")
+    p.add_argument(
+        "--threshold",
+        type=int,
+        default=1,
+        help="Only report interfaces with total errors >= this value (default: 1)",
     )
-    parser.add_argument("--port", type=int, default=22)
-    parser.add_argument("--use-keys", action="store_true",
-                        help="Use SSH key authentication instead of password")
-    parser.add_argument("--mac", help="Search for a specific MAC address")
-    parser.add_argument("--vlan", help="Filter results to a specific VLAN ID")
-    parser.add_argument("--output", help="Write results to a CSV file")
-    parser.add_argument("--debug", action="store_true")
-    args = parser.parse_args()
+    p.add_argument("--all", dest="show_all", action="store_true", help="Show all interfaces including zero-error")
+    p.add_argument("--output", default=None, metavar="FILE", help="Write results to CSV file")
+    p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
-    all_entries: list[dict] = []
-
-    for host in hosts:
-        entries = query_device(
-            host=host,
+    try:
+        interfaces = fetch_interface_data(
+            host=args.device,
             username=args.username,
             password=args.password,
             device_type=args.device_type,
             port=args.port,
-            use_keys=args.use_keys,
+            enable_secret=args.enable_secret,
         )
-        all_entries.extend(entries)
+    except AuthenticationException:
+        log.error("Authentication failed for %s", args.device)
+        return 1
+    except NetmikoTimeoutException:
+        log.error("Connection to %s timed out", args.device)
+        return 1
+    except Exception as exc:
+        log.error("Connection failed: %s", exc)
+        return 1
 
-    if not all_entries:
-        log.error("No MAC entries retrieved from any device")
-        sys.exit(1)
+    if not interfaces:
+        log.warning("No interfaces parsed — verify device type or SSH output")
+        return 1
 
-    if args.mac:
-        try:
-            search_mac = normalize_mac(args.mac)
-        except ValueError as exc:
-            log.error("%s", exc)
-            sys.exit(1)
-        all_entries = [e for e in all_entries if e["mac"] == search_mac]
-        if not all_entries:
-            print(f"MAC {search_mac} not found on any queried device.")
-            sys.exit(0)
+    visible = interfaces if args.show_all else [i for i in interfaces if i.total() >= args.threshold]
 
-    if args.vlan:
-        all_entries = [e for e in all_entries if e["vlan"] == args.vlan]
+    if not visible:
+        print(f"No interfaces with error count >= {args.threshold}")
+    else:
+        print_table(visible)
 
     if args.output:
-        write_csv(all_entries, args.output)
-    else:
-        print_table(all_entries)
+        write_csv(visible, args.output)
+
+    flagged = [i for i in interfaces if i.total() >= args.threshold]
+    if flagged:
+        log.warning("%d interface(s) exceed threshold of %d errors", len(flagged), args.threshold)
+        return 2
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
-```
+    sys.exit(main())
