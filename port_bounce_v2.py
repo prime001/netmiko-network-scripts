@@ -1,229 +1,266 @@
-```python
-"""
-interface_error_recovery.py - Detect and remediate interfaces with incrementing error counters.
+interface_errors.py - Interface Error Counter Monitor
 
 Purpose:
-    Connects to a Cisco IOS/IOS-XE device, inspects interface error counters
-    (CRC, input errors, output errors, runts, giants), and performs a controlled
-    shutdown/no-shutdown on interfaces whose error counts exceed a configurable
-    threshold. Pre/post counter snapshots confirm whether the bounce resolved
-    the condition.
+    Connects to a network device via SSH and collects interface error statistics
+    (input errors, output errors, CRC, drops). Flags interfaces whose counters
+    exceed configurable thresholds. Useful for NOC triage, pre/post-maintenance
+    baseline checks, and catching degraded links before they cause outages.
 
 Usage:
-    python interface_error_recovery.py -d 192.168.1.1 -u admin -p secret
-    python interface_error_recovery.py -d 192.168.1.1 -u admin -p secret \
-        --interface GigabitEthernet0/1 --threshold 100 --dry-run
+    python interface_errors.py -H 192.168.1.1 -u admin -p secret
+    python interface_errors.py -H 10.0.0.1 -u admin -p secret \
+        --device-type cisco_nxos --crc-threshold 5 --error-threshold 50
+    python interface_errors.py -H 10.0.0.1 -u admin -p secret --all --json
 
 Prerequisites:
     pip install netmiko
-    Device must allow SSH and have enable access if needed.
+    Supported device types: cisco_ios, cisco_nxos, cisco_xr, juniper_junos
+
+Exit codes:
+    0 — connected successfully, no interfaces exceeded thresholds
+    1 — connection or auth failure
+    2 — one or more interfaces exceeded thresholds (useful for scripting)
 """
 
 import argparse
+import json
 import logging
 import re
 import sys
-import time
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
+from typing import List
 
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
-
-ERROR_PATTERN = re.compile(
-    r"(\S+)\s+is\s+(?:up|down).*?\n"
-    r".*?(\d+)\s+input errors.*?\n"
-    r".*?(\d+)\s+CRC.*?\n"
-    r".*?(\d+)\s+output errors",
-    re.DOTALL,
-)
-
-COUNTER_RE = re.compile(
-    r"(\d+) input errors.*?(\d+) CRC.*?(\d+) output errors.*?(\d+) runts.*?(\d+) giants",
-    re.DOTALL,
-)
 
 
 @dataclass
-class InterfaceCounters:
+class InterfaceStats:
     name: str
+    status: str = "unknown"
     input_errors: int = 0
-    crc: int = 0
     output_errors: int = 0
-    runts: int = 0
-    giants: int = 0
-
-    def total_errors(self) -> int:
-        return self.input_errors + self.crc + self.output_errors + self.runts + self.giants
+    crc: int = 0
+    input_drops: int = 0
+    output_drops: int = 0
 
 
-def parse_counters(interface: str, output: str) -> Optional[InterfaceCounters]:
-    m = COUNTER_RE.search(output)
-    if not m:
-        return None
-    return InterfaceCounters(
-        name=interface,
-        input_errors=int(m.group(1)),
-        crc=int(m.group(2)),
-        output_errors=int(m.group(3)),
-        runts=int(m.group(4)),
-        giants=int(m.group(5)),
-    )
+def _parse_cisco(output: str) -> List[InterfaceStats]:
+    interfaces: List[InterfaceStats] = []
+    current = None
 
-
-def get_interface_list(conn) -> list[str]:
-    output = conn.send_command("show interfaces | include ^[A-Za-z]")
-    interfaces = []
     for line in output.splitlines():
-        m = re.match(r"^(\S+)\s+is\s+(?:up|down)", line)
+        m = re.match(r'^(\S+) is (\S.*)', line)
         if m:
-            interfaces.append(m.group(1))
+            if current:
+                interfaces.append(current)
+            current = InterfaceStats(name=m.group(1), status=m.group(2).rstrip(','))
+            continue
+
+        if current is None:
+            continue
+
+        m = re.search(r'(\d+) input errors', line)
+        if m:
+            current.input_errors = int(m.group(1))
+        m = re.search(r'(\d+) CRC', line)
+        if m:
+            current.crc = int(m.group(1))
+        m = re.search(r'(\d+) output errors', line)
+        if m:
+            current.output_errors = int(m.group(1))
+        m = re.search(r'(\d+) input drops', line)
+        if m:
+            current.input_drops = int(m.group(1))
+        m = re.search(r'(\d+) output drops', line)
+        if m:
+            current.output_drops = int(m.group(1))
+        m = re.search(r'(\d+) no buffer', line)
+        if m:
+            current.input_drops += int(m.group(1))
+
+    if current:
+        interfaces.append(current)
     return interfaces
 
 
-def get_counters(conn, interface: str) -> Optional[InterfaceCounters]:
-    output = conn.send_command(f"show interfaces {interface}")
-    return parse_counters(interface, output)
+def _parse_juniper(output: str) -> List[InterfaceStats]:
+    interfaces: List[InterfaceStats] = []
+    current = None
+
+    for line in output.splitlines():
+        m = re.match(r'^Physical interface:\s+(\S+)', line)
+        if m:
+            if current:
+                interfaces.append(current)
+            current = InterfaceStats(name=m.group(1))
+            continue
+
+        if current is None:
+            continue
+
+        m = re.search(r'Input errors:\s+(\d+)', line)
+        if m:
+            current.input_errors = int(m.group(1))
+        m = re.search(r'Output errors:\s+(\d+)', line)
+        if m:
+            current.output_errors = int(m.group(1))
+        m = re.search(r'Frame-check-sequence errors:\s+(\d+)', line)
+        if m:
+            current.crc = int(m.group(1))
+        m = re.search(r'Input drops:\s+(\d+)', line)
+        if m:
+            current.input_drops = int(m.group(1))
+        m = re.search(r'Output drops:\s+(\d+)', line)
+        if m:
+            current.output_drops = int(m.group(1))
+
+    if current:
+        interfaces.append(current)
+    return interfaces
 
 
-def bounce_interface(conn, interface: str, wait: int = 5, dry_run: bool = False) -> bool:
-    if dry_run:
-        log.info("[DRY-RUN] Would bounce %s (shutdown + %ds + no shutdown)", interface, wait)
-        return True
-    log.info("Bouncing %s ...", interface)
-    try:
-        conn.send_config_set([f"interface {interface}", "shutdown"])
-        time.sleep(wait)
-        conn.send_config_set([f"interface {interface}", "no shutdown"])
-        time.sleep(3)
-        return True
-    except Exception as exc:
-        log.error("Failed to bounce %s: %s", interface, exc)
-        return False
+def collect_stats(conn, device_type: str) -> List[InterfaceStats]:
+    if "juniper" in device_type:
+        output = conn.send_command("show interfaces extensive", read_timeout=90)
+        return _parse_juniper(output)
+    output = conn.send_command("show interfaces", read_timeout=60)
+    return _parse_cisco(output)
 
 
-def check_interface_up(conn, interface: str) -> bool:
-    output = conn.send_command(f"show interfaces {interface} | include line protocol")
-    return "up" in output.lower()
+def apply_thresholds(
+    stats: List[InterfaceStats],
+    error_threshold: int,
+    crc_threshold: int,
+    drop_threshold: int,
+) -> List[InterfaceStats]:
+    return [
+        s for s in stats
+        if (
+            s.input_errors > error_threshold
+            or s.output_errors > error_threshold
+            or s.crc > crc_threshold
+            or (s.input_drops + s.output_drops) > drop_threshold
+        )
+    ]
+
+
+def print_table(host: str, flagged: List[InterfaceStats], total: int) -> None:
+    print(f"\n{'='*70}")
+    print(f"Interface Error Report  |  {host}")
+    print(f"Interfaces checked: {total}  |  Flagged: {len(flagged)}")
+    print(f"{'='*70}")
+    if not flagged:
+        print("No interfaces exceeded thresholds.\n")
+        return
+    header = f"{'Interface':<32} {'In Err':>8} {'Out Err':>8} {'CRC':>8} {'Drops':>8}"
+    print(header)
+    print("-" * 70)
+    for s in flagged:
+        drops = s.input_drops + s.output_drops
+        print(f"{s.name[:32]:<32} {s.input_errors:>8} {s.output_errors:>8} {s.crc:>8} {drops:>8}")
+    print()
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Recover interfaces with high error counters")
-    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    p = argparse.ArgumentParser(description="Report interface error counters via netmiko.")
+    p.add_argument("-H", "--host", required=True, help="Device IP or hostname")
     p.add_argument("-u", "--username", required=True, help="SSH username")
     p.add_argument("-p", "--password", required=True, help="SSH password")
-    p.add_argument("--secret", default="", help="Enable secret (if needed)")
-    p.add_argument("--device-type", default="cisco_ios", help="Netmiko device type")
-    p.add_argument("--interface", help="Target a single interface (default: all)")
+    p.add_argument("--secret", default="", help="Enable secret for privileged mode")
     p.add_argument(
-        "--threshold",
-        type=int,
-        default=50,
-        help="Total error count that triggers a bounce (default: 50)",
+        "--device-type", default="cisco_ios",
+        choices=["cisco_ios", "cisco_nxos", "cisco_xr", "juniper_junos"],
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument(
+        "--error-threshold", type=int, default=0,
+        help="Flag when input/output errors exceed N (default: 0)",
     )
     p.add_argument(
-        "--wait",
-        type=int,
-        default=5,
-        help="Seconds to hold interface down during bounce (default: 5)",
+        "--crc-threshold", type=int, default=0,
+        help="Flag when CRC errors exceed N (default: 0)",
     )
     p.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Report errors and bounce candidates without making changes",
+        "--drop-threshold", type=int, default=0,
+        help="Flag when total drops exceed N (default: 0)",
     )
+    p.add_argument("--all", action="store_true", help="Show all interfaces, not just flagged")
+    p.add_argument("--json", action="store_true", help="Output results as JSON")
+    p.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     return p
 
 
 def main() -> int:
     args = build_parser().parse_args()
 
-    device_params = {
+    if args.verbose:
+        log.setLevel(logging.DEBUG)
+
+    device = {
         "device_type": args.device_type,
-        "host": args.device,
+        "host": args.host,
         "username": args.username,
         "password": args.password,
+        "port": args.port,
         "secret": args.secret,
-        "timeout": 30,
     }
 
-    log.info("Connecting to %s ...", args.device)
+    log.info("Connecting to %s (%s)", args.host, args.device_type)
     try:
-        conn = ConnectHandler(**device_params)
-        if args.secret:
-            conn.enable()
+        with ConnectHandler(**device) as conn:
+            if args.secret:
+                conn.enable()
+            stats = collect_stats(conn, args.device_type)
     except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s", args.device)
+        log.error("Authentication failed for %s", args.host)
         return 1
     except NetmikoTimeoutException:
-        log.error("Connection timed out for %s", args.device)
+        log.error("Connection timed out to %s", args.host)
+        return 1
+    except Exception as exc:
+        log.error("Unexpected error connecting to %s: %s", args.host, exc)
         return 1
 
-    interfaces = [args.interface] if args.interface else get_interface_list(conn)
-    log.info("Checking %d interface(s) against threshold=%d", len(interfaces), args.threshold)
+    log.info("Collected stats for %d interfaces", len(stats))
 
-    candidates = []
-    for iface in interfaces:
-        counters = get_counters(conn, iface)
-        if counters is None:
-            log.warning("Could not parse counters for %s", iface)
-            continue
-        total = counters.total_errors()
-        if total >= args.threshold:
-            log.warning(
-                "%s: %d total errors (input=%d crc=%d output=%d runts=%d giants=%d)",
-                iface, total, counters.input_errors, counters.crc,
-                counters.output_errors, counters.runts, counters.giants,
-            )
-            candidates.append(counters)
+    if args.all:
+        display = stats
+    else:
+        display = apply_thresholds(
+            stats,
+            error_threshold=args.error_threshold,
+            crc_threshold=args.crc_threshold,
+            drop_threshold=args.drop_threshold,
+        )
 
-    if not candidates:
-        log.info("No interfaces exceeded threshold. Nothing to do.")
-        conn.disconnect()
-        return 0
+    if args.json:
+        print(json.dumps({
+            "host": args.host,
+            "total_interfaces": len(stats),
+            "flagged_count": len(display),
+            "interfaces": [
+                {
+                    "name": s.name,
+                    "status": s.status,
+                    "input_errors": s.input_errors,
+                    "output_errors": s.output_errors,
+                    "crc": s.crc,
+                    "input_drops": s.input_drops,
+                    "output_drops": s.output_drops,
+                }
+                for s in display
+            ],
+        }, indent=2))
+    else:
+        print_table(args.host, display, len(stats))
 
-    log.info("%d interface(s) queued for bounce", len(candidates))
-    exit_code = 0
-
-    for pre in candidates:
-        bounced = bounce_interface(conn, pre.name, wait=args.wait, dry_run=args.dry_run)
-        if not bounced:
-            exit_code = 1
-            continue
-
-        if args.dry_run:
-            continue
-
-        if not check_interface_up(conn, pre.name):
-            log.error("%s did not come back up after bounce", pre.name)
-            exit_code = 1
-            continue
-
-        post = get_counters(conn, pre.name)
-        if post is None:
-            log.warning("Could not read post-bounce counters for %s", pre.name)
-            continue
-
-        delta = post.total_errors() - pre.total_errors()
-        if delta == 0:
-            log.info("%s: counters cleared — bounce resolved the condition", pre.name)
-        else:
-            log.warning(
-                "%s: %d new errors accumulated post-bounce (may need further investigation)",
-                pre.name, delta,
-            )
-
-    conn.disconnect()
-    return exit_code
+    return 2 if display and not args.all else 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
-```
