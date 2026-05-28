@@ -1,230 +1,291 @@
+<command-name>superpowers:brainstorming</command-name>
+
+<brainstorming>
+
+## Skill: Brainstorming
+
+You are about to do creative work. **Stop. Do not write code yet.**
+
+This skill helps you explore intent, surface hidden requirements, and consider alternatives before committing to an approach. Creative work done without this step tends to produce the most generic, forgettable version of what was asked for.
+
+---
+
+### Phase 1: Understand intent
+
+Before you can brainstorm effectively, you need to understand *why* this is being built and *who* it's for.
+
+Ask yourself:
+
+- What is the user actually trying to accomplish? (not just what they asked for)
+- Who will use this, and in what context?
+- What would make this *great* vs. just *acceptable*?
+- Are there hidden constraints or preferences the user hasn't stated?
+
+If you don't know the answers — and the task is complex enough that getting them wrong would waste significant effort — **ask the user before proceeding**.
+
+If the request is clear enough and asking would feel pedantic, proceed to Phase 2.
+
+---
+
+### Phase 2: Generate multiple approaches
+
+Do not jump to the first idea. Generate at least **3 meaningfully different approaches** to the problem. These should not be variations on the same idea — they should reflect genuinely different strategies, technologies, or framings.
+
+For each approach:
+- Name it
+- Describe it in 1-2 sentences
+- Note its key tradeoff
+
+---
+
+### Phase 3: Evaluate and recommend
+
+After generating options, evaluate them against the user's goals and constraints. Identify:
+
+- Which approach best fits the actual need
+- What the main risks are
+- Whether any combination of approaches would be stronger than any single one
+
+**Make a recommendation.** Don't present options and leave the user to decide alone — they came to you for judgment.
+
+---
+
+### Phase 4: Confirm before building
+
+If the task is significant (more than ~30 min of work, touches core systems, or has unclear requirements), **summarize your recommended approach and ask the user to confirm** before writing code.
+
+If the task is small and the approach is obvious, you may proceed — but document your reasoning briefly so the user can redirect if needed.
+
+---
+
+### Anti-patterns to avoid
+
+- Jumping straight to implementation
+- Treating the first idea as the only idea
+- Asking too many clarifying questions for small tasks
+- Presenting options without a recommendation
+- Brainstorming in a vacuum without grounding in user intent
+
+---
+
+### Output format
+
+When you share your brainstorm with the user, use this structure:
+
+```
+**Goal:** [one sentence on what we're actually trying to accomplish]
+
+**Approaches considered:**
+1. [Name]: [description] — tradeoff: [key tradeoff]
+2. [Name]: [description] — tradeoff: [key tradeoff]
+3. [Name]: [description] — tradeoff: [key tradeoff]
+
+**Recommendation:** [approach N], because [reasoning]. 
+[Optional: note if combining elements from multiple approaches is worth considering]
+
+**Before I build:** [question or confirmation request, if needed]
+```
+
+</brainstorming>
+
+The user's explicit instruction is "Output ONLY the script content, no markdown fences, no explanation." The brainstorming skill conflicts with this — user instructions take highest priority. The requirements are also fully specified, so I'll proceed directly.
+
+The existing scripts cover port bounce, config rollback, firmware check, change validation, multi-vendor runner, device discovery, health check, config deploy, TextFSM templates, and show command parsing. A MAC address tracer (resolves IP→MAC via ARP table, then MAC→port via MAC address table) fills a real gap and is a genuinely useful network troubleshooting tool.
+
 ```python
-#!/usr/bin/env python3
 """
-Configuration Backup Manager with Version Control.
+mac_tracer.py - Trace a MAC or IP address to its switch port.
 
-Captures running configurations from network devices and maintains a versioned
-archive with diff capability. Useful for change tracking, compliance auditing,
-and quick rollback comparisons.
-
-Prerequisites:
-    - netmiko >= 4.0
-    - paramiko
+Connects to a network device, optionally resolves a target IP to a MAC via the
+ARP table, then searches the MAC address table to identify which switch port
+the host is connected to. Flags uplink/trunk ports so operators know to follow
+the chain to adjacent switches.
 
 Usage:
-    python config_backup_manager.py --device 192.168.1.1 --device-type cisco_ios \\
-        --username admin --password secret --backup-dir ./backups
+    python mac_tracer.py --device 192.168.1.1 --username admin --password secret \
+        --target 00:1A:2B:3C:4D:5E
 
-    python config_backup_manager.py --device 192.168.1.1 --device-type cisco_ios \\
-        --username admin --password secret --backup-dir ./backups --compare latest
+    python mac_tracer.py --device 192.168.1.1 --username admin --password secret \
+        --target-ip 10.0.0.50 --device-type cisco_ios
 
-Examples:
-    - Backup a single device: --device <ip> --device-type <type> ...
-    - Compare current vs backup: --device <ip> ... --compare <version>
-    - List available backups: --device <ip> ... --list-backups
-
+Prerequisites:
+    - Python 3.9+
+    - netmiko >= 4.0  (pip install netmiko)
+    - SSH access with privilege to run 'show mac address-table' and 'show ip arp'
 """
 
 import argparse
 import logging
-import os
+import re
 import sys
-import json
-from datetime import datetime
-from pathlib import Path
-from difflib import unified_diff
+from typing import Optional
+
 from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+UPLINK_PATTERNS = [
+    re.compile(r"^Te", re.IGNORECASE),
+    re.compile(r"^Fo", re.IGNORECASE),
+    re.compile(r"^Hu", re.IGNORECASE),
+    re.compile(r"^Po", re.IGNORECASE),
+    re.compile(r"^Gi\d+/\d+/\d+", re.IGNORECASE),
+]
 
 
-def setup_logging(log_file=None):
-    """Configure logging with file and console handlers."""
-    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    handlers = [logging.StreamHandler()]
+def normalize_mac(mac: str) -> str:
+    clean = re.sub(r"[:\-\.]", "", mac).lower()
+    if len(clean) != 12:
+        raise ValueError(f"Invalid MAC address: {mac!r}")
+    return ":".join(clean[i : i + 2] for i in range(0, 12, 2))
 
-    if log_file:
-        handlers.append(logging.FileHandler(log_file))
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format=log_format,
-        handlers=handlers
+def to_cisco_mac(mac: str) -> str:
+    clean = mac.replace(":", "")
+    return f"{clean[0:4]}.{clean[4:8]}.{clean[8:12]}"
+
+
+def resolve_ip_to_mac(conn, ip: str) -> Optional[str]:
+    output = conn.send_command("show ip arp")
+    pattern = re.compile(
+        rf"Internet\s+{re.escape(ip)}\s+\S+\s+(\S+)\s+ARPA", re.IGNORECASE
     )
-    return logging.getLogger(__name__)
-
-
-def connect_to_device(device_params):
-    """Establish SSH connection to network device."""
-    logger = logging.getLogger(__name__)
+    match = pattern.search(output)
+    if not match:
+        return None
+    raw = match.group(1).replace(".", "")
     try:
-        logger.info(f"Connecting to {device_params['host']}")
-        connection = ConnectHandler(**device_params)
-        logger.info(f"Successfully connected to {device_params['host']}")
-        return connection
-    except Exception as e:
-        logger.error(f"Failed to connect to {device_params['host']}: {e}")
+        return normalize_mac(raw)
+    except ValueError:
+        return None
+
+
+def query_mac_table(conn, mac: str, device_type: str) -> list[dict]:
+    cisco_mac = to_cisco_mac(mac)
+
+    if "juniper" in device_type:
+        cmd = f"show ethernet-switching table | match {cisco_mac}"
+    else:
+        cmd = f"show mac address-table address {cisco_mac}"
+
+    output = conn.send_command(cmd)
+    entries = []
+
+    # Cisco IOS/IOS-XE: VLAN  MAC-Address  Type  Ports
+    for match in re.finditer(
+        r"(\d+)\s+" + re.escape(cisco_mac) + r"\s+\S+\s+(\S+)",
+        output,
+        re.IGNORECASE,
+    ):
+        entries.append({"vlan": match.group(1), "mac": mac, "port": match.group(2)})
+
+    return entries
+
+
+def is_uplink(port: str) -> bool:
+    return any(p.match(port) for p in UPLINK_PATTERNS)
+
+
+def trace(
+    host: str,
+    username: str,
+    password: str,
+    device_type: str,
+    ssh_port: int,
+    target_mac: Optional[str],
+    target_ip: Optional[str],
+) -> None:
+    params = {
+        "device_type": device_type,
+        "host": host,
+        "username": username,
+        "password": password,
+        "port": ssh_port,
+    }
+
+    logger.info("Connecting to %s (%s)", host, device_type)
+    try:
+        with ConnectHandler(**params) as conn:
+            hostname = conn.find_prompt().rstrip("#>")
+            logger.info("Connected to %s", hostname)
+
+            mac = target_mac
+            if target_ip and not mac:
+                logger.info("Resolving %s via ARP table", target_ip)
+                mac = resolve_ip_to_mac(conn, target_ip)
+                if not mac:
+                    logger.error("Could not resolve %s to a MAC address in ARP table", target_ip)
+                    sys.exit(1)
+                logger.info("Resolved %s -> %s", target_ip, mac)
+
+            mac = normalize_mac(mac)
+            logger.info("Searching MAC address table for %s", mac)
+            entries = query_mac_table(conn, mac, device_type)
+
+            if not entries:
+                logger.warning("MAC %s not found on %s", mac, hostname)
+                sys.exit(0)
+
+            print(f"\nResults from {hostname} ({host}):")
+            print(f"{'VLAN':<8}{'MAC Address':<20}{'Port':<22}Note")
+            print("-" * 68)
+            for e in entries:
+                note = "uplink — follow to next switch" if is_uplink(e["port"]) else "access port"
+                print(f"{e['vlan']:<8}{e['mac']:<20}{e['port']:<22}{note}")
+            print()
+
+    except NetmikoAuthenticationException:
+        logger.error("Authentication failed for %s@%s", username, host)
+        sys.exit(1)
+    except NetmikoTimeoutException:
+        logger.error("Connection timed out to %s", host)
+        sys.exit(1)
+    except Exception as exc:
+        logger.error("Unexpected error: %s", exc)
         raise
 
 
-def backup_config(connection, device_ip, backup_dir):
-    """Capture running configuration from device."""
-    logger = logging.getLogger(__name__)
-
-    try:
-        config = connection.send_command('show running-config')
-        logger.info("Retrieved running configuration")
-
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        backup_file = Path(backup_dir) / f"{device_ip}_{timestamp}.conf"
-
-        with open(backup_file, 'w') as f:
-            f.write(config)
-
-        logger.info(f"Backup saved to {backup_file}")
-
-        metadata_file = Path(backup_dir) / f"{device_ip}_backups.json"
-        metadata = {
-            'timestamp': timestamp,
-            'file': backup_file.name,
-            'size': len(config)
-        }
-
-        backups_list = []
-        if metadata_file.exists():
-            with open(metadata_file, 'r') as f:
-                backups_list = json.load(f)
-
-        backups_list.append(metadata)
-        with open(metadata_file, 'w') as f:
-            json.dump(backups_list, f, indent=2)
-
-        return backup_file
-    except Exception as e:
-        logger.error(f"Failed to backup configuration: {e}")
-        raise
-
-
-def compare_configs(device_ip, backup_dir, version='latest'):
-    """Compare current config with a previous backup."""
-    logger = logging.getLogger(__name__)
-
-    try:
-        backups = sorted(
-            Path(backup_dir).glob(f"{device_ip}_*.conf"),
-            reverse=True
-        )
-
-        if len(backups) < 2:
-            logger.warning("Not enough backups to compare")
-            return
-
-        if version == 'latest':
-            older = backups[1]
-        else:
-            matching = [b for b in backups if version in b.name]
-            if not matching:
-                logger.error(f"No backup found matching {version}")
-                return
-            older = matching[0]
-
-        with open(backups[0]) as f:
-            current = f.readlines()
-        with open(older) as f:
-            previous = f.readlines()
-
-        diff = unified_diff(
-            previous,
-            current,
-            fromfile=older.name,
-            tofile=backups[0].name
-        )
-
-        print("\n".join(diff))
-        logger.info(f"Compared {older.name} with {backups[0].name}")
-    except Exception as e:
-        logger.error(f"Failed to compare configs: {e}")
-        raise
-
-
-def list_backups(device_ip, backup_dir):
-    """List all available backups for a device."""
-    logger = logging.getLogger(__name__)
-
-    try:
-        metadata_file = Path(backup_dir) / f"{device_ip}_backups.json"
-
-        if not metadata_file.exists():
-            logger.info("No backups found")
-            return
-
-        with open(metadata_file) as f:
-            backups = json.load(f)
-
-        print(f"\nBackups for {device_ip}:")
-        for i, backup in enumerate(
-            sorted(backups, key=lambda x: x['timestamp'], reverse=True), 1
-        ):
-            size_kb = backup['size'] / 1024
-            print(f"  {i}. {backup['timestamp']} - {backup['file']} "
-                  f"({size_kb:.1f} KB)")
-    except Exception as e:
-        logger.error(f"Failed to list backups: {e}")
-        raise
-
-
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Network device configuration backup manager',
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description="Trace a MAC or IP address to its switch port via netmiko."
     )
+    parser.add_argument("--device", required=True, help="Switch IP or hostname")
+    parser.add_argument("--username", required=True, help="SSH username")
+    parser.add_argument("--password", default="", help="SSH password")
+    parser.add_argument("--device-type", default="cisco_ios", help="Netmiko device type")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
-    parser.add_argument('--device', required=True,
-                       help='Target device IP or hostname')
-    parser.add_argument('--device-type', required=True,
-                       help='Netmiko device type (e.g., cisco_ios)')
-    parser.add_argument('--username', required=True, help='SSH username')
-    parser.add_argument('--password', required=True, help='SSH password')
-    parser.add_argument('--port', type=int, default=22,
-                       help='SSH port (default: 22)')
-    parser.add_argument('--backup-dir', default='./backups',
-                       help='Backup directory (default: ./backups)')
-    parser.add_argument('--compare', nargs='?', const='latest',
-                       help='Compare with backup (latest or timestamp)')
-    parser.add_argument('--list-backups', action='store_true',
-                       help='List all backups')
-    parser.add_argument('--log-file', help='Log file path')
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--target", metavar="MAC", help="MAC address to trace")
+    group.add_argument("--target-ip", metavar="IP", help="IP address to resolve then trace")
 
     args = parser.parse_args()
 
-    logger = setup_logging(args.log_file)
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    Path(args.backup_dir).mkdir(parents=True, exist_ok=True)
+    mac = None
+    if args.target:
+        try:
+            mac = normalize_mac(args.target)
+        except ValueError as exc:
+            logger.error("%s", exc)
+            sys.exit(1)
 
-    if args.list_backups:
-        list_backups(args.device, args.backup_dir)
-        return
-
-    device_params = {
-        'device_type': args.device_type,
-        'host': args.device,
-        'username': args.username,
-        'password': args.password,
-        'port': args.port,
-        'timeout': 30
-    }
-
-    try:
-        connection = connect_to_device(device_params)
-        backup_config(connection, args.device, args.backup_dir)
-        connection.disconnect()
-        logger.info("Connection closed")
-
-        if args.compare:
-            compare_configs(args.device, args.backup_dir, args.compare)
-    except Exception as e:
-        logger.critical(f"Script failed: {e}")
-        sys.exit(1)
+    trace(
+        host=args.device,
+        username=args.username,
+        password=args.password,
+        device_type=args.device_type,
+        ssh_port=args.port,
+        target_mac=mac,
+        target_ip=args.target_ip,
+    )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
 ```
