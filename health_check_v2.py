@@ -1,183 +1,224 @@
-```python
-"""
-interface_error_monitor.py - Delta-based interface error rate monitor.
+BGP Neighbor State Monitor
 
-Connects to a network device, samples 'show interfaces' counters twice across a
-configurable interval, computes per-interface error rates, and flags any that
-exceed the specified threshold.  Exits non-zero when flagged interfaces exist so
-the script integrates cleanly with Nagios/NRPE, cron, or CI pipelines.
+Connects to a router and checks all BGP neighbor states, reporting peer uptime,
+prefix counts, and AS numbers. Exits non-zero if any peer is not Established,
+making it suitable for use in monitoring pipelines, cron jobs, and alerting hooks.
 
 Usage:
-    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret
-    python interface_error_monitor.py -d 10.0.0.1 -u admin -p secret \\
-        --device-type cisco_ios --interval 30 --threshold 0.5 --json
+    python bgp_neighbor_monitor.py -d 192.168.1.1 -u admin -p secret
+    python bgp_neighbor_monitor.py -d 10.0.0.1 -u admin \
+        --device-type cisco_xe --min-prefixes 100 --expected-peers 4
+
+Exit codes:
+    0 — all peers Established, prefix counts above threshold
+    1 — one or more peers degraded or threshold violation
+    2 — connection / auth failure
 
 Prerequisites:
     pip install netmiko
-    SSH access to the device with credentials that allow 'show interfaces'.
 """
 
 import argparse
-import json
+import getpass
 import logging
 import re
 import sys
-import time
-from typing import Dict
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
+
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
-def parse_show_interfaces(output: str) -> Dict[str, Dict[str, int]]:
-    counters: Dict[str, Dict[str, int]] = {}
-    current = None
-
-    for line in output.splitlines():
-        m = re.match(r'^(\S+)\s+is\s+(?:up|down|administratively down)', line, re.IGNORECASE)
-        if m:
-            current = m.group(1)
-            counters[current] = {"input_errors": 0, "output_errors": 0, "crc": 0, "drops": 0}
-            continue
-
-        if current is None:
-            continue
-
-        m = re.search(r'(\d+) input errors', line)
-        if m:
-            counters[current]["input_errors"] = int(m.group(1))
-
-        m = re.search(r'(\d+) CRC', line)
-        if m:
-            counters[current]["crc"] = int(m.group(1))
-
-        m = re.search(r'(\d+) output errors', line)
-        if m:
-            counters[current]["output_errors"] = int(m.group(1))
-
-        m = re.search(r'(\d+)\s+(?:input drops|drops)', line)
-        if m:
-            counters[current]["drops"] = int(m.group(1))
-
-    return counters
+@dataclass
+class BgpPeer:
+    neighbor: str
+    as_number: str
+    state: str
+    uptime: str
+    prefixes_received: int
 
 
-def compute_deltas(
-    t1: Dict[str, Dict[str, int]],
-    t2: Dict[str, Dict[str, int]],
-    interval: float,
-    threshold: float,
-) -> list:
-    rows = []
-    for intf, c2 in t2.items():
-        if intf not in t1:
-            continue
-        c1 = t1[intf]
-        d_in = max(0, c2["input_errors"] - c1["input_errors"])
-        d_out = max(0, c2["output_errors"] - c1["output_errors"])
-        d_crc = max(0, c2["crc"] - c1["crc"])
-        d_drop = max(0, c2["drops"] - c1["drops"])
-        rate = (d_in + d_out + d_crc) / interval if interval > 0 else 0.0
-        rows.append({
-            "interface": intf,
-            "input_errors_delta": d_in,
-            "output_errors_delta": d_out,
-            "crc_delta": d_crc,
-            "drops_delta": d_drop,
-            "errors_per_sec": round(rate, 4),
-            "flagged": rate > threshold,
-        })
-    return sorted(rows, key=lambda r: r["errors_per_sec"], reverse=True)
+def _parse_ios_style(output: str) -> List[BgpPeer]:
+    """Parse IOS / IOS-XE / IOS-XR BGP summary table."""
+    peers = []
+    pattern = re.compile(
+        r"^(\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]+)\s+"  # neighbor IP
+        r"\d+\s+"          # BGP version
+        r"(\d+)\s+"        # remote AS
+        r"\d+\s+"          # MsgRcvd
+        r"\d+\s+"          # MsgSent
+        r"\d+\s+"          # TblVer
+        r"\d+\s+"          # InQ
+        r"\d+\s+"          # OutQ
+        r"(\S+)\s+"        # Up/Down
+        r"(\S+)$",         # State or PfxRcd
+        re.MULTILINE,
+    )
+    for m in pattern.finditer(output):
+        neighbor, asn, uptime, state_or_pfx = m.groups()
+        try:
+            pfx = int(state_or_pfx)
+            state = "Established"
+        except ValueError:
+            pfx = 0
+            state = state_or_pfx
+        peers.append(BgpPeer(neighbor, asn, state, uptime, pfx))
+    return peers
 
 
-def build_args() -> argparse.Namespace:
+def _parse_eos_style(output: str) -> List[BgpPeer]:
+    """Parse Arista EOS BGP summary table."""
+    peers = []
+    pattern = re.compile(
+        r"^(\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]+)\s+"
+        r"(\d+)\s+"        # AS
+        r"\d+\s+\d+\s+"    # MsgRcvd / MsgSent
+        r"\S+\s+\S+\s+"    # InQ / OutQ
+        r"(\S+)\s+"        # Up/Down
+        r"(\w+)\s+"        # State
+        r"(\d+)",          # PfxRcd
+        re.MULTILINE,
+    )
+    for m in pattern.finditer(output):
+        neighbor, asn, uptime, state, pfx = m.groups()
+        peers.append(BgpPeer(neighbor, asn, state, uptime, int(pfx)))
+    return peers
+
+
+_COMMANDS = {
+    "cisco_ios": "show ip bgp summary",
+    "cisco_xe": "show ip bgp summary",
+    "cisco_xr": "show bgp ipv4 unicast summary",
+    "arista_eos": "show ip bgp summary",
+}
+
+_PARSERS = {
+    "cisco_ios": _parse_ios_style,
+    "cisco_xe": _parse_ios_style,
+    "cisco_xr": _parse_ios_style,
+    "arista_eos": _parse_eos_style,
+}
+
+
+def collect_bgp_state(
+    device_params: dict,
+    device_type: str,
+    min_prefixes: int,
+    expected_peers: Optional[int],
+    verbose: bool,
+) -> Tuple[List[BgpPeer], List[str]]:
+    command = _COMMANDS.get(device_type, "show ip bgp summary")
+    parser = _PARSERS.get(device_type, _parse_ios_style)
+
+    logger.info("Connecting to %s", device_params["host"])
+    with ConnectHandler(**device_params) as conn:
+        output = conn.send_command(command, read_timeout=30)
+
+    if verbose:
+        print(f"\n--- raw output ---\n{output}\n--- end raw ---\n")
+
+    peers = parser(output)
+    alerts: List[str] = []
+
+    if expected_peers is not None and len(peers) != expected_peers:
+        alerts.append(f"Expected {expected_peers} peers, found {len(peers)}")
+
+    for peer in peers:
+        if peer.state != "Established":
+            alerts.append(f"Peer {peer.neighbor} AS{peer.as_number} is {peer.state}")
+        elif peer.prefixes_received < min_prefixes:
+            alerts.append(
+                f"Peer {peer.neighbor} AS{peer.as_number}: "
+                f"{peer.prefixes_received} prefixes < minimum {min_prefixes}"
+            )
+
+    return peers, alerts
+
+
+def print_report(peers: List[BgpPeer], alerts: List[str], host: str) -> None:
+    established = sum(1 for p in peers if p.state == "Established")
+    status = "OK" if not alerts else "DEGRADED"
+
+    print(f"\nBGP Neighbors — {host}  [{status}]")
+    print(f"{'Neighbor':<22} {'AS':<8} {'State':<14} {'Uptime':<14} PfxRcd")
+    print("─" * 68)
+    for p in peers:
+        marker = "  " if p.state == "Established" else "! "
+        print(
+            f"{marker}{p.neighbor:<20} {p.as_number:<8} "
+            f"{p.state:<14} {p.uptime:<14} {p.prefixes_received}"
+        )
+    print(f"\n{established}/{len(peers)} peers Established")
+
+    if alerts:
+        print("\nAlerts:")
+        for alert in alerts:
+            print(f"  [!] {alert}")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Sample interface error counters twice and report delta rates."
+        description="Monitor BGP neighbor states and prefix counts via SSH."
     )
     p.add_argument("-d", "--device", required=True, help="Device hostname or IP")
     p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", required=True, help="SSH password")
-    p.add_argument("--device-type", default="cisco_ios",
-                   help="Netmiko device type (default: cisco_ios)")
-    p.add_argument("--interval", type=float, default=60.0,
-                   help="Seconds between samples (default: 60)")
-    p.add_argument("--threshold", type=float, default=1.0,
-                   help="Errors/sec that triggers a flag (default: 1.0)")
-    p.add_argument("--timeout", type=int, default=30,
-                   help="SSH timeout in seconds (default: 30)")
-    p.add_argument("--json", action="store_true", help="Emit JSON output")
-    p.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
-    return p.parse_args()
-
-
-def main() -> int:
-    args = build_args()
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING,
-        format="%(asctime)s %(levelname)s %(message)s",
+    p.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
+    p.add_argument(
+        "-t", "--device-type",
+        default="cisco_ios",
+        choices=list(_COMMANDS.keys()),
+        help="Netmiko device type (default: cisco_ios)",
     )
-
-    conn_params = {
-        "device_type": args.device_type,
-        "host": args.device,
-        "username": args.username,
-        "password": args.password,
-        "timeout": args.timeout,
-        "fast_cli": False,
-    }
-
-    try:
-        with ConnectHandler(**conn_params) as conn:
-            logger.debug("T1 sample on %s", args.device)
-            t1 = parse_show_interfaces(conn.send_command("show interfaces"))
-
-            if not args.json:
-                print(f"Sampling {len(t1)} interfaces — waiting {args.interval}s ...")
-
-            time.sleep(args.interval)
-
-            logger.debug("T2 sample on %s", args.device)
-            t2 = parse_show_interfaces(conn.send_command("show interfaces"))
-
-    except NetmikoAuthenticationException:
-        logger.error("Authentication failed for %s@%s", args.username, args.device)
-        return 2
-    except NetmikoTimeoutException:
-        logger.error("Connection timed out to %s", args.device)
-        return 3
-    except Exception as exc:
-        logger.error("Unexpected error: %s", exc)
-        return 1
-
-    results = compute_deltas(t1, t2, args.interval, args.threshold)
-    flagged_count = sum(1 for r in results if r["flagged"])
-
-    if args.json:
-        print(json.dumps({
-            "device": args.device,
-            "interval_sec": args.interval,
-            "threshold_errors_per_sec": args.threshold,
-            "interfaces": results,
-        }, indent=2))
-    else:
-        header = f"{'Interface':<32} {'InErr':>7} {'OutErr':>7} {'CRC':>6} {'Drops':>7} {'Err/s':>9}"
-        print(f"\n{header}")
-        print("-" * len(header))
-        for r in results:
-            flag = " !" if r["flagged"] else ""
-            print(
-                f"{r['interface']:<32} {r['input_errors_delta']:>7} "
-                f"{r['output_errors_delta']:>7} {r['crc_delta']:>6} "
-                f"{r['drops_delta']:>7} {r['errors_per_sec']:>9.4f}{flag}"
-            )
-        status = "FLAGGED" if flagged_count else "OK"
-        print(f"\n[{status}] {flagged_count} interface(s) exceeded {args.threshold} errors/sec")
-
-    return 1 if flagged_count else 0
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("--timeout", type=int, default=15, help="Connect timeout seconds")
+    p.add_argument(
+        "--min-prefixes", type=int, default=0, metavar="N",
+        help="Alert if an Established peer has fewer than N received prefixes",
+    )
+    p.add_argument(
+        "--expected-peers", type=int, metavar="N",
+        help="Alert if total peer count differs from N",
+    )
+    p.add_argument("--verbose", "-v", action="store_true", help="Print raw device output")
+    return p
 
 
 if __name__ == "__main__":
-    sys.exit(main())
-```
+    args = build_arg_parser().parse_args()
+    password = args.password or getpass.getpass(f"Password for {args.username}@{args.device}: ")
+
+    device_params = {
+        "device_type": args.device_type,
+        "host": args.device,
+        "username": args.username,
+        "password": password,
+        "port": args.port,
+        "timeout": args.timeout,
+    }
+
+    try:
+        peers, alerts = collect_bgp_state(
+            device_params=device_params,
+            device_type=args.device_type,
+            min_prefixes=args.min_prefixes,
+            expected_peers=args.expected_peers,
+            verbose=args.verbose,
+        )
+    except NetmikoAuthenticationException:
+        print(f"ERROR: Authentication failed for {args.username}@{args.device}", file=sys.stderr)
+        sys.exit(2)
+    except NetmikoTimeoutException:
+        print(f"ERROR: Connection timed out to {args.device}:{args.port}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        logger.debug("Exception detail", exc_info=True)
+        sys.exit(2)
+
+    print_report(peers, alerts, args.device)
+    sys.exit(1 if alerts else 0)
