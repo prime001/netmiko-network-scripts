@@ -1,231 +1,245 @@
-Writing the firmware audit script now, taking a batch inventory-based compliance angle to differentiate from existing single-device firmware_check variants.
+NTP Compliance Checker
 
-```python
-"""
-firmware_audit.py - Batch firmware compliance auditor for network devices.
-
-Reads a device inventory CSV, connects to each device via Netmiko, compares
-the running OS version against a per-device expected version, and produces a
-compliance report in both console table and JSON formats.
+Connects to network devices via SSH and verifies NTP synchronization status,
+checking stratum level, reference clock association, and clock offset against
+configurable compliance thresholds.
 
 Usage:
-    python firmware_audit.py --inventory devices.csv
-    python firmware_audit.py --inventory devices.csv --output report.json
-    python firmware_audit.py --inventory devices.csv --timeout 45 --fail-fast
-
-Inventory CSV columns (required):
-    hostname, device_type, ip, username, password, expected_version
-
-Optional CSV column:
-    port  (default 22)
-
-Supported device_types:
-    cisco_ios, cisco_xe, cisco_nxos, cisco_xr, arista_eos, juniper_junos
-
-Exit code 0 = all devices compliant; 1 = any non-compliant or unreachable.
+    python ntp_compliance.py -d 192.168.1.1 -u admin -p secret
+    python ntp_compliance.py -d 192.168.1.1 -u admin --device-type cisco_nxos
+    python ntp_compliance.py --host-file devices.txt -u admin --max-stratum 3
 
 Prerequisites:
     pip install netmiko
 """
 
 import argparse
-import csv
-import json
+import getpass
 import logging
 import re
 import sys
-from datetime import datetime
-from pathlib import Path
 
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetMikoAuthenticationException, NetMikoTimeoutException
+
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-_VERSION_CMD = {
-    "cisco_ios": "show version",
-    "cisco_xe": "show version",
-    "cisco_nxos": "show version",
-    "cisco_xr": "show version",
-    "arista_eos": "show version",
-    "juniper_junos": "show version",
-}
 
-_VERSION_RE = {
-    "cisco_ios": r"Version\s+([\d]+\.[\d]+\([^\)]+\)[A-Za-z0-9]*)",
-    "cisco_xe": r"Cisco IOS XE Software.*?Version\s+([\d\.]+[A-Za-z0-9\.]*)",
-    "cisco_nxos": r"NXOS:\s+version\s+(\S+)",
-    "cisco_xr": r"Cisco IOS XR Software.*?Version\s+([\d\.]+)",
-    "arista_eos": r"EOS version:\s+([\d\.]+[A-Za-z0-9]*)",
-    "juniper_junos": r"Junos:\s+([\d\.A-Za-z]+)",
+NTP_STATUS_COMMANDS = {
+    "cisco_ios": "show ntp status",
+    "cisco_xe": "show ntp status",
+    "cisco_nxos": "show ntp status",
+    "cisco_xr": "show ntp status",
+    "arista_eos": "show ntp status",
+    "juniper_junos": "show ntp status",
 }
 
 
-def _extract_version(output: str, device_type: str) -> str | None:
-    pattern = _VERSION_RE.get(device_type)
-    if not pattern:
-        return None
-    match = re.search(pattern, output, re.IGNORECASE | re.DOTALL)
-    return match.group(1) if match else None
+def parse_ntp_status(output: str) -> dict:
+    result = {"synced": False, "stratum": None, "reference": None, "offset_ms": None}
 
+    if re.search(r"clock is synchronized", output, re.IGNORECASE):
+        result["synced"] = True
+    elif re.search(r"synchronised\s+to", output, re.IGNORECASE):
+        result["synced"] = True
 
-def audit_device(row: dict) -> dict:
-    hostname = row["hostname"]
-    result = {
-        "hostname": hostname,
-        "ip": row["ip"],
-        "device_type": row["device_type"],
-        "expected_version": row["expected_version"],
-        "running_version": None,
-        "compliant": False,
-        "status": "error",
-        "error": None,
-    }
-    params = {
-        "device_type": row["device_type"],
-        "host": row["ip"],
-        "port": int(row.get("port", 22)),
-        "username": row["username"],
-        "password": row["password"],
-        "timeout": int(row.get("_timeout", 30)),
-        "fast_cli": False,
-    }
-    try:
-        log.info("Connecting to %s (%s)", hostname, row["ip"])
-        with ConnectHandler(**params) as conn:
-            cmd = _VERSION_CMD.get(row["device_type"], "show version")
-            output = conn.send_command(cmd)
-            version = _extract_version(output, row["device_type"])
-            result["running_version"] = version
-            if version is None:
-                result["status"] = "parse_error"
-                result["error"] = "Version string not found in output"
-                log.warning("%s: could not parse version", hostname)
-            elif version.strip() == row["expected_version"].strip():
-                result["compliant"] = True
-                result["status"] = "compliant"
-                log.info("%s: compliant (%s)", hostname, version)
-            else:
-                result["status"] = "non_compliant"
-                log.warning(
-                    "%s: NON-COMPLIANT running=%s expected=%s",
-                    hostname, version, row["expected_version"],
-                )
-    except NetmikoAuthenticationException as exc:
-        result["status"] = "auth_error"
-        result["error"] = str(exc)
-        log.error("%s: authentication failed", hostname)
-    except NetmikoTimeoutException as exc:
-        result["status"] = "timeout"
-        result["error"] = str(exc)
-        log.error("%s: connection timed out", hostname)
-    except Exception as exc:
-        result["status"] = "error"
-        result["error"] = str(exc)
-        log.error("%s: unexpected error: %s", hostname, exc)
+    match = re.search(r"stratum\s+(\d+)", output, re.IGNORECASE)
+    if match:
+        result["stratum"] = int(match.group(1))
+
+    match = re.search(
+        r"reference\s+(?:is\s+)?([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|[0-9A-Fa-f:.]+)",
+        output,
+        re.IGNORECASE,
+    )
+    if match:
+        result["reference"] = match.group(1)
+
+    match = re.search(r"offset\s+(?:is\s+)?([+-]?\d+\.?\d*)\s*ms", output, re.IGNORECASE)
+    if match:
+        result["offset_ms"] = float(match.group(1))
+
     return result
 
 
-def load_inventory(path: Path, timeout: int) -> list[dict]:
-    required = {"hostname", "device_type", "ip", "username", "password", "expected_version"}
-    rows = []
-    with open(path, newline="") as fh:
-        reader = csv.DictReader(fh)
-        missing = required - set(reader.fieldnames or [])
-        if missing:
-            raise ValueError(f"Inventory missing required columns: {missing}")
-        for row in reader:
-            row["_timeout"] = row.get("timeout", str(timeout))
-            rows.append(row)
-    return rows
+def check_device(
+    host: str,
+    username: str,
+    password: str,
+    device_type: str,
+    port: int,
+    max_stratum: int,
+    max_offset_ms: float,
+) -> dict:
+    result = {
+        "host": host,
+        "compliant": False,
+        "synced": False,
+        "stratum": None,
+        "offset_ms": None,
+        "reference": None,
+        "issues": [],
+        "error": None,
+    }
 
-
-def print_report(results: list[dict]) -> None:
-    col = {"hostname": 20, "status": 14, "expected_version": 22, "running_version": 22}
-    divider = "-" * sum(col.values())
-    print(f"\n{'Firmware Compliance Report':^{len(divider)}}")
-    print(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(divider)
-    header = (
-        f"{'HOSTNAME':<{col['hostname']}}"
-        f"{'STATUS':<{col['status']}}"
-        f"{'EXPECTED':<{col['expected_version']}}"
-        f"{'RUNNING':<{col['running_version']}}"
-    )
-    print(header)
-    print(divider)
-    for r in results:
-        running = r["running_version"] or f"({r['status']})"
-        print(
-            f"{r['hostname']:<{col['hostname']}}"
-            f"{r['status']:<{col['status']}}"
-            f"{r['expected_version']:<{col['expected_version']}}"
-            f"{running:<{col['running_version']}}"
-        )
-    print(divider)
-    compliant = sum(1 for r in results if r["compliant"])
-    print(f"Summary: {compliant}/{len(results)} devices compliant\n")
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Audit firmware compliance across a device inventory CSV.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__.split("Prerequisites:")[0].strip(),
-    )
-    p.add_argument("--inventory", required=True, metavar="FILE",
-                   help="CSV inventory file (see docstring for format)")
-    p.add_argument("--output", metavar="FILE",
-                   help="Write full JSON report to this file")
-    p.add_argument("--timeout", type=int, default=30, metavar="SEC",
-                   help="SSH connect timeout per device (default: 30)")
-    p.add_argument("--fail-fast", action="store_true",
-                   help="Stop after first non-compliant or unreachable device")
-    return p.parse_args()
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    inventory_path = Path(args.inventory)
-
-    if not inventory_path.exists():
-        log.error("Inventory file not found: %s", inventory_path)
-        sys.exit(1)
+    params = {
+        "device_type": device_type,
+        "host": host,
+        "username": username,
+        "password": password,
+        "port": port,
+    }
 
     try:
-        devices = load_inventory(inventory_path, args.timeout)
-    except ValueError as exc:
-        log.error("Invalid inventory: %s", exc)
+        logger.info("Connecting to %s", host)
+        with ConnectHandler(**params) as conn:
+            cmd = NTP_STATUS_COMMANDS.get(device_type, "show ntp status")
+            output = conn.send_command(cmd)
+            logger.debug("NTP status for %s:\n%s", host, output)
+
+        parsed = parse_ntp_status(output)
+        result.update(parsed)
+
+        issues = []
+        if not result["synced"]:
+            issues.append("not synchronized")
+        if result["stratum"] is not None and result["stratum"] > max_stratum:
+            issues.append(f"stratum {result['stratum']} exceeds max {max_stratum}")
+        if result["offset_ms"] is not None and abs(result["offset_ms"]) > max_offset_ms:
+            issues.append(
+                f"offset {result['offset_ms']}ms exceeds {max_offset_ms}ms limit"
+            )
+
+        result["issues"] = issues
+        result["compliant"] = result["synced"] and len(issues) == 0
+
+    except NetMikoAuthenticationException:
+        result["error"] = "authentication failed"
+        logger.error("Authentication failed for %s", host)
+    except NetMikoTimeoutException:
+        result["error"] = "connection timed out"
+        logger.error("Timeout connecting to %s", host)
+    except Exception as exc:
+        result["error"] = str(exc)
+        logger.error("Unexpected error on %s: %s", host, exc)
+
+    return result
+
+
+def print_report(results: list) -> None:
+    compliant_count = sum(1 for r in results if r["compliant"])
+    total = len(results)
+
+    print(f"\n{'=' * 60}")
+    print(f"NTP Compliance Report  {compliant_count}/{total} compliant")
+    print(f"{'=' * 60}")
+
+    for r in results:
+        tag = "PASS" if r["compliant"] else "FAIL"
+        print(f"\n[{tag}] {r['host']}")
+        if r["error"]:
+            print(f"  ERROR: {r['error']}")
+            continue
+        print(f"  Synchronized : {r['synced']}")
+        print(
+            f"  Stratum      : {r['stratum'] if r['stratum'] is not None else 'unknown'}"
+        )
+        print(f"  Reference    : {r['reference'] or 'unknown'}")
+        if r["offset_ms"] is not None:
+            print(f"  Offset       : {r['offset_ms']} ms")
+        else:
+            print("  Offset       : unknown")
+        for issue in r["issues"]:
+            print(f"  Issue        : {issue}")
+
+    print(f"\n{'=' * 60}\n")
+
+
+def load_hosts(host_file: str) -> list:
+    try:
+        with open(host_file) as fh:
+            return [
+                line.strip()
+                for line in fh
+                if line.strip() and not line.strip().startswith("#")
+            ]
+    except FileNotFoundError:
+        logger.error("Host file not found: %s", host_file)
         sys.exit(1)
 
-    if not devices:
-        log.error("No devices found in inventory.")
-        sys.exit(1)
 
-    results: list[dict] = []
-    for device in devices:
-        result = audit_device(device)
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Verify NTP synchronization compliance on network devices"
+    )
+
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("-d", "--device", help="Single device IP or hostname")
+    target.add_argument("--host-file", help="File containing one device per line")
+
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
+    parser.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        choices=list(NTP_STATUS_COMMANDS.keys()),
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument(
+        "--max-stratum",
+        type=int,
+        default=5,
+        help="Maximum acceptable NTP stratum (default: 5)",
+    )
+    parser.add_argument(
+        "--max-offset",
+        type=float,
+        default=100.0,
+        help="Maximum acceptable clock offset in milliseconds (default: 100.0)",
+    )
+    parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="Stop after the first non-compliant device",
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true", help="Enable debug logging"
+    )
+
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    password = args.password or getpass.getpass(f"Password for {args.username}: ")
+
+    hosts = [args.device] if args.device else load_hosts(args.host_file)
+
+    results = []
+    for host in hosts:
+        result = check_device(
+            host=host,
+            username=args.username,
+            password=password,
+            device_type=args.device_type,
+            port=args.port,
+            max_stratum=args.max_stratum,
+            max_offset_ms=args.max_offset,
+        )
         results.append(result)
         if args.fail_fast and not result["compliant"]:
-            log.warning("--fail-fast triggered on %s", device["hostname"])
+            logger.warning("Fail-fast triggered on %s", host)
             break
 
     print_report(results)
-
-    if args.output:
-        out_path = Path(args.output)
-        report = {
-            "generated_at": datetime.now().isoformat(),
-            "total": len(results),
-            "compliant": sum(1 for r in results if r["compliant"]),
-            "results": results,
-        }
-        out_path.write_text(json.dumps(report, indent=2))
-        log.info("JSON report written to %s", out_path)
-
     sys.exit(0 if all(r["compliant"] for r in results) else 1)
-```
+
+
+if __name__ == "__main__":
+    main()
