@@ -1,291 +1,181 @@
-<command-name>superpowers:brainstorming</command-name>
+vlan_audit.py - Multi-switch VLAN consistency auditor
 
-<brainstorming>
-
-## Skill: Brainstorming
-
-You are about to do creative work. **Stop. Do not write code yet.**
-
-This skill helps you explore intent, surface hidden requirements, and consider alternatives before committing to an approach. Creative work done without this step tends to produce the most generic, forgettable version of what was asked for.
-
----
-
-### Phase 1: Understand intent
-
-Before you can brainstorm effectively, you need to understand *why* this is being built and *who* it's for.
-
-Ask yourself:
-
-- What is the user actually trying to accomplish? (not just what they asked for)
-- Who will use this, and in what context?
-- What would make this *great* vs. just *acceptable*?
-- Are there hidden constraints or preferences the user hasn't stated?
-
-If you don't know the answers — and the task is complex enough that getting them wrong would waste significant effort — **ask the user before proceeding**.
-
-If the request is clear enough and asking would feel pedantic, proceed to Phase 2.
-
----
-
-### Phase 2: Generate multiple approaches
-
-Do not jump to the first idea. Generate at least **3 meaningfully different approaches** to the problem. These should not be variations on the same idea — they should reflect genuinely different strategies, technologies, or framings.
-
-For each approach:
-- Name it
-- Describe it in 1-2 sentences
-- Note its key tradeoff
-
----
-
-### Phase 3: Evaluate and recommend
-
-After generating options, evaluate them against the user's goals and constraints. Identify:
-
-- Which approach best fits the actual need
-- What the main risks are
-- Whether any combination of approaches would be stronger than any single one
-
-**Make a recommendation.** Don't present options and leave the user to decide alone — they came to you for judgment.
-
----
-
-### Phase 4: Confirm before building
-
-If the task is significant (more than ~30 min of work, touches core systems, or has unclear requirements), **summarize your recommended approach and ask the user to confirm** before writing code.
-
-If the task is small and the approach is obvious, you may proceed — but document your reasoning briefly so the user can redirect if needed.
-
----
-
-### Anti-patterns to avoid
-
-- Jumping straight to implementation
-- Treating the first idea as the only idea
-- Asking too many clarifying questions for small tasks
-- Presenting options without a recommendation
-- Brainstorming in a vacuum without grounding in user intent
-
----
-
-### Output format
-
-When you share your brainstorm with the user, use this structure:
-
-```
-**Goal:** [one sentence on what we're actually trying to accomplish]
-
-**Approaches considered:**
-1. [Name]: [description] — tradeoff: [key tradeoff]
-2. [Name]: [description] — tradeoff: [key tradeoff]
-3. [Name]: [description] — tradeoff: [key tradeoff]
-
-**Recommendation:** [approach N], because [reasoning]. 
-[Optional: note if combining elements from multiple approaches is worth considering]
-
-**Before I build:** [question or confirmation request, if needed]
-```
-
-</brainstorming>
-
-The user's explicit instruction is "Output ONLY the script content, no markdown fences, no explanation." The brainstorming skill conflicts with this — user instructions take highest priority. The requirements are also fully specified, so I'll proceed directly.
-
-The existing scripts cover port bounce, config rollback, firmware check, change validation, multi-vendor runner, device discovery, health check, config deploy, TextFSM templates, and show command parsing. A MAC address tracer (resolves IP→MAC via ARP table, then MAC→port via MAC address table) fills a real gap and is a genuinely useful network troubleshooting tool.
-
-```python
-"""
-mac_tracer.py - Trace a MAC or IP address to its switch port.
-
-Connects to a network device, optionally resolves a target IP to a MAC via the
-ARP table, then searches the MAC address table to identify which switch port
-the host is connected to. Flags uplink/trunk ports so operators know to follow
-the chain to adjacent switches.
+Purpose:
+    Connects to a set of Cisco IOS/NX-OS switches, pulls the active VLAN
+    database from each, and reports VLANs that are missing from one or more
+    switches. Useful for validating consistent VLAN provisioning across a
+    distribution or access layer before deploying trunk-dependent services.
 
 Usage:
-    python mac_tracer.py --device 192.168.1.1 --username admin --password secret \
-        --target 00:1A:2B:3C:4D:5E
-
-    python mac_tracer.py --device 192.168.1.1 --username admin --password secret \
-        --target-ip 10.0.0.50 --device-type cisco_ios
+    python vlan_audit.py --hosts 10.0.0.1 10.0.0.2 10.0.0.3 \
+        --username admin --password secret \
+        [--device-type cisco_ios] [--output vlan_report.json] [--verbose]
 
 Prerequisites:
-    - Python 3.9+
-    - netmiko >= 4.0  (pip install netmiko)
-    - SSH access with privilege to run 'show mac address-table' and 'show ip arp'
+    pip install netmiko
+    SSH access (port 22) to all target switches.
+    Read-only credentials are sufficient — no configuration commands are sent.
+
+Exit codes:
+    0  All reachable hosts have identical VLAN tables.
+    1  No hosts could be reached.
+    2  At least one VLAN inconsistency was found (check report for details).
 """
 
+from __future__ import annotations
+
 import argparse
+import json
 import logging
 import re
 import sys
+from getpass import getpass
 from typing import Optional
 
-from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
-
-logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-UPLINK_PATTERNS = [
-    re.compile(r"^Te", re.IGNORECASE),
-    re.compile(r"^Fo", re.IGNORECASE),
-    re.compile(r"^Hu", re.IGNORECASE),
-    re.compile(r"^Po", re.IGNORECASE),
-    re.compile(r"^Gi\d+/\d+/\d+", re.IGNORECASE),
-]
+from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
 
-def normalize_mac(mac: str) -> str:
-    clean = re.sub(r"[:\-\.]", "", mac).lower()
-    if len(clean) != 12:
-        raise ValueError(f"Invalid MAC address: {mac!r}")
-    return ":".join(clean[i : i + 2] for i in range(0, 12, 2))
+log = logging.getLogger(__name__)
 
 
-def to_cisco_mac(mac: str) -> str:
-    clean = mac.replace(":", "")
-    return f"{clean[0:4]}.{clean[4:8]}.{clean[8:12]}"
+def parse_vlan_table(raw_output: str) -> dict[str, str]:
+    """Return {vlan_id: vlan_name} from 'show vlan brief' output."""
+    vlans: dict[str, str] = {}
+    for line in raw_output.splitlines():
+        match = re.match(r"^(\d+)\s+(\S+)\s+active", line, re.IGNORECASE)
+        if match:
+            vlans[match.group(1)] = match.group(2)
+    return vlans
 
 
-def resolve_ip_to_mac(conn, ip: str) -> Optional[str]:
-    output = conn.send_command("show ip arp")
-    pattern = re.compile(
-        rf"Internet\s+{re.escape(ip)}\s+\S+\s+(\S+)\s+ARPA", re.IGNORECASE
-    )
-    match = pattern.search(output)
-    if not match:
-        return None
-    raw = match.group(1).replace(".", "")
-    try:
-        return normalize_mac(raw)
-    except ValueError:
-        return None
-
-
-def query_mac_table(conn, mac: str, device_type: str) -> list[dict]:
-    cisco_mac = to_cisco_mac(mac)
-
-    if "juniper" in device_type:
-        cmd = f"show ethernet-switching table | match {cisco_mac}"
-    else:
-        cmd = f"show mac address-table address {cisco_mac}"
-
-    output = conn.send_command(cmd)
-    entries = []
-
-    # Cisco IOS/IOS-XE: VLAN  MAC-Address  Type  Ports
-    for match in re.finditer(
-        r"(\d+)\s+" + re.escape(cisco_mac) + r"\s+\S+\s+(\S+)",
-        output,
-        re.IGNORECASE,
-    ):
-        entries.append({"vlan": match.group(1), "mac": mac, "port": match.group(2)})
-
-    return entries
-
-
-def is_uplink(port: str) -> bool:
-    return any(p.match(port) for p in UPLINK_PATTERNS)
-
-
-def trace(
-    host: str,
-    username: str,
-    password: str,
-    device_type: str,
-    ssh_port: int,
-    target_mac: Optional[str],
-    target_ip: Optional[str],
-) -> None:
-    params = {
-        "device_type": device_type,
+def collect_vlans(host: str, credentials: dict) -> Optional[dict[str, str]]:
+    """SSH to host and return its active VLAN table, or None on failure."""
+    device = {
         "host": host,
-        "username": username,
-        "password": password,
-        "port": ssh_port,
+        "username": credentials["username"],
+        "password": credentials["password"],
+        "device_type": credentials["device_type"],
+        "timeout": 30,
+    }
+    try:
+        log.info("Connecting to %s", host)
+        with ConnectHandler(**device) as conn:
+            output = conn.send_command("show vlan brief")
+        return parse_vlan_table(output)
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s", host)
+    except NetmikoTimeoutException:
+        log.error("Timeout connecting to %s", host)
+    except Exception as exc:
+        log.error("Unexpected error on %s: %s", host, exc)
+    return None
+
+
+def audit_vlans(host_vlans: dict[str, dict[str, str]]) -> dict:
+    """
+    Compare VLAN tables across hosts.
+
+    Returns a report dict with per-host VLAN counts, the union of all VLANs
+    seen, and a mapping of VLAN IDs to the list of hosts missing each one.
+    """
+    all_vlan_ids: set[str] = set()
+    for vlans in host_vlans.values():
+        all_vlan_ids.update(vlans.keys())
+
+    missing: dict[str, list[str]] = {}
+    for vlan_id in sorted(all_vlan_ids, key=int):
+        absent_on = [h for h, vlans in host_vlans.items() if vlan_id not in vlans]
+        if absent_on:
+            missing[vlan_id] = absent_on
+
+    return {
+        "hosts": {
+            host: {"vlan_count": len(vlans), "vlans": vlans}
+            for host, vlans in host_vlans.items()
+        },
+        "total_unique_vlans": len(all_vlan_ids),
+        "inconsistencies": missing,
+        "consistent": len(missing) == 0,
     }
 
-    logger.info("Connecting to %s (%s)", host, device_type)
-    try:
-        with ConnectHandler(**params) as conn:
-            hostname = conn.find_prompt().rstrip("#>")
-            logger.info("Connected to %s", hostname)
 
-            mac = target_mac
-            if target_ip and not mac:
-                logger.info("Resolving %s via ARP table", target_ip)
-                mac = resolve_ip_to_mac(conn, target_ip)
-                if not mac:
-                    logger.error("Could not resolve %s to a MAC address in ARP table", target_ip)
-                    sys.exit(1)
-                logger.info("Resolved %s -> %s", target_ip, mac)
-
-            mac = normalize_mac(mac)
-            logger.info("Searching MAC address table for %s", mac)
-            entries = query_mac_table(conn, mac, device_type)
-
-            if not entries:
-                logger.warning("MAC %s not found on %s", mac, hostname)
-                sys.exit(0)
-
-            print(f"\nResults from {hostname} ({host}):")
-            print(f"{'VLAN':<8}{'MAC Address':<20}{'Port':<22}Note")
-            print("-" * 68)
-            for e in entries:
-                note = "uplink — follow to next switch" if is_uplink(e["port"]) else "access port"
-                print(f"{e['vlan']:<8}{e['mac']:<20}{e['port']:<22}{note}")
-            print()
-
-    except NetmikoAuthenticationException:
-        logger.error("Authentication failed for %s@%s", username, host)
-        sys.exit(1)
-    except NetmikoTimeoutException:
-        logger.error("Connection timed out to %s", host)
-        sys.exit(1)
-    except Exception as exc:
-        logger.error("Unexpected error: %s", exc)
-        raise
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Trace a MAC or IP address to its switch port via netmiko."
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Audit VLAN consistency across multiple Cisco switches.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--device", required=True, help="Switch IP or hostname")
-    parser.add_argument("--username", required=True, help="SSH username")
-    parser.add_argument("--password", default="", help="SSH password")
-    parser.add_argument("--device-type", default="cisco_ios", help="Netmiko device type")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    p.add_argument(
+        "--hosts", nargs="+", required=True, metavar="IP",
+        help="Switch IP addresses or hostnames to audit",
+    )
+    p.add_argument("--username", required=True, help="SSH username")
+    p.add_argument("--password", help="SSH password (prompted if omitted)")
+    p.add_argument(
+        "--device-type", default="cisco_ios",
+        help="Netmiko device type",
+    )
+    p.add_argument(
+        "--output", metavar="FILE",
+        help="Write JSON report to FILE (prints to stdout if omitted)",
+    )
+    p.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    return p
 
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--target", metavar="MAC", help="MAC address to trace")
-    group.add_argument("--target-ip", metavar="IP", help="IP address to resolve then trace")
 
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
 
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    mac = None
-    if args.target:
-        try:
-            mac = normalize_mac(args.target)
-        except ValueError as exc:
-            logger.error("%s", exc)
-            sys.exit(1)
-
-    trace(
-        host=args.device,
-        username=args.username,
-        password=args.password,
-        device_type=args.device_type,
-        ssh_port=args.port,
-        target_mac=mac,
-        target_ip=args.target_ip,
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
     )
+
+    password = args.password or getpass(f"Password for {args.username}: ")
+    credentials = {
+        "username": args.username,
+        "password": password,
+        "device_type": args.device_type,
+    }
+
+    host_vlans: dict[str, dict[str, str]] = {}
+    failed: list[str] = []
+
+    for host in args.hosts:
+        result = collect_vlans(host, credentials)
+        if result is None:
+            failed.append(host)
+        else:
+            host_vlans[host] = result
+            log.info("%s: %d active VLANs", host, len(result))
+
+    if not host_vlans:
+        log.error("Could not reach any hosts; aborting.")
+        return 1
+
+    report = audit_vlans(host_vlans)
+    report["unreachable_hosts"] = failed
+
+    json_output = json.dumps(report, indent=2)
+
+    if args.output:
+        with open(args.output, "w") as fh:
+            fh.write(json_output)
+        log.info("Report written to %s", args.output)
+    else:
+        print(json_output)
+
+    if report["inconsistencies"]:
+        log.warning(
+            "%d VLAN inconsistencies found across %d hosts.",
+            len(report["inconsistencies"]),
+            len(host_vlans),
+        )
+        return 2
+
+    log.info("All %d hosts have consistent VLAN tables.", len(host_vlans))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
-```
+    sys.exit(main())
