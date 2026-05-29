@@ -1,111 +1,79 @@
-pre_post_snapshot.py - Pre/Post Change State Capture and Comparison
+The user wants the script content as text output only — no file write needed. Here it is:
 
-Purpose:
-    Captures key device state metrics (interface status, routing neighbor
-    counts, CPU/memory) to a JSON snapshot file before and after a
-    maintenance window, then diffs two snapshots to surface unintended
-    changes introduced during the change.
+```
+route_table_diff.py
+```
+
+"""
+route_table_diff.py - Pre/post change routing table snapshot and diff tool.
+
+Captures the IPv4 routing table from a Cisco IOS (or compatible) device,
+saves a timestamped JSON snapshot, and diffs it against a previously saved
+snapshot to surface routes added, removed, or changed during a maintenance
+window.
 
 Usage:
-    # Capture pre-change baseline
-    python pre_post_snapshot.py --host 192.168.1.1 --username admin \
-        --password secret --device-type cisco_ios --mode capture \
-        --snapshot-file pre_change.json
+    # Capture a pre-change baseline
+    python route_table_diff.py --host 10.0.0.1 --username admin --snapshot pre
 
-    # After the change, capture post-change state
-    python pre_post_snapshot.py --host 192.168.1.1 --username admin \
-        --password secret --device-type cisco_ios --mode capture \
-        --snapshot-file post_change.json
+    # Capture post-change and compare against the pre snapshot
+    python route_table_diff.py --host 10.0.0.1 --username admin \
+        --snapshot post --compare 10.0.0.1_pre_20240315_143000.json
 
-    # Compare the two snapshots
-    python pre_post_snapshot.py --mode diff \
-        --before pre_change.json --after post_change.json
+    # Diff two saved snapshots without connecting to a device
+    python route_table_diff.py --diff before.json after.json
 
 Prerequisites:
     pip install netmiko
-    Python 3.8+
-    SSH access to target device with enable privileges
 """
 
 import argparse
 import json
 import logging
+import re
 import sys
 from datetime import datetime
+from getpass import getpass
+from pathlib import Path
 
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s",
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-CAPTURE_COMMANDS = {
-    "cisco_ios": [
-        ("interfaces", "show interfaces"),
-        ("bgp_summary", "show ip bgp summary"),
-        ("ospf_neighbors", "show ip ospf neighbor"),
-        ("routes", "show ip route summary"),
-        ("cpu", "show processes cpu sorted | head 5"),
-        ("memory", "show processes memory sorted | head 5"),
-    ],
-    "cisco_xe": [
-        ("interfaces", "show interfaces"),
-        ("bgp_summary", "show ip bgp summary"),
-        ("ospf_neighbors", "show ip ospf neighbor"),
-        ("routes", "show ip route summary"),
-        ("cpu", "show processes cpu sorted | head 5"),
-        ("memory", "show processes memory sorted | head 5"),
-    ],
-    "cisco_nxos": [
-        ("interfaces", "show interface status"),
-        ("bgp_summary", "show bgp summary"),
-        ("ospf_neighbors", "show ip ospf neighbors"),
-        ("routes", "show ip route summary"),
-        ("cpu", "show system resources"),
-        ("memory", "show system resources"),
-    ],
-    "arista_eos": [
-        ("interfaces", "show interfaces status"),
-        ("bgp_summary", "show bgp summary"),
-        ("ospf_neighbors", "show ip ospf neighbor"),
-        ("routes", "show ip route summary"),
-        ("cpu", "show processes top once"),
-        ("memory", "show version | grep Memory"),
-    ],
-}
+# Matches IOS "show ip route" prefix lines, e.g.:
+#   C    10.0.0.0/24 is directly connected, GigabitEthernet0/0
+#   O    192.168.1.0/24 [110/2] via 10.0.0.2, 00:01:23, Gi0/0
+ROUTE_RE = re.compile(r"^([A-Z*][A-Z* ]*?)\s+([\d./]+)\s+", re.MULTILINE)
 
 
-def capture_snapshot(host, username, password, device_type, port=22):
+def parse_routes(output: str) -> dict:
+    """Extract {prefix: protocol} from 'show ip route' output."""
+    routes = {}
+    for match in ROUTE_RE.finditer(output):
+        protocol = match.group(1).strip()
+        prefix = match.group(2).strip()
+        routes[prefix] = protocol
+    return routes
+
+
+def fetch_routes(host: str, username: str, password: str, device_type: str) -> dict:
     device = {
         "device_type": device_type,
         "host": host,
         "username": username,
         "password": password,
-        "port": port,
     }
-
-    commands = CAPTURE_COMMANDS.get(device_type, CAPTURE_COMMANDS["cisco_ios"])
-    snapshot = {
-        "host": host,
-        "device_type": device_type,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "data": {},
-    }
-
+    log.info("Connecting to %s (%s)", host, device_type)
     try:
-        log.info("Connecting to %s", host)
         with ConnectHandler(**device) as conn:
-            conn.enable()
-            for key, cmd in commands:
-                log.info("Running: %s", cmd)
-                try:
-                    snapshot["data"][key] = conn.send_command(cmd)
-                except Exception as exc:
-                    log.warning("Command '%s' failed: %s", cmd, exc)
-                    snapshot["data"][key] = ""
+            output = conn.send_command("show ip route", read_timeout=30)
+        log.info("Retrieved routing table (%d lines)", output.count("\n"))
+        return parse_routes(output)
     except NetmikoAuthenticationException:
         log.error("Authentication failed for %s", host)
         sys.exit(1)
@@ -113,91 +81,122 @@ def capture_snapshot(host, username, password, device_type, port=22):
         log.error("Connection timed out for %s", host)
         sys.exit(1)
 
-    return snapshot
+
+def save_snapshot(host: str, label: str, routes: dict) -> Path:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = Path(f"{host}_{label}_{ts}.json")
+    payload = {"host": host, "label": label, "timestamp": ts, "routes": routes}
+    filename.write_text(json.dumps(payload, indent=2))
+    log.info("Snapshot saved: %s (%d routes)", filename, len(routes))
+    return filename
 
 
-def diff_snapshots(before_file, after_file):
-    with open(before_file) as f:
-        before = json.load(f)
-    with open(after_file) as f:
-        after = json.load(f)
-
-    print(f"\n{'=' * 60}")
-    print(f"Pre-change:  {before['timestamp']}  ({before['host']})")
-    print(f"Post-change: {after['timestamp']}  ({after['host']})")
-    print(f"{'=' * 60}\n")
-
-    changes_found = False
-    for key in before["data"]:
-        before_val = before["data"].get(key, "").strip()
-        after_val = after["data"].get(key, "").strip()
-        if before_val == after_val:
-            print(f"[OK]      {key}")
-            continue
-
-        changes_found = True
-        print(f"[CHANGED] {key}")
-        before_lines = set(before_val.splitlines())
-        after_lines = set(after_val.splitlines())
-        for line in sorted(before_lines - after_lines):
-            print(f"  - {line}")
-        for line in sorted(after_lines - before_lines):
-            print(f"  + {line}")
-        print()
-
-    print()
-    if not changes_found:
-        print("Result: No differences detected between snapshots.")
-    else:
-        print("Result: Differences found. Review lines prefixed with '-' (removed) and '+' (added).")
+def load_snapshot(path: str) -> dict:
+    p = Path(path)
+    if not p.exists():
+        log.error("Snapshot file not found: %s", path)
+        sys.exit(1)
+    return json.loads(p.read_text())
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Capture and compare device state snapshots for change validation."
+def diff_snapshots(before: dict, after: dict) -> int:
+    """Print a human-readable diff. Returns number of changes found."""
+    b_routes = before["routes"]
+    a_routes = after["routes"]
+
+    added = {k: v for k, v in a_routes.items() if k not in b_routes}
+    removed = {k: v for k, v in b_routes.items() if k not in a_routes}
+    changed = {
+        k: (b_routes[k], a_routes[k])
+        for k in b_routes
+        if k in a_routes and b_routes[k] != a_routes[k]
+    }
+
+    b_label = before.get("label", "before")
+    a_label = after.get("label", "after")
+    print(f"\nRoute diff: {b_label} -> {a_label}")
+    print(
+        f"  Before: {before.get('timestamp', '?')} ({len(b_routes)} routes)  |  "
+        f"After: {after.get('timestamp', '?')} ({len(a_routes)} routes)\n"
     )
-    parser.add_argument(
-        "--mode",
-        choices=["capture", "diff"],
-        required=True,
-        help="'capture' saves current device state; 'diff' compares two snapshot files",
+
+    if not added and not removed and not changed:
+        print("  No routing changes detected.")
+        return 0
+
+    if added:
+        print(f"  ADDED ({len(added)}):")
+        for prefix, proto in sorted(added.items()):
+            print(f"    + {prefix:<25} [{proto}]")
+
+    if removed:
+        print(f"\n  REMOVED ({len(removed)}):")
+        for prefix, proto in sorted(removed.items()):
+            print(f"    - {prefix:<25} [{proto}]")
+
+    if changed:
+        print(f"\n  PROTOCOL CHANGE ({len(changed)}):")
+        for prefix, (old, new) in sorted(changed.items()):
+            print(f"    ~ {prefix:<25} {old} -> {new}")
+
+    return len(added) + len(removed) + len(changed)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Capture and diff routing table snapshots around network changes."
     )
-    parser.add_argument("--host", help="Device IP or hostname (required for capture)")
-    parser.add_argument("--username", help="SSH username (required for capture)")
-    parser.add_argument("--password", help="SSH password (required for capture)")
-    parser.add_argument(
+    p.add_argument("--host", help="Device IP or hostname")
+    p.add_argument("--username", help="SSH username")
+    p.add_argument("--password", help="SSH password (prompted if omitted)")
+    p.add_argument(
         "--device-type",
         default="cisco_ios",
-        choices=list(CAPTURE_COMMANDS.keys()),
         help="Netmiko device type (default: cisco_ios)",
     )
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument(
-        "--snapshot-file",
-        help="JSON file to write captured snapshot to (capture mode)",
+    p.add_argument(
+        "--snapshot",
+        metavar="LABEL",
+        help="Capture a snapshot with this label (e.g. 'pre' or 'post')",
     )
-    parser.add_argument("--before", help="Pre-change snapshot JSON file (diff mode)")
-    parser.add_argument("--after", help="Post-change snapshot JSON file (diff mode)")
-
-    args = parser.parse_args()
-
-    if args.mode == "capture":
-        if not all([args.host, args.username, args.password, args.snapshot_file]):
-            parser.error(
-                "capture mode requires --host, --username, --password, --snapshot-file"
-            )
-        snapshot = capture_snapshot(
-            args.host, args.username, args.password, args.device_type, args.port
-        )
-        with open(args.snapshot_file, "w") as f:
-            json.dump(snapshot, f, indent=2)
-        log.info("Snapshot saved to %s", args.snapshot_file)
-
-    elif args.mode == "diff":
-        if not args.before or not args.after:
-            parser.error("diff mode requires --before and --after snapshot file paths")
-        diff_snapshots(args.before, args.after)
+    p.add_argument(
+        "--compare",
+        metavar="FILE",
+        help="Snapshot JSON to diff the new capture against",
+    )
+    p.add_argument(
+        "--diff",
+        nargs=2,
+        metavar=("BEFORE", "AFTER"),
+        help="Diff two existing snapshot files without connecting to a device",
+    )
+    return p
 
 
 if __name__ == "__main__":
-    main()
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.diff:
+        before = load_snapshot(args.diff[0])
+        after = load_snapshot(args.diff[1])
+        changes = diff_snapshots(before, after)
+        sys.exit(0 if changes == 0 else 1)
+
+    if not args.host or not args.snapshot:
+        parser.error("--host and --snapshot are required when not using --diff")
+
+    password = args.password or getpass(f"Password for {args.username}@{args.host}: ")
+    routes = fetch_routes(args.host, args.username, password, args.device_type)
+    save_snapshot(args.host, args.snapshot, routes)
+
+    if args.compare:
+        before = load_snapshot(args.compare)
+        after_payload = {
+            "host": args.host,
+            "label": args.snapshot,
+            "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+            "routes": routes,
+        }
+        changes = diff_snapshots(before, after_payload)
+        sys.exit(0 if changes == 0 else 1)
