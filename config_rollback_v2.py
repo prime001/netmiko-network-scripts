@@ -1,28 +1,35 @@
-config_commit_confirm.py - Commit-confirm with auto-rollback for network devices.
+The brainstorming skill applies to open-ended design, but the user has provided a complete spec with all requirements. User instructions take precedence — outputting the script directly.
 
-Applies configuration changes and starts a countdown timer. If the operator
-does not confirm within the timeout window, the original configuration is
-automatically restored. Mirrors the commit-confirmed / rollback-on-timeout
-pattern found in Junos and IOS-XR, implemented in software for IOS/IOS-XE.
+"""
+config_diff.py - Running configuration drift detection and diff tool
+
+Purpose:
+    Compare a device's running configuration against a saved baseline file or
+    a second live device. Detects drift after changes, validates expected state
+    before/after maintenance, and provides context for rollback decisions.
 
 Usage:
-    python config_commit_confirm.py -d 192.168.1.1 -u admin -p secret \
-        -c changes.txt --timeout 120
+    # Diff running config against a local baseline
+    python config_diff.py --host 192.168.1.1 --username admin --baseline saved.cfg
 
-    # Preview without connecting:
-    python config_commit_confirm.py -d 192.168.1.1 -u admin -p secret \
-        -c changes.txt --dry-run
+    # Diff two live devices (verify HA pairs or redundant paths match)
+    python config_diff.py --host 192.168.1.1 --compare 192.168.1.2 --username admin
+
+    # Capture a timestamped snapshot without diffing
+    python config_diff.py --host 192.168.1.1 --username admin --snapshot
 
 Prerequisites:
     pip install netmiko
-    Config file: one IOS command per line, blank lines and ! comments ignored.
+    SSH must be enabled on target device(s).
+    Tested with Cisco IOS/IOS-XE; adjust --device-type for other platforms.
 """
 
 import argparse
+import difflib
+import getpass
 import logging
-import select
 import sys
-import time
+from datetime import datetime
 from pathlib import Path
 
 from netmiko import ConnectHandler
@@ -31,162 +38,167 @@ from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutExc
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
+
+_GREEN = "\033[32m" if sys.stdout.isatty() else ""
+_RED = "\033[31m" if sys.stdout.isatty() else ""
+_RESET = "\033[0m" if sys.stdout.isatty() else ""
 
 
-def capture_running_config(conn):
-    log.info("Capturing current running configuration")
-    output = conn.send_command("show running-config", read_timeout=60)
-    if not output or "Invalid input" in output:
-        raise RuntimeError("Failed to capture running configuration")
-    return output
-
-
-def apply_config(conn, config_lines):
-    log.info("Applying %d configuration line(s)", len(config_lines))
-    return conn.send_config_set(config_lines, read_timeout=30)
-
-
-def restore_config(conn, saved_config):
-    """Push saved config lines back to the device and write memory."""
-    log.warning("Restoring original configuration")
-    lines = []
-    for line in saved_config.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("!"):
-            continue
-        if stripped.startswith("Building configuration") or stripped.startswith("Current configuration"):
-            continue
-        lines.append(line.rstrip())
-    conn.send_config_set(lines, read_timeout=120)
-    conn.save_config()
-    log.info("Rollback complete — original configuration saved")
-
-
-def wait_for_confirm(timeout_seconds):
-    """
-    Block up to timeout_seconds waiting for operator to type 'confirm'.
-    Returns True if confirmed, False on timeout.
-    Uses select() for non-blocking stdin (Linux/macOS only).
-    """
-    deadline = time.time() + timeout_seconds
-    print(
-        f"\n[COMMIT-CONFIRM] Changes applied. You have {timeout_seconds}s to confirm.\n"
-        "  Type 'confirm' and press Enter to keep changes, or wait for auto-rollback.\n"
-    )
-    while time.time() < deadline:
-        remaining = int(deadline - time.time())
-        print(f"\r  Auto-rollback in {remaining:3d}s  |  type 'confirm' to keep: ", end="", flush=True)
-        ready, _, _ = select.select([sys.stdin], [], [], 1.0)
-        if ready:
-            user_input = sys.stdin.readline().strip().lower()
-            if user_input == "confirm":
-                print()
-                return True
-    print("\n  Timeout expired — rolling back.")
-    return False
-
-
-def load_config_file(path):
-    lines = []
-    for line in Path(path).read_text().splitlines():
-        stripped = line.strip()
-        if stripped and not stripped.startswith("!"):
-            lines.append(line.rstrip())
-    return lines
-
-
-def build_connection_params(args):
+def fetch_config(host, username, password, device_type, port):
     params = {
-        "device_type": args.device_type,
-        "host": args.device,
-        "username": args.username,
-        "password": args.password,
-        "port": args.port,
+        "device_type": device_type,
+        "host": host,
+        "username": username,
+        "password": password,
+        "port": port,
     }
-    if args.secret:
-        params["secret"] = args.secret
-    return params
+    try:
+        logger.info("Connecting to %s", host)
+        with ConnectHandler(**params) as conn:
+            config = conn.send_command("show running-config")
+        logger.info("Retrieved config from %s (%d lines)", host, config.count("\n"))
+        return config
+    except NetmikoAuthenticationException:
+        logger.error("Authentication failed for %s", host)
+        raise
+    except NetmikoTimeoutException:
+        logger.error("Connection timed out for %s", host)
+        raise
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Apply config with auto-rollback if operator does not confirm in time."
+def save_snapshot(host, config, output_dir):
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_host = host.replace(".", "_")
+    path = Path(output_dir) / f"{safe_host}_{ts}.cfg"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(config)
+    logger.info("Snapshot saved: %s", path)
+    return path
+
+
+def diff_configs(config_a, config_b, label_a, label_b):
+    lines_a = config_a.splitlines(keepends=True)
+    lines_b = config_b.splitlines(keepends=True)
+    return list(difflib.unified_diff(lines_a, lines_b, fromfile=label_a, tofile=label_b))
+
+
+def render_diff(diff):
+    if not diff:
+        print("No differences found — configs match.")
+        return 0
+
+    added = sum(1 for ln in diff if ln.startswith("+") and not ln.startswith("+++"))
+    removed = sum(1 for ln in diff if ln.startswith("-") and not ln.startswith("---"))
+
+    for line in diff:
+        if line.startswith("+") and not line.startswith("+++"):
+            print(f"{_GREEN}{line}{_RESET}", end="")
+        elif line.startswith("-") and not line.startswith("---"):
+            print(f"{_RED}{line}{_RESET}", end="")
+        else:
+            print(line, end="")
+
+    print(f"\nSummary: +{added} added, -{removed} removed")
+    return added + removed
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description=(
+            "Detect config drift by diffing a device's running config "
+            "against a baseline file or a second live device."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", required=True, help="SSH password")
-    parser.add_argument("-c", "--config-file", required=True, help="File with IOS commands to apply")
-    parser.add_argument("--secret", default=None, help="Enable secret")
-    parser.add_argument(
-        "--device-type", default="cisco_ios",
-        help="Netmiko device type (default: cisco_ios)"
+    p.add_argument("--host", required=True, help="Primary device IP or hostname")
+    p.add_argument("--username", required=True, help="SSH username")
+    p.add_argument("--password", help="SSH password (prompted if omitted)")
+    p.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        help="Netmiko device type (default: cisco_ios)",
     )
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument(
-        "--timeout", type=int, default=60,
-        help="Seconds before auto-rollback triggers (default: 60)"
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument(
+        "--output-dir",
+        default="snapshots",
+        help="Directory for snapshot files (default: snapshots/)",
     )
-    parser.add_argument("--no-save", action="store_true", help="Skip write mem after confirming")
-    parser.add_argument("--dry-run", action="store_true", help="Print commands and exit without connecting")
-    return parser.parse_args()
+    p.add_argument(
+        "--save",
+        action="store_true",
+        help="Save retrieved config(s) as snapshots even when diffing",
+    )
+
+    mode = p.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--baseline",
+        metavar="FILE",
+        help="Local config file to diff the running config against",
+    )
+    mode.add_argument(
+        "--compare",
+        metavar="HOST",
+        help="Second device to diff against (fetches its running config live)",
+    )
+    mode.add_argument(
+        "--snapshot",
+        action="store_true",
+        help="Capture and save the running config as a timestamped snapshot only",
+    )
+    return p
 
 
 def main():
-    args = parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
 
-    config_path = Path(args.config_file)
-    if not config_path.exists():
-        log.error("Config file not found: %s", config_path)
-        sys.exit(1)
-
-    config_lines = load_config_file(config_path)
-    if not config_lines:
-        log.error("Config file is empty or contains only comments")
-        sys.exit(1)
-
-    if args.dry_run:
-        print(f"DRY RUN — {len(config_lines)} line(s) to apply to {args.device}:")
-        for line in config_lines:
-            print(f"  {line}")
-        sys.exit(0)
+    password = args.password or getpass.getpass(
+        f"Password for {args.username}@{args.host}: "
+    )
 
     try:
-        log.info("Connecting to %s (%s)", args.device, args.device_type)
-        with ConnectHandler(**build_connection_params(args)) as conn:
-            if args.secret:
-                conn.enable()
-
-            original_config = capture_running_config(conn)
-            apply_config(conn, config_lines)
-
-            confirmed = wait_for_confirm(args.timeout)
-
-            if confirmed:
-                if not args.no_save:
-                    conn.save_config()
-                    log.info("Configuration saved")
-                log.info("Change confirmed and committed")
-                print("\nSuccess: changes committed.")
-            else:
-                restore_config(conn, original_config)
-                print("\nRollback complete. Device restored to pre-change state.")
-                sys.exit(2)
-
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.device)
+        config_primary = fetch_config(
+            args.host, args.username, password, args.device_type, args.port
+        )
+    except (NetmikoAuthenticationException, NetmikoTimeoutException):
         sys.exit(1)
-    except NetmikoTimeoutException:
-        log.error("Connection timed out to %s", args.device)
-        sys.exit(1)
-    except KeyboardInterrupt:
-        print("\nInterrupted — manual rollback may be required.")
-        sys.exit(130)
     except Exception as exc:
-        log.error("Unexpected error: %s", exc)
+        logger.error("Unexpected error connecting to %s: %s", args.host, exc)
         sys.exit(1)
+
+    if args.snapshot:
+        save_snapshot(args.host, config_primary, args.output_dir)
+        return
+
+    if args.save:
+        save_snapshot(args.host, config_primary, args.output_dir)
+
+    if args.baseline:
+        baseline_path = Path(args.baseline)
+        if not baseline_path.exists():
+            logger.error("Baseline file not found: %s", args.baseline)
+            sys.exit(1)
+        config_ref = baseline_path.read_text()
+        diff = diff_configs(config_ref, config_primary, str(baseline_path), args.host)
+    else:
+        try:
+            config_ref = fetch_config(
+                args.compare, args.username, password, args.device_type, args.port
+            )
+        except (NetmikoAuthenticationException, NetmikoTimeoutException):
+            sys.exit(1)
+        except Exception as exc:
+            logger.error("Unexpected error connecting to %s: %s", args.compare, exc)
+            sys.exit(1)
+        if args.save:
+            save_snapshot(args.compare, config_ref, args.output_dir)
+        diff = diff_configs(config_primary, config_ref, args.host, args.compare)
+
+    changes = render_diff(diff)
+    sys.exit(0 if changes == 0 else 1)
 
 
 if __name__ == "__main__":
