@@ -1,174 +1,181 @@
-#!/usr/bin/env python3
-"""
-Interface Statistics Analyzer - Collect and analyze interface statistics.
+MAC Address Locator — find which switchport a MAC address is learned on.
 
-Connects to network devices via SSH and collects interface statistics
-including errors, discards, and CRC errors. Identifies interfaces with
-issues exceeding specified thresholds and generates a report.
+Connects to one or more switches in parallel, queries the MAC address table,
+and reports which port the target MAC is associated with.
 
 Usage:
-    python interface_stats.py -d 192.168.1.1 -u admin -p password
+    python mac_locator.py -d 10.0.0.1 10.0.0.2 -m aa:bb:cc:dd:ee:ff -p secret
+    python mac_locator.py -f switches.txt -m aabb.ccdd.eeff -u admin -p secret
+    python mac_locator.py -d 10.0.0.1 -m 00-1A-2B-3C-4D-5E -p secret -e enable_pw
+
+    Device file format (one per line):
+        10.0.0.1
+        10.0.0.2 cisco_nxos
 
 Prerequisites:
-    - netmiko: pip install netmiko
-    - Device SSH access enabled with proper credentials
+    pip install netmiko
+    SSH access with sufficient privileges to read the MAC address table.
+
+Supported device types: cisco_ios, cisco_xe, cisco_nxos, aruba_os, hp_comware
 """
 
 import argparse
 import logging
+import re
 import sys
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
-from netmiko.ssh_autodetect import SSHDetect
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
 logger = logging.getLogger(__name__)
 
+MAC_COMMANDS = {
+    "cisco_ios": "show mac address-table",
+    "cisco_xe": "show mac address-table",
+    "cisco_nxos": "show mac address-table",
+    "aruba_os": "show mac-address-table",
+    "hp_comware": "display mac-address",
+}
 
-def detect_device_type(host, username, password, timeout=10):
-    """Auto-detect device type using netmiko's SSHDetect."""
+_MAC_RE = re.compile(
+    r"([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}"
+    r"|[0-9a-fA-F]{2}(?:[:\-][0-9a-fA-F]{2}){5})"
+    r".+?"
+    r"((?:Gi|Fa|Te|Tw|Hu|Eth|Po|GigabitEthernet|FastEthernet"
+    r"|TenGigabitEthernet|Port-channel|Vlan)\S+)",
+    re.IGNORECASE,
+)
+
+
+def normalize_mac(mac: str) -> str:
+    return re.sub(r"[.:\-]", "", mac).lower()
+
+
+def search_device(host: str, device_type: str, username: str, password: str,
+                  target_mac: str, secret: str = "") -> dict:
+    result = {"host": host, "found": False, "port": None, "error": None}
+    command = MAC_COMMANDS.get(device_type, "show mac address-table")
+
     try:
-        logger.info(f"Detecting device type for {host}...")
-        guesser = SSHDetect(host=host, username=username, password=password, timeout=timeout)
-        device_type = guesser.autodetect()
-        logger.info(f"Detected device type: {device_type}")
-        return device_type
-    except Exception as e:
-        logger.error(f"Auto-detection failed: {e}")
-        raise
+        params = {"device_type": device_type, "host": host,
+                  "username": username, "password": password}
+        if secret:
+            params["secret"] = secret
 
+        with ConnectHandler(**params) as conn:
+            if secret:
+                conn.enable()
+            output = conn.send_command(command)
 
-def connect_device(host, username, password, device_type=None, timeout=30):
-    """Establish SSH connection to device."""
-    try:
-        if not device_type:
-            device_type = detect_device_type(host, username, password)
-        logger.info(f"Connecting to {host} ({device_type})...")
-        device = ConnectHandler(
-            device_type=device_type,
-            host=host,
-            username=username,
-            password=password,
-            timeout=timeout
-        )
-        logger.info(f"Connected to {host}")
-        return device
+        for line in output.splitlines():
+            m = _MAC_RE.search(line)
+            if m and normalize_mac(m.group(1)) == target_mac:
+                result["found"] = True
+                result["port"] = m.group(2)
+                break
+
     except NetmikoAuthenticationException:
-        logger.error(f"Authentication failed for {host}")
-        raise
+        result["error"] = "authentication failed"
     except NetmikoTimeoutException:
-        logger.error(f"Connection timeout for {host}")
-        raise
+        result["error"] = "connection timed out"
+    except Exception as exc:
+        result["error"] = str(exc)
+
+    return result
 
 
-def parse_interface_stats(device, device_type):
-    """Parse interface statistics from device output."""
-    stats = {}
-    try:
-        if 'cisco' in device_type.lower():
-            output = device.send_command("show interfaces")
-            current_intf = None
-            for line in output.split('\n'):
-                if line and not line[0].isspace():
-                    current_intf = line.split()[0]
-                    stats[current_intf] = {
-                        'input_errors': 0,
-                        'output_errors': 0,
-                        'input_discards': 0,
-                        'output_discards': 0,
-                        'crc_errors': 0
-                    }
-                elif current_intf:
-                    try:
-                        if 'input errors' in line:
-                            stats[current_intf]['input_errors'] = int(line.split(',')[0].split()[-1])
-                        elif 'output errors' in line:
-                            stats[current_intf]['output_errors'] = int(line.split(',')[0].split()[-1])
-                        elif 'input discards' in line:
-                            stats[current_intf]['input_discards'] = int(line.split()[-1])
-                        elif 'output discards' in line:
-                            stats[current_intf]['output_discards'] = int(line.split()[-1])
-                        elif 'crc' in line.lower():
-                            stats[current_intf]['crc_errors'] = int(line.split(',')[0].split()[-1])
-                    except (ValueError, IndexError):
-                        pass
-        logger.info(f"Parsed {len(stats)} interfaces")
-        return stats
-    except Exception as e:
-        logger.error(f"Error parsing stats: {e}")
-        raise
+def load_devices(hosts: list, device_file: str, default_type: str) -> list:
+    devices = [{"host": h, "device_type": default_type} for h in (hosts or [])]
 
+    if device_file:
+        try:
+            with open(device_file) as fh:
+                for raw in fh:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split()
+                    devices.append({
+                        "host": parts[0],
+                        "device_type": parts[1] if len(parts) > 1 else default_type,
+                    })
+        except FileNotFoundError:
+            logger.error("Device file not found: %s", device_file)
+            sys.exit(1)
 
-def analyze_stats(stats, error_thresh=10, discard_thresh=5):
-    """Analyze stats and identify problematic interfaces."""
-    problem_errors = []
-    problem_discards = []
-    for intf, data in stats.items():
-        total_errors = (data.get('input_errors', 0) + 
-                       data.get('output_errors', 0) + 
-                       data.get('crc_errors', 0))
-        total_discards = (data.get('input_discards', 0) + 
-                         data.get('output_discards', 0))
-        if total_errors >= error_thresh:
-            problem_errors.append(f"  {intf}: {total_errors} errors "
-                                f"(Input: {data.get('input_errors', 0)}, "
-                                f"Output: {data.get('output_errors', 0)}, "
-                                f"CRC: {data.get('crc_errors', 0)})")
-        if total_discards >= discard_thresh:
-            problem_discards.append(f"  {intf}: {total_discards} discards "
-                                  f"(Input: {data.get('input_discards', 0)}, "
-                                  f"Output: {data.get('output_discards', 0)})")
-    return problem_errors, problem_discards
-
-
-def print_report(host, stats, errors, discards):
-    """Print analysis report to stdout."""
-    print(f"\n{'='*70}")
-    print(f"Interface Statistics Report - {host}")
-    print(f"{'='*70}\n")
-    print(f"Total Interfaces: {len(stats)}\n")
-    if errors:
-        print("INTERFACES WITH ERRORS:")
-        print("\n".join(errors) + "\n")
-    else:
-        print("No interfaces with errors above threshold.\n")
-    if discards:
-        print("INTERFACES WITH DISCARDS:")
-        print("\n".join(discards) + "\n")
-    else:
-        print("No interfaces with discards above threshold.\n")
-    print(f"{'='*70}\n")
+    return devices
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Collect and analyze interface statistics from network devices.'
+        description="Locate a MAC address across one or more switches."
     )
-    parser.add_argument('-d', '--device', required=True, help='Device IP/hostname')
-    parser.add_argument('-u', '--username', required=True, help='SSH username')
-    parser.add_argument('-p', '--password', required=True, help='SSH password')
-    parser.add_argument('-t', '--device-type', help='Device type (e.g., cisco_ios)')
-    parser.add_argument('--error-threshold', type=int, default=10,
-                       help='Error count threshold (default: 10)')
-    parser.add_argument('--discard-threshold', type=int, default=5,
-                       help='Discard count threshold (default: 5)')
+    parser.add_argument("-d", "--devices", nargs="+", metavar="HOST",
+                        help="Switch IPs or hostnames")
+    parser.add_argument("-f", "--file", metavar="FILE",
+                        help="File listing devices (host [device_type], one per line)")
+    parser.add_argument("-m", "--mac", required=True,
+                        help="MAC address to locate (any common format)")
+    parser.add_argument("-u", "--username", default="admin", help="SSH username")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
+    parser.add_argument("-e", "--enable", default="", metavar="SECRET",
+                        help="Enable/privilege secret")
+    parser.add_argument("-t", "--device-type", default="cisco_ios",
+                        choices=list(MAC_COMMANDS),
+                        help="Default netmiko device type (default: cisco_ios)")
+    parser.add_argument("-w", "--workers", type=int, default=10,
+                        help="Parallel threads (default: 10)")
+    parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
-    
-    device = None
-    try:
-        device = connect_device(args.device, args.username, args.password, args.device_type)
-        device_type = args.device_type or 'cisco_ios'
-        stats = parse_interface_stats(device, device_type)
-        errors, discards = analyze_stats(stats, args.error_threshold, args.discard_threshold)
-        print_report(args.device, stats, errors, discards)
-        return 0 if not errors and not discards else 1
-    except Exception as e:
-        logger.error(f"Script failed: {e}")
-        return 1
-    finally:
-        if device:
-            device.disconnect()
-            logger.info("Disconnected from device")
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if not args.devices and not args.file:
+        parser.error("Specify at least one device via -d or -f")
+
+    target = normalize_mac(args.mac)
+    if len(target) != 12 or not re.fullmatch(r"[0-9a-f]{12}", target):
+        parser.error(f"Invalid MAC address: {args.mac!r}")
+
+    devices = load_devices(args.devices, args.file, args.device_type)
+    if not devices:
+        logger.error("No devices to query.")
+        sys.exit(1)
+
+    logger.info("Querying %d device(s) for MAC %s", len(devices), args.mac)
+
+    found_any = False
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {
+            pool.submit(
+                search_device,
+                dev["host"], dev["device_type"],
+                args.username, args.password,
+                target, args.enable,
+            ): dev["host"]
+            for dev in devices
+        }
+        for future in as_completed(futures):
+            res = future.result()
+            if res["error"]:
+                logger.warning("[%s] %s", res["host"], res["error"])
+            elif res["found"]:
+                print(f"[FOUND] {res['host']}  ->  {res['port']}")
+                found_any = True
+            else:
+                logger.info("[%s] not found", res["host"])
+
+    if not found_any:
+        print("MAC address not found on any queried device.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
