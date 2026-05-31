@@ -1,245 +1,218 @@
-NTP Compliance Checker
+```python
+#!/usr/bin/env python3
+"""
+Device Configuration Snapshot and Change Detection Tool
 
-Connects to network devices via SSH and verifies NTP synchronization status,
-checking stratum level, reference clock association, and clock offset against
-configurable compliance thresholds.
+Purpose:
+    Takes timestamped snapshots of network device running configurations
+    and detects changes between consecutive runs. Useful for tracking
+    configuration drift and detecting unauthorized modifications.
 
 Usage:
-    python ntp_compliance.py -d 192.168.1.1 -u admin -p secret
-    python ntp_compliance.py -d 192.168.1.1 -u admin --device-type cisco_nxos
-    python ntp_compliance.py --host-file devices.txt -u admin --max-stratum 3
+    python config_snapshot.py --host 192.168.1.1 --username admin --device-type cisco_ios
+    python config_snapshot.py --host 192.168.1.1 --username admin --device-type cisco_ios --compare --diff
 
 Prerequisites:
-    pip install netmiko
+    - netmiko installed (pip install netmiko)
+    - Network device accessible via SSH/Telnet
+    - User credentials with privilege to view running configuration
+    - Device must support 'show running-config' or equivalent command
+
+Output:
+    - Configuration snapshots stored in ./snapshots/ directory with timestamps
+    - Change summaries printed to console
+    - Detailed unified diffs available with --diff flag
+    - Logging output to config_snapshot.log
 """
 
 import argparse
 import getpass
 import logging
-import re
 import sys
+from datetime import datetime
+from difflib import unified_diff
+from pathlib import Path
 
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetMikoAuthenticationException, NetMikoTimeoutException
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-
-NTP_STATUS_COMMANDS = {
-    "cisco_ios": "show ntp status",
-    "cisco_xe": "show ntp status",
-    "cisco_nxos": "show ntp status",
-    "cisco_xr": "show ntp status",
-    "arista_eos": "show ntp status",
-    "juniper_junos": "show ntp status",
-}
-
-
-def parse_ntp_status(output: str) -> dict:
-    result = {"synced": False, "stratum": None, "reference": None, "offset_ms": None}
-
-    if re.search(r"clock is synchronized", output, re.IGNORECASE):
-        result["synced"] = True
-    elif re.search(r"synchronised\s+to", output, re.IGNORECASE):
-        result["synced"] = True
-
-    match = re.search(r"stratum\s+(\d+)", output, re.IGNORECASE)
-    if match:
-        result["stratum"] = int(match.group(1))
-
-    match = re.search(
-        r"reference\s+(?:is\s+)?([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|[0-9A-Fa-f:.]+)",
-        output,
-        re.IGNORECASE,
+def setup_logging(log_level):
+    """Configure logging to file and console."""
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('config_snapshot.log')
+        ]
     )
-    if match:
-        result["reference"] = match.group(1)
-
-    match = re.search(r"offset\s+(?:is\s+)?([+-]?\d+\.?\d*)\s*ms", output, re.IGNORECASE)
-    if match:
-        result["offset_ms"] = float(match.group(1))
-
-    return result
+    return logging.getLogger(__name__)
 
 
-def check_device(
-    host: str,
-    username: str,
-    password: str,
-    device_type: str,
-    port: int,
-    max_stratum: int,
-    max_offset_ms: float,
-) -> dict:
-    result = {
-        "host": host,
-        "compliant": False,
-        "synced": False,
-        "stratum": None,
-        "offset_ms": None,
-        "reference": None,
-        "issues": [],
-        "error": None,
-    }
+def create_snapshot_dir():
+    """Create snapshots directory if it doesn't exist."""
+    snapshot_dir = Path('snapshots')
+    snapshot_dir.mkdir(exist_ok=True)
+    return snapshot_dir
 
-    params = {
-        "device_type": device_type,
-        "host": host,
-        "username": username,
-        "password": password,
-        "port": port,
-    }
 
+def connect_device(device_params, logger):
+    """Establish SSH/Telnet connection to network device."""
     try:
-        logger.info("Connecting to %s", host)
-        with ConnectHandler(**params) as conn:
-            cmd = NTP_STATUS_COMMANDS.get(device_type, "show ntp status")
-            output = conn.send_command(cmd)
-            logger.debug("NTP status for %s:\n%s", host, output)
-
-        parsed = parse_ntp_status(output)
-        result.update(parsed)
-
-        issues = []
-        if not result["synced"]:
-            issues.append("not synchronized")
-        if result["stratum"] is not None and result["stratum"] > max_stratum:
-            issues.append(f"stratum {result['stratum']} exceeds max {max_stratum}")
-        if result["offset_ms"] is not None and abs(result["offset_ms"]) > max_offset_ms:
-            issues.append(
-                f"offset {result['offset_ms']}ms exceeds {max_offset_ms}ms limit"
-            )
-
-        result["issues"] = issues
-        result["compliant"] = result["synced"] and len(issues) == 0
-
-    except NetMikoAuthenticationException:
-        result["error"] = "authentication failed"
-        logger.error("Authentication failed for %s", host)
-    except NetMikoTimeoutException:
-        result["error"] = "connection timed out"
-        logger.error("Timeout connecting to %s", host)
-    except Exception as exc:
-        result["error"] = str(exc)
-        logger.error("Unexpected error on %s: %s", host, exc)
-
-    return result
-
-
-def print_report(results: list) -> None:
-    compliant_count = sum(1 for r in results if r["compliant"])
-    total = len(results)
-
-    print(f"\n{'=' * 60}")
-    print(f"NTP Compliance Report  {compliant_count}/{total} compliant")
-    print(f"{'=' * 60}")
-
-    for r in results:
-        tag = "PASS" if r["compliant"] else "FAIL"
-        print(f"\n[{tag}] {r['host']}")
-        if r["error"]:
-            print(f"  ERROR: {r['error']}")
-            continue
-        print(f"  Synchronized : {r['synced']}")
-        print(
-            f"  Stratum      : {r['stratum'] if r['stratum'] is not None else 'unknown'}"
-        )
-        print(f"  Reference    : {r['reference'] or 'unknown'}")
-        if r["offset_ms"] is not None:
-            print(f"  Offset       : {r['offset_ms']} ms")
-        else:
-            print("  Offset       : unknown")
-        for issue in r["issues"]:
-            print(f"  Issue        : {issue}")
-
-    print(f"\n{'=' * 60}\n")
-
-
-def load_hosts(host_file: str) -> list:
-    try:
-        with open(host_file) as fh:
-            return [
-                line.strip()
-                for line in fh
-                if line.strip() and not line.strip().startswith("#")
-            ]
-    except FileNotFoundError:
-        logger.error("Host file not found: %s", host_file)
+        logger.info(f"Connecting to {device_params['host']}")
+        connection = ConnectHandler(**device_params)
+        logger.debug(f"Successfully connected to {device_params['host']}")
+        return connection
+    except NetmikoAuthenticationException as e:
+        logger.error(f"Authentication failed for {device_params['host']}: {e}")
+        sys.exit(1)
+    except NetmikoTimeoutException as e:
+        logger.error(f"Connection timeout to {device_params['host']}: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Connection error: {e}")
         sys.exit(1)
 
 
-def main() -> None:
+def get_hostname(connection, logger):
+    """Extract hostname from device running configuration."""
+    try:
+        output = connection.send_command('show run | include hostname')
+        if output:
+            return output.split()[-1]
+        return 'unknown-device'
+    except Exception as e:
+        logger.warning(f"Could not determine hostname: {e}")
+        return 'unknown-device'
+
+
+def get_config(connection, logger):
+    """Retrieve running configuration from device."""
+    try:
+        logger.debug("Retrieving running configuration")
+        config = connection.send_command('show running-config')
+        logger.info("Configuration retrieved successfully")
+        return config
+    except Exception as e:
+        logger.error(f"Failed to retrieve configuration: {e}")
+        sys.exit(1)
+
+
+def save_snapshot(config, hostname, snapshot_dir, logger):
+    """Save configuration snapshot with timestamp."""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename = snapshot_dir / f"{hostname}_{timestamp}.txt"
+    
+    try:
+        with open(filename, 'w') as f:
+            f.write(config)
+        logger.info(f"Snapshot saved to {filename}")
+        return filename
+    except IOError as e:
+        logger.error(f"Failed to write snapshot: {e}")
+        sys.exit(1)
+
+
+def find_previous_snapshot(snapshot_dir, hostname):
+    """Locate most recent previous snapshot for device."""
+    snapshots = sorted(
+        snapshot_dir.glob(f"{hostname}_*.txt"),
+        key=lambda x: x.stat().st_mtime,
+        reverse=True
+    )
+    return snapshots[1] if len(snapshots) > 1 else None
+
+
+def compare_configs(current_config, previous_file, hostname, logger):
+    """Generate unified diff between current and previous configurations."""
+    try:
+        with open(previous_file, 'r') as f:
+            previous_config = f.read()
+        
+        current_lines = current_config.splitlines(keepends=True)
+        previous_lines = previous_config.splitlines(keepends=True)
+        
+        diff = list(unified_diff(
+            previous_lines,
+            current_lines,
+            fromfile=f'{hostname}_previous',
+            tofile=f'{hostname}_current'
+        ))
+        
+        return diff if diff else None
+    except IOError as e:
+        logger.error(f"Failed to read previous snapshot: {e}")
+        return None
+
+
+def print_summary(diff):
+    """Print change summary statistics."""
+    additions = sum(1 for line in diff if line.startswith('+') and not line.startswith('+++'))
+    deletions = sum(1 for line in diff if line.startswith('-') and not line.startswith('---'))
+    
+    print("\n=== Configuration Changes Detected ===")
+    print(f"Lines added:    {additions}")
+    print(f"Lines removed:  {deletions}")
+    print(f"Total changes:  {len([l for l in diff if l[0] in '+-' and l[1] not in '+-'])}")
+
+
+def main():
     parser = argparse.ArgumentParser(
-        description="Verify NTP synchronization compliance on network devices"
+        description='Snapshot device configurations and detect changes',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__
     )
-
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("-d", "--device", help="Single device IP or hostname")
-    target.add_argument("--host-file", help="File containing one device per line")
-
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
-    parser.add_argument(
-        "--device-type",
-        default="cisco_ios",
-        choices=list(NTP_STATUS_COMMANDS.keys()),
-        help="Netmiko device type (default: cisco_ios)",
-    )
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument(
-        "--max-stratum",
-        type=int,
-        default=5,
-        help="Maximum acceptable NTP stratum (default: 5)",
-    )
-    parser.add_argument(
-        "--max-offset",
-        type=float,
-        default=100.0,
-        help="Maximum acceptable clock offset in milliseconds (default: 100.0)",
-    )
-    parser.add_argument(
-        "--fail-fast",
-        action="store_true",
-        help="Stop after the first non-compliant device",
-    )
-    parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Enable debug logging"
-    )
-
+    
+    parser.add_argument('--host', required=True, help='Device IP address or hostname')
+    parser.add_argument('--username', required=True, help='SSH username')
+    parser.add_argument('--password', help='SSH password (will prompt if not provided)')
+    parser.add_argument('--device-type', default='cisco_ios', help='Netmiko device type')
+    parser.add_argument('--port', type=int, default=22, help='SSH port (default: 22)')
+    parser.add_argument('--timeout', type=int, default=10, help='Connection timeout in seconds')
+    parser.add_argument('--compare', action='store_true', help='Compare with previous snapshot')
+    parser.add_argument('--diff', action='store_true', help='Show detailed unified diff output')
+    parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                       default='INFO', help='Logging level (default: INFO)')
+    
     args = parser.parse_args()
+    logger = setup_logging(args.log_level)
+    
+    if not args.password:
+        args.password = getpass.getpass('Password: ')
+    
+    device_params = {
+        'device_type': args.device_type,
+        'host': args.host,
+        'username': args.username,
+        'password': args.password,
+        'port': args.port,
+        'timeout': args.timeout,
+    }
+    
+    snapshot_dir = create_snapshot_dir()
+    connection = connect_device(device_params, logger)
+    hostname = get_hostname(connection, logger)
+    config = get_config(connection, logger)
+    connection.disconnect()
+    
+    snapshot_file = save_snapshot(config, hostname, snapshot_dir, logger)
+    
+    if args.compare:
+        previous = find_previous_snapshot(snapshot_dir, hostname)
+        if previous:
+            diff = compare_configs(config, previous, hostname, logger)
+            if diff:
+                print_summary(diff)
+                if args.diff:
+                    print("\n=== Detailed Unified Diff ===")
+                    print(''.join(diff))
+            else:
+                print(f"\nNo configuration changes detected since {previous.name}")
+        else:
+            logger.info("No previous snapshot available for comparison")
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
 
-    password = args.password or getpass.getpass(f"Password for {args.username}: ")
-
-    hosts = [args.device] if args.device else load_hosts(args.host_file)
-
-    results = []
-    for host in hosts:
-        result = check_device(
-            host=host,
-            username=args.username,
-            password=password,
-            device_type=args.device_type,
-            port=args.port,
-            max_stratum=args.max_stratum,
-            max_offset_ms=args.max_offset,
-        )
-        results.append(result)
-        if args.fail_fast and not result["compliant"]:
-            logger.warning("Fail-fast triggered on %s", host)
-            break
-
-    print_report(results)
-    sys.exit(0 if all(r["compliant"] for r in results) else 1)
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
+```
