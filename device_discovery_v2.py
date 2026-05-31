@@ -1,21 +1,33 @@
-cdp_lldp_crawler.py - Network topology discovery via CDP/LLDP neighbor crawling.
+```python
+"""
+interface_error_monitor.py - Monitor interface error counters on network devices.
 
 Purpose:
-    Discovers network topology by recursively querying CDP or LLDP neighbors
-    starting from a seed device. Builds a map of device adjacencies without
-    relying on IP scanning — uses the devices themselves as the source of truth
-    for neighbor relationships. Useful for documenting unknown networks or
-    verifying topology after changes.
+    Connects to a network device via SSH, collects interface error statistics,
+    and reports interfaces with errors above configurable thresholds. Supports
+    delta mode: collects two snapshots separated by a configurable interval so
+    you see the error *rate* rather than cumulative lifetime counts -- far more
+    useful when chasing an active fault.
 
 Usage:
-    python cdp_lldp_crawler.py --host 10.0.0.1 --username admin --password secret
-    python cdp_lldp_crawler.py --host 10.0.0.1 -u admin -p secret --depth 2 --protocol lldp
-    python cdp_lldp_crawler.py --host 10.0.0.1 -u admin -p secret --output topology.csv
+    # Cumulative errors, report all interfaces:
+    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret
+
+    # Rate mode: compare snapshots 60 seconds apart:
+    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret --delta --interval 60
+
+    # Flag interfaces with >= 100 total errors, save to CSV:
+    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret --threshold 100 --output errors.csv
 
 Prerequisites:
     pip install netmiko
-    CDP or LLDP must be enabled on target devices.
-    SSH access required on all devices to be crawled recursively.
+    Device must support: show interfaces  (Cisco IOS / IOS-XE / NX-OS)
+    SSH access with privilege level sufficient to run show commands.
+
+Exit codes:
+    0 - success, no interfaces above threshold
+    1 - connection / auth failure
+    2 - success, one or more interfaces flagged above threshold
 """
 
 import argparse
@@ -23,195 +35,214 @@ import csv
 import logging
 import re
 import sys
-from collections import deque
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
-)
+
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
 
-def parse_cdp_neighbors(output: str) -> list[dict]:
-    neighbors = []
-    blocks = re.split(r"-{10,}", output)
-    for block in blocks:
-        device_id = re.search(r"Device ID:\s*(\S+)", block)
-        ip_addr = re.search(r"IP(?:v4)? [Aa]ddress:\s*(\d+\.\d+\.\d+\.\d+)", block)
-        platform = re.search(r"Platform:\s*([^,]+)", block)
-        local_iface = re.search(r"Interface:\s*(\S+),", block)
-        remote_iface = re.search(r"Port ID \(outgoing port\):\s*(\S+)", block)
-        if device_id and ip_addr:
-            neighbors.append({
-                "device_id": device_id.group(1),
-                "ip": ip_addr.group(1),
-                "platform": platform.group(1).strip() if platform else "unknown",
-                "local_interface": local_iface.group(1) if local_iface else "unknown",
-                "remote_interface": remote_iface.group(1) if remote_iface else "unknown",
-            })
-    return neighbors
+@dataclass
+class InterfaceErrors:
+    name: str
+    input_errors: int = 0
+    crc: int = 0
+    output_errors: int = 0
+    input_drops: int = 0
+    output_drops: int = 0
+    resets: int = 0
 
+    def total(self) -> int:
+        return self.input_errors + self.output_errors + self.input_drops + self.output_drops
 
-def parse_lldp_neighbors(output: str) -> list[dict]:
-    neighbors = []
-    blocks = re.split(r"-{10,}|={10,}", output)
-    for block in blocks:
-        system_name = re.search(r"System Name:\s*(\S+)", block)
-        ip_addr = re.search(r"(?:Management Address|IP):\s*(\d+\.\d+\.\d+\.\d+)", block)
-        system_desc = re.search(r"System Description:\s*(.+)", block)
-        local_iface = re.search(r"Local Intf:\s*(\S+)", block)
-        remote_iface = re.search(r"Port id:\s*(\S+)", block)
-        if system_name and ip_addr:
-            neighbors.append({
-                "device_id": system_name.group(1),
-                "ip": ip_addr.group(1),
-                "platform": system_desc.group(1).strip()[:40] if system_desc else "unknown",
-                "local_interface": local_iface.group(1) if local_iface else "unknown",
-                "remote_interface": remote_iface.group(1) if remote_iface else "unknown",
-            })
-    return neighbors
-
-
-def query_neighbors(
-    host: str, username: str, password: str, device_type: str, protocol: str
-) -> list[dict]:
-    params = {
-        "device_type": device_type,
-        "host": host,
-        "username": username,
-        "password": password,
-        "timeout": 15,
-    }
-    command = (
-        "show cdp neighbors detail" if protocol == "cdp" else "show lldp neighbors detail"
-    )
-    try:
-        with ConnectHandler(**params) as conn:
-            output = conn.send_command(command, read_timeout=30)
-        parser = parse_cdp_neighbors if protocol == "cdp" else parse_lldp_neighbors
-        return parser(output)
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s", host)
-    except NetmikoTimeoutException:
-        log.error("Connection timed out for %s", host)
-    except Exception as exc:
-        log.error("Error querying %s: %s", host, exc)
-    return []
-
-
-def crawl(
-    seed_host: str,
-    username: str,
-    password: str,
-    device_type: str,
-    protocol: str,
-    max_depth: int,
-) -> list[dict]:
-    edges = []
-    visited_ips = {seed_host}
-    queue = deque([(seed_host, seed_host, 0)])
-
-    while queue:
-        host, source_label, depth = queue.popleft()
-        log.info("Querying %s (depth %d)", host, depth)
-        neighbors = query_neighbors(host, username, password, device_type, protocol)
-        for nbr in neighbors:
-            edges.append({
-                "source_host": source_label,
-                "source_interface": nbr["local_interface"],
-                "neighbor_device_id": nbr["device_id"],
-                "neighbor_ip": nbr["ip"],
-                "neighbor_interface": nbr["remote_interface"],
-                "platform": nbr["platform"],
-            })
-            if depth < max_depth and nbr["ip"] not in visited_ips:
-                visited_ips.add(nbr["ip"])
-                queue.append((nbr["ip"], nbr["device_id"], depth + 1))
-
-    return edges
-
-
-def print_table(edges: list[dict]) -> None:
-    if not edges:
-        print("No neighbors discovered.")
-        return
-    header = (
-        f"{'Source':<22} {'Src Intf':<16} {'Neighbor':<26} "
-        f"{'Nbr IP':<16} {'Nbr Intf':<16} Platform"
-    )
-    print(header)
-    print("-" * len(header))
-    for e in edges:
-        print(
-            f"{e['source_host']:<22} {e['source_interface']:<16} "
-            f"{e['neighbor_device_id']:<26} {e['neighbor_ip']:<16} "
-            f"{e['neighbor_interface']:<16} {e['platform']}"
+    def delta(self, previous: "InterfaceErrors") -> "InterfaceErrors":
+        return InterfaceErrors(
+            name=self.name,
+            input_errors=max(0, self.input_errors - previous.input_errors),
+            crc=max(0, self.crc - previous.crc),
+            output_errors=max(0, self.output_errors - previous.output_errors),
+            input_drops=max(0, self.input_drops - previous.input_drops),
+            output_drops=max(0, self.output_drops - previous.output_drops),
+            resets=max(0, self.resets - previous.resets),
         )
 
 
-def write_csv(edges: list[dict], path: str) -> None:
+def parse_interfaces(raw: str) -> Dict[str, InterfaceErrors]:
+    """Parse 'show interfaces' output into per-interface error counters."""
+    interfaces: Dict[str, InterfaceErrors] = {}
+    current: Optional[str] = None
+
+    for line in raw.splitlines():
+        m = re.match(r'^(\S+)\s+is\s+(?:up|down|administratively down)', line)
+        if m:
+            current = m.group(1)
+            interfaces[current] = InterfaceErrors(name=current)
+            continue
+
+        if current is None:
+            continue
+
+        obj = interfaces[current]
+
+        m = re.search(r'(\d+)\s+input errors.*?(\d+)\s+CRC', line)
+        if m:
+            obj.input_errors = int(m.group(1))
+            obj.crc = int(m.group(2))
+
+        m = re.search(r'(\d+)\s+output errors.*?(\d+)\s+interface resets', line)
+        if m:
+            obj.output_errors = int(m.group(1))
+            obj.resets = int(m.group(2))
+
+        m = re.search(r'(\d+)\s+input\s+drops', line)
+        if m:
+            obj.input_drops = int(m.group(1))
+
+        m = re.search(r'(\d+)\s+output\s+drops', line)
+        if m:
+            obj.output_drops = int(m.group(1))
+
+    return interfaces
+
+
+def collect(conn) -> Dict[str, InterfaceErrors]:
+    log.info("Collecting interface statistics...")
+    return parse_interfaces(conn.send_command("show interfaces", read_timeout=60))
+
+
+def print_report(
+    errors: Dict[str, InterfaceErrors],
+    threshold: int,
+    interval: Optional[int],
+) -> List[InterfaceErrors]:
+    label = f" / {interval}s" if interval else " cumulative"
+    flagged = sorted(
+        [e for e in errors.values() if e.total() >= threshold],
+        key=lambda e: e.total(),
+        reverse=True,
+    )
+
+    if not flagged:
+        log.info("No interfaces exceed threshold of %d%s", threshold, label)
+        return flagged
+
+    print(
+        f"\n{'Interface':<32} {'In-Err':>8} {'CRC':>8} "
+        f"{'Out-Err':>8} {'In-Drop':>8} {'Out-Drop':>8} {'Resets':>8}"
+    )
+    print("-" * 88)
+    for e in flagged:
+        print(
+            f"{e.name:<32} {e.input_errors:>8} {e.crc:>8} {e.output_errors:>8}"
+            f" {e.input_drops:>8} {e.output_drops:>8} {e.resets:>8}"
+        )
+    print(f"\n{len(flagged)} interface(s) above threshold of {threshold}{label}")
+    return flagged
+
+
+def write_csv(flagged: List[InterfaceErrors], path: str) -> None:
     fields = [
-        "source_host", "source_interface", "neighbor_device_id",
-        "neighbor_ip", "neighbor_interface", "platform",
+        "interface", "input_errors", "crc", "output_errors",
+        "input_drops", "output_drops", "resets",
     ]
     with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(edges)
-    log.info("Topology written to %s (%d rows)", path, len(edges))
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for e in flagged:
+            w.writerow({
+                "interface": e.name,
+                "input_errors": e.input_errors,
+                "crc": e.crc,
+                "output_errors": e.output_errors,
+                "input_drops": e.input_drops,
+                "output_drops": e.output_drops,
+                "resets": e.resets,
+            })
+    log.info("Results written to %s", path)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Discover network topology via CDP/LLDP neighbor crawling."
+def build_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Monitor interface error counters on network devices."
     )
-    parser.add_argument("--host", required=True, help="Seed device IP or hostname")
-    parser.add_argument("--username", "-u", required=True, help="SSH username")
-    parser.add_argument("--password", "-p", required=True, help="SSH password")
-    parser.add_argument(
+    p.add_argument("-d", "--device", required=True, help="Device hostname or IP")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", required=True, help="SSH password")
+    p.add_argument(
         "--device-type", default="cisco_ios",
         help="Netmiko device type (default: cisco_ios)",
     )
-    parser.add_argument(
-        "--protocol", choices=["cdp", "lldp"], default="cdp",
-        help="Neighbor discovery protocol (default: cdp)",
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument(
+        "--threshold", type=int, default=0,
+        help="Minimum total errors to flag an interface (default: 0 = report all)",
     )
-    parser.add_argument(
-        "--depth", type=int, default=1,
-        help="Crawl depth: 0 = seed only, 1 = seed + neighbors (default: 1)",
+    p.add_argument(
+        "--delta", action="store_true",
+        help="Collect two snapshots and report error rate over the interval",
     )
-    parser.add_argument("--output", help="Write results to a CSV file")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    args = parser.parse_args()
+    p.add_argument(
+        "--interval", type=int, default=60,
+        help="Seconds between snapshots in delta mode (default: 60)",
+    )
+    p.add_argument("--output", metavar="FILE", help="Write flagged interfaces to a CSV file")
+    p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = build_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    edges = crawl(
-        seed_host=args.host,
-        username=args.username,
-        password=args.password,
-        device_type=args.device_type,
-        protocol=args.protocol,
-        max_depth=args.depth,
-    )
+    params = {
+        "device_type": args.device_type,
+        "host": args.device,
+        "username": args.username,
+        "password": args.password,
+        "port": args.port,
+    }
 
-    print_table(edges)
+    try:
+        log.info("Connecting to %s...", args.device)
+        with ConnectHandler(**params) as conn:
+            snap1 = collect(conn)
 
-    if args.output:
-        write_csv(edges, args.output)
+            if args.delta:
+                log.info("Waiting %d seconds for second snapshot...", args.interval)
+                time.sleep(args.interval)
+                snap2 = collect(conn)
+                errors = {
+                    name: snap2[name].delta(snap1[name])
+                    for name in snap2
+                    if name in snap1
+                }
+                flagged = print_report(errors, args.threshold, args.interval)
+            else:
+                flagged = print_report(snap1, args.threshold, None)
 
-    unique_devices = len({e["neighbor_ip"] for e in edges})
-    log.info(
-        "Discovery complete — %d adjacencies, %d unique neighbors",
-        len(edges),
-        unique_devices,
-    )
-    sys.exit(0 if edges else 1)
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.device)
+        return 1
+    except NetmikoTimeoutException:
+        log.error("Connection timed out to %s", args.device)
+        return 1
+    except Exception as exc:
+        log.error("Unexpected error: %s", exc)
+        return 1
+
+    if args.output and flagged:
+        write_csv(flagged, args.output)
+
+    return 2 if flagged else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
+```
