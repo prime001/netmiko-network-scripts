@@ -1,250 +1,271 @@
-Writing a MAC address tracer script — this is distinct from all existing scripts and covers a real-world daily task (finding which switch port a device is plugged into).
-
 ```python
+#!/usr/bin/env python3
 """
-mac_tracer.py — MAC address and IP-to-port tracer for Cisco IOS/IOS-XE switches.
+Routing Table Audit Script
 
-Purpose:
-    Locate where a MAC address (or IP-mapped MAC) is connected by querying the
-    MAC address table and ARP table on one or more switches. Useful for
-    troubleshooting, asset tracking, and security incident response.
+Verifies critical routes exist on network devices. Compares actual routing table
+against expected routes, reports discrepancies, and alerts on missing/changed routes.
 
 Usage:
-    # Trace a MAC address on a single switch
-    python mac_tracer.py --host 192.168.1.1 --user admin --mac 00:1A:2B:3C:4D:5E
+    python route_auditor.py --device 10.1.1.1 -u admin -p pass -t cisco_ios --routes routes.txt
+    python route_auditor.py --device 10.1.1.1 -u admin -p pass -t arista_eos --routes critical_routes.json
 
-    # Trace an IP address (resolves via ARP table first, then locates port)
-    python mac_tracer.py --host 192.168.1.1 --user admin --ip 10.0.0.55
+Expected routes file format (text):
+    10.0.0.0/8 10.1.1.1
+    192.168.0.0/16 10.1.1.2
 
-    # Search across multiple switches from a file (one IP/hostname per line)
-    python mac_tracer.py --hosts-file switches.txt --user admin --mac aabb.cc00.1234
+Expected routes file format (JSON):
+    {"routes": [{"prefix": "10.0.0.0/8", "nexthop": "10.1.1.1"}]}
+
+Supports:
+    - Cisco IOS, IOS-XE, NXOS
+    - Arista EOS
+    - Juniper Junos
 
 Prerequisites:
-    pip install netmiko
-    SSH must be enabled on the target switch(es).
-    For --ip tracing, the first host must be a Layer-3 device holding the ARP table.
+    - netmiko installed: pip install netmiko
+    - Network connectivity to target device
+    - Read access to routing table
+    - Expected routes file created
+
+Exit codes:
+    0 = all expected routes present
+    1 = missing or changed routes
+    2 = error connecting or parsing
 """
 
 import argparse
-import getpass
+import json
 import logging
-import re
 import sys
-from typing import Optional
-
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
-
+import re
+from pathlib import Path
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
     level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-def normalize_mac(mac: str) -> str:
-    """Normalize any common MAC format to Cisco dotted-quad (xxxx.xxxx.xxxx)."""
-    raw = re.sub(r"[.:\-]", "", mac).lower()
-    if len(raw) != 12 or not re.fullmatch(r"[0-9a-f]{12}", raw):
-        raise ValueError(f"Invalid MAC address: {mac!r}")
-    return f"{raw[0:4]}.{raw[4:8]}.{raw[8:12]}"
+def parse_ios_routing_table(output):
+    """Parse Cisco IOS 'show ip route' output."""
+    routes = {}
+    for line in output.split('\n'):
+        line = line.strip()
+        if not line or line.startswith('Codes') or line.startswith('Gateway'):
+            continue
+        
+        parts = line.split()
+        if len(parts) >= 2 and '.' in parts[0]:
+            prefix = parts[0]
+            if parts[0][0] in 'CSLRIDOB':
+                prefix = parts[1]
+            
+            nexthop = None
+            for i, part in enumerate(parts):
+                if '.' in part and part != prefix:
+                    nexthop = part
+                    break
+            
+            if prefix and nexthop:
+                routes[prefix] = nexthop
+    
+    return routes
 
 
-def resolve_ip_to_mac(conn, ip: str) -> Optional[str]:
-    """Query ARP table on an already-open connection; return MAC or None."""
-    output = conn.send_command(f"show ip arp {ip}")
-    match = re.search(
-        r"Internet\s+\S+\s+\S+\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})",
-        output,
-        re.IGNORECASE,
-    )
-    if match:
-        return match.group(1).lower()
-    log.warning("IP %s not found in ARP table on %s", ip, conn.host)
-    return None
+def parse_junos_routing_table(output):
+    """Parse Juniper Junos 'show route' output."""
+    routes = {}
+    for line in output.split('\n'):
+        line = line.strip()
+        if not line or line.startswith('Routing'):
+            continue
+        
+        parts = line.split()
+        if len(parts) >= 3 and '.' in parts[0]:
+            prefix = parts[0]
+            nexthop = None
+            
+            for i, part in enumerate(parts):
+                if '.' in part and part != prefix:
+                    nexthop = part
+                    break
+            
+            if prefix and nexthop:
+                routes[prefix] = nexthop
+    
+    return routes
 
 
-def query_mac_table(conn, mac: str) -> list[dict]:
-    """Return parsed MAC address table entries matching the given MAC."""
-    output = conn.send_command(f"show mac address-table address {mac}")
-    entries = []
-    for line in output.splitlines():
-        m = re.match(
-            r"\s*(\d+)\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+(\S+)\s+(\S+)",
-            line,
-            re.IGNORECASE,
-        )
-        if m:
-            entries.append(
-                {
-                    "vlan": m.group(1),
-                    "mac": m.group(2).lower(),
-                    "type": m.group(3),
-                    "port": m.group(4),
-                }
-            )
-    return entries
-
-
-def trace_on_host(
-    host: str,
-    username: str,
-    password: str,
-    mac: str,
-    device_type: str,
-) -> list[dict]:
-    """Connect to one host, query MAC table, return annotated entries."""
-    params = {
-        "device_type": device_type,
-        "host": host,
-        "username": username,
-        "password": password,
-    }
+def load_expected_routes(filepath):
+    """Load expected routes from text or JSON file."""
+    filepath = Path(filepath)
+    expected = {}
+    
     try:
-        log.info("Connecting to %s ...", host)
-        with ConnectHandler(**params) as conn:
-            entries = query_mac_table(conn, mac)
-            for e in entries:
-                e["host"] = host
-            if not entries:
-                log.info("MAC %s not found on %s", mac, host)
-            return entries
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s", host)
-    except NetmikoTimeoutException:
-        log.error("Connection timed out for %s", host)
-    except Exception as exc:
-        log.error("Error on %s: %s", host, exc)
-    return []
+        content = filepath.read_text()
+        
+        if filepath.suffix.lower() == '.json':
+            data = json.loads(content)
+            for route in data.get('routes', []):
+                expected[route['prefix']] = route['nexthop']
+        else:
+            for line in content.split('\n'):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    expected[parts[0]] = parts[1]
+        
+        logger.info(f"Loaded {len(expected)} expected routes from {filepath}")
+        return expected
+    
+    except FileNotFoundError:
+        logger.error(f"Route file not found: {filepath}")
+        raise
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in {filepath}: {e}")
+        raise
 
 
-def resolve_then_trace(
-    host: str,
-    username: str,
-    password: str,
-    ip: str,
-    device_type: str,
-) -> tuple[Optional[str], list[dict]]:
-    """Single-connection ARP resolution + MAC table lookup on the same host."""
-    params = {
-        "device_type": device_type,
-        "host": host,
-        "username": username,
-        "password": password,
+def get_routing_table(device, username, password, device_type, timeout=15):
+    """
+    Connect to device and retrieve routing table.
+    
+    Args:
+        device: IP or hostname
+        username: login username
+        password: login password
+        device_type: netmiko device type
+        timeout: connection timeout in seconds
+    
+    Returns:
+        dict: routes with their next hops
+    
+    Raises:
+        NetmikoAuthenticationException: invalid credentials
+        NetmikoTimeoutException: connection timeout
+    """
+    conn_params = {
+        'device_type': device_type,
+        'host': device,
+        'username': username,
+        'password': password,
+        'timeout': timeout,
     }
+    
     try:
-        log.info("Connecting to %s to resolve IP %s ...", host, ip)
-        with ConnectHandler(**params) as conn:
-            mac = resolve_ip_to_mac(conn, ip)
-            if not mac:
-                return None, []
-            log.info("Resolved %s → %s", ip, mac)
-            entries = query_mac_table(conn, mac)
-            for e in entries:
-                e["host"] = host
-            return mac, entries
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s", host)
-    except NetmikoTimeoutException:
-        log.error("Connection timed out for %s", host)
-    except Exception as exc:
-        log.error("Error on %s: %s", host, exc)
-    return None, []
+        device_conn = ConnectHandler(**conn_params)
+        logger.info(f"Connected to {device}")
+    except NetmikoAuthenticationException as e:
+        logger.error(f"Authentication failed: {e}")
+        raise
+    except NetmikoTimeoutException as e:
+        logger.error(f"Connection timeout: {e}")
+        raise
+    
+    try:
+        if 'cisco' in device_type.lower():
+            output = device_conn.send_command('show ip route')
+            routes = parse_ios_routing_table(output)
+        elif 'junos' in device_type.lower():
+            output = device_conn.send_command('show route')
+            routes = parse_junos_routing_table(output)
+        else:
+            logger.warning(f"Route parsing not implemented for {device_type}")
+            routes = {}
+    finally:
+        device_conn.disconnect()
+    
+    return routes
 
 
-def print_results(results: list[dict], mac: str) -> None:
-    if not results:
-        print(f"\nMAC {mac} not found on any queried device.")
-        return
-    print(f"\nResults for MAC: {mac}")
-    print("-" * 62)
-    print(f"{'Host':<22} {'VLAN':<8} {'Type':<12} {'Port'}")
-    print("-" * 62)
-    for r in results:
-        print(f"{r['host']:<22} {r['vlan']:<8} {r['type']:<12} {r['port']}")
-    print("-" * 62)
-    print(f"  {len(results)} match(es) across {len({r['host'] for r in results})} device(s).")
+def audit_routes(actual, expected):
+    """Compare actual and expected routes."""
+    missing = {}
+    changed = {}
+    
+    for prefix, expected_nh in expected.items():
+        if prefix not in actual:
+            missing[prefix] = expected_nh
+        elif actual[prefix] != expected_nh:
+            changed[prefix] = {
+                'expected': expected_nh,
+                'actual': actual[prefix]
+            }
+    
+    return missing, changed
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(
-        description="Trace a MAC or IP address to a switch port.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description='Audit routing table against expected routes'
     )
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("--mac", help="MAC address to search (any common delimiter format)")
-    target.add_argument("--ip", help="IP address — resolved via ARP, then traced to port")
-
-    hosts_group = parser.add_mutually_exclusive_group(required=True)
-    hosts_group.add_argument("--host", help="Single switch hostname or IP")
-    hosts_group.add_argument(
-        "--hosts-file",
-        help="File listing switch IPs/hostnames, one per line (# comments ok)",
-    )
-
-    parser.add_argument("--user", required=True, help="SSH username")
-    parser.add_argument("--password", help="SSH password (prompted if omitted)")
     parser.add_argument(
-        "--device-type",
-        default="cisco_ios",
-        help="Netmiko device type (default: cisco_ios)",
+        '--device', '-d', required=True,
+        help='Target device IP or hostname'
     )
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        '--username', '-u', required=True,
+        help='Login username'
+    )
+    parser.add_argument(
+        '--password', '-p', required=True,
+        help='Login password'
+    )
+    parser.add_argument(
+        '--device-type', '-t', default='cisco_ios',
+        help='Netmiko device type (default: cisco_ios)'
+    )
+    parser.add_argument(
+        '--routes', '-r', required=True,
+        help='Path to expected routes file (text or JSON)'
+    )
+    parser.add_argument(
+        '--timeout', type=int, default=15,
+        help='Connection timeout in seconds (default: 15)'
+    )
+    
     args = parser.parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    password = args.password or getpass.getpass(f"Password for {args.user}: ")
-
-    if args.mac:
-        try:
-            mac = normalize_mac(args.mac)
-        except ValueError as exc:
-            log.error(exc)
-            sys.exit(1)
-    else:
-        mac = None
-
-    if args.hosts_file:
-        try:
-            with open(args.hosts_file) as fh:
-                host_list = [
-                    ln.strip()
-                    for ln in fh
-                    if ln.strip() and not ln.startswith("#")
-                ]
-        except FileNotFoundError:
-            log.error("Hosts file not found: %s", args.hosts_file)
-            sys.exit(1)
-    else:
-        host_list = [args.host]
-
-    all_results: list[dict] = []
-
-    if args.ip:
-        resolved_mac, first_results = resolve_then_trace(
-            host_list[0], args.user, password, args.ip, args.device_type
+    
+    try:
+        expected = load_expected_routes(args.routes)
+        actual = get_routing_table(
+            args.device,
+            args.username,
+            args.password,
+            args.device_type,
+            args.timeout
         )
-        if not resolved_mac:
-            sys.exit(1)
-        mac = resolved_mac
-        all_results.extend(first_results)
-        for host in host_list[1:]:
-            all_results.extend(
-                trace_on_host(host, args.user, password, mac, args.device_type)
+    except Exception as e:
+        logger.error(f"Failed to audit routes: {e}")
+        return 2
+    
+    missing, changed = audit_routes(actual, expected)
+    
+    if not missing and not changed:
+        logger.info(f"All {len(expected)} expected routes present on {args.device}")
+        return 0
+    
+    if missing:
+        logger.error(f"Missing {len(missing)} route(s):")
+        for prefix, nexthop in sorted(missing.items()):
+            logger.error(f"  {prefix} -> {nexthop}")
+    
+    if changed:
+        logger.warning(f"Changed {len(changed)} route(s):")
+        for prefix, data in sorted(changed.items()):
+            logger.warning(
+                f"  {prefix}: expected {data['expected']}, got {data['actual']}"
             )
-    else:
-        for host in host_list:
-            all_results.extend(
-                trace_on_host(host, args.user, password, mac, args.device_type)
-            )
-
-    print_results(all_results, mac)
-    sys.exit(0 if all_results else 1)
+    
+    return 1
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    sys.exit(main())
 ```
