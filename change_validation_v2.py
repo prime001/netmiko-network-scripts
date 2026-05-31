@@ -1,202 +1,213 @@
-The user wants the script content as text output only — no file write needed. Here it is:
-
-```
-route_table_diff.py
-```
-
+#!/usr/bin/env python3
 """
-route_table_diff.py - Pre/post change routing table snapshot and diff tool.
+Configuration Backup and Diff Tool
 
-Captures the IPv4 routing table from a Cisco IOS (or compatible) device,
-saves a timestamped JSON snapshot, and diffs it against a previously saved
-snapshot to surface routes added, removed, or changed during a maintenance
-window.
+Captures running configuration from network devices, compares with previous
+backups, and displays differences. Useful for change management and auditing.
 
 Usage:
-    # Capture a pre-change baseline
-    python route_table_diff.py --host 10.0.0.1 --username admin --snapshot pre
-
-    # Capture post-change and compare against the pre snapshot
-    python route_table_diff.py --host 10.0.0.1 --username admin \
-        --snapshot post --compare 10.0.0.1_pre_20240315_143000.json
-
-    # Diff two saved snapshots without connecting to a device
-    python route_table_diff.py --diff before.json after.json
+    python config_backup_diff.py --device 192.168.1.1 --username admin --password secret
+    python config_backup_diff.py --device 10.0.0.1 -u admin -p secret --backup-dir ./backups
 
 Prerequisites:
-    pip install netmiko
+    - netmiko library installed
+    - Network device accessible via SSH (TCP port 22 or custom)
+    - Valid credentials with enable/admin privileges
+    - Python 3.7+
+
+Examples:
+    # Backup Cisco device and compare with previous version
+    ./config_backup_diff.py --device router1.example.com -u netadmin -p mypass123
+
+    # Specify non-standard SSH port and backup directory
+    ./config_backup_diff.py --device 192.168.1.1 -u admin -p pass --port 2222 --backup-dir /var/backups/configs
+
+The script automatically stores timestamped backups and displays unified diff
+output when previous backups exist.
 """
 
 import argparse
-import json
+import difflib
 import logging
-import re
 import sys
 from datetime import datetime
-from getpass import getpass
 from pathlib import Path
 
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
-
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger(__name__)
-
-# Matches IOS "show ip route" prefix lines, e.g.:
-#   C    10.0.0.0/24 is directly connected, GigabitEthernet0/0
-#   O    192.168.1.0/24 [110/2] via 10.0.0.2, 00:01:23, Gi0/0
-ROUTE_RE = re.compile(r"^([A-Z*][A-Z* ]*?)\s+([\d./]+)\s+", re.MULTILINE)
+from netmiko.exceptions import NetmikoTimeoutException, NetmikoAuthenticationException
 
 
-def parse_routes(output: str) -> dict:
-    """Extract {prefix: protocol} from 'show ip route' output."""
-    routes = {}
-    for match in ROUTE_RE.finditer(output):
-        protocol = match.group(1).strip()
-        prefix = match.group(2).strip()
-        routes[prefix] = protocol
-    return routes
+def setup_logging(verbose=False):
+    """Configure logging with timestamp and level information."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    return logging.getLogger(__name__)
 
 
-def fetch_routes(host: str, username: str, password: str, device_type: str) -> dict:
-    device = {
-        "device_type": device_type,
-        "host": host,
-        "username": username,
-        "password": password,
-    }
-    log.info("Connecting to %s (%s)", host, device_type)
+def get_device_config(device_params, logger):
+    """
+    Connect to device and retrieve running configuration.
+    
+    Args:
+        device_params: Dictionary with connection parameters for netmiko
+        logger: Logger instance for status messages
+        
+    Returns:
+        Configuration string on success, None on failure
+    """
     try:
-        with ConnectHandler(**device) as conn:
-            output = conn.send_command("show ip route", read_timeout=30)
-        log.info("Retrieved routing table (%d lines)", output.count("\n"))
-        return parse_routes(output)
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s", host)
-        sys.exit(1)
+        logger.info(f"Connecting to {device_params['host']}")
+        connection = ConnectHandler(**device_params)
+        
+        logger.info("Retrieving running configuration")
+        config = connection.send_command("show running-config")
+        
+        connection.disconnect()
+        logger.info("Successfully retrieved configuration")
+        return config
+        
     except NetmikoTimeoutException:
-        log.error("Connection timed out for %s", host)
-        sys.exit(1)
+        logger.error(f"Timeout connecting to {device_params['host']}")
+        return None
+    except NetmikoAuthenticationException:
+        logger.error(f"Authentication failed for {device_params['host']}")
+        return None
+    except Exception as e:
+        logger.error(f"Error retrieving configuration: {e}")
+        return None
 
 
-def save_snapshot(host: str, label: str, routes: dict) -> Path:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = Path(f"{host}_{label}_{ts}.json")
-    payload = {"host": host, "label": label, "timestamp": ts, "routes": routes}
-    filename.write_text(json.dumps(payload, indent=2))
-    log.info("Snapshot saved: %s (%d routes)", filename, len(routes))
+def find_previous_backup(device_name, backup_dir):
+    """
+    Locate the most recent backup file for a device.
+    
+    Args:
+        device_name: Device hostname or IP address
+        backup_dir: Directory containing backup files
+        
+    Returns:
+        Path object to previous backup or None if not found
+    """
+    backup_dir = Path(backup_dir)
+    if not backup_dir.exists():
+        return None
+    
+    pattern = f"{device_name}_*.backup"
+    backups = sorted(backup_dir.glob(pattern))
+    return backups[-1] if backups else None
+
+
+def save_backup(config, device_name, backup_dir, logger):
+    """
+    Persist configuration backup with ISO timestamp.
+    
+    Args:
+        config: Configuration string content
+        device_name: Device hostname or IP
+        backup_dir: Directory for storing backups
+        logger: Logger instance
+        
+    Returns:
+        Path object to saved backup file
+    """
+    backup_dir = Path(backup_dir)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = backup_dir / f"{device_name}_{timestamp}.backup"
+    
+    with open(filename, 'w') as f:
+        f.write(config)
+    
+    logger.info(f"Configuration saved to {filename}")
     return filename
 
 
-def load_snapshot(path: str) -> dict:
-    p = Path(path)
-    if not p.exists():
-        log.error("Snapshot file not found: %s", path)
-        sys.exit(1)
-    return json.loads(p.read_text())
+def display_diff(old_config, new_config, device_name):
+    """
+    Display unified diff between two configurations.
+    
+    Args:
+        old_config: Previous configuration content
+        new_config: Current configuration content
+        device_name: Device identifier for output header
+    """
+    old_lines = old_config.splitlines(keepends=True)
+    new_lines = new_config.splitlines(keepends=True)
+    
+    diff = list(difflib.unified_diff(
+        old_lines,
+        new_lines,
+        fromfile=f"{device_name} (previous)",
+        tofile=f"{device_name} (current)",
+        lineterm=''
+    ))
+    
+    print(f"\n{'='*70}")
+    print(f"Configuration Comparison - {device_name}")
+    print(f"{'='*70}\n")
+    
+    if not diff:
+        print("No configuration changes detected.\n")
+    else:
+        print(''.join(diff))
 
 
-def diff_snapshots(before: dict, after: dict) -> int:
-    """Print a human-readable diff. Returns number of changes found."""
-    b_routes = before["routes"]
-    a_routes = after["routes"]
-
-    added = {k: v for k, v in a_routes.items() if k not in b_routes}
-    removed = {k: v for k, v in b_routes.items() if k not in a_routes}
-    changed = {
-        k: (b_routes[k], a_routes[k])
-        for k in b_routes
-        if k in a_routes and b_routes[k] != a_routes[k]
+def main():
+    """Parse arguments, execute backup/compare workflow."""
+    parser = argparse.ArgumentParser(
+        description='Backup device config and compare with previous version'
+    )
+    parser.add_argument('--device', required=True,
+                        help='Device IP address or hostname')
+    parser.add_argument('-u', '--username', required=True,
+                        help='SSH username')
+    parser.add_argument('-p', '--password', required=True,
+                        help='SSH password')
+    parser.add_argument('-t', '--device-type', default='cisco_ios',
+                        help='Netmiko device type (default: cisco_ios)')
+    parser.add_argument('--backup-dir', default='./config_backups',
+                        help='Directory for storing backups (default: ./config_backups)')
+    parser.add_argument('--port', type=int, default=22,
+                        help='SSH port (default: 22)')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Enable verbose logging')
+    
+    args = parser.parse_args()
+    logger = setup_logging(args.verbose)
+    
+    device_params = {
+        'device_type': args.device_type,
+        'host': args.device,
+        'username': args.username,
+        'password': args.password,
+        'port': args.port,
+        'timeout': 30,
+        'conn_timeout': 30,
     }
-
-    b_label = before.get("label", "before")
-    a_label = after.get("label", "after")
-    print(f"\nRoute diff: {b_label} -> {a_label}")
-    print(
-        f"  Before: {before.get('timestamp', '?')} ({len(b_routes)} routes)  |  "
-        f"After: {after.get('timestamp', '?')} ({len(a_routes)} routes)\n"
-    )
-
-    if not added and not removed and not changed:
-        print("  No routing changes detected.")
-        return 0
-
-    if added:
-        print(f"  ADDED ({len(added)}):")
-        for prefix, proto in sorted(added.items()):
-            print(f"    + {prefix:<25} [{proto}]")
-
-    if removed:
-        print(f"\n  REMOVED ({len(removed)}):")
-        for prefix, proto in sorted(removed.items()):
-            print(f"    - {prefix:<25} [{proto}]")
-
-    if changed:
-        print(f"\n  PROTOCOL CHANGE ({len(changed)}):")
-        for prefix, (old, new) in sorted(changed.items()):
-            print(f"    ~ {prefix:<25} {old} -> {new}")
-
-    return len(added) + len(removed) + len(changed)
-
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Capture and diff routing table snapshots around network changes."
-    )
-    p.add_argument("--host", help="Device IP or hostname")
-    p.add_argument("--username", help="SSH username")
-    p.add_argument("--password", help="SSH password (prompted if omitted)")
-    p.add_argument(
-        "--device-type",
-        default="cisco_ios",
-        help="Netmiko device type (default: cisco_ios)",
-    )
-    p.add_argument(
-        "--snapshot",
-        metavar="LABEL",
-        help="Capture a snapshot with this label (e.g. 'pre' or 'post')",
-    )
-    p.add_argument(
-        "--compare",
-        metavar="FILE",
-        help="Snapshot JSON to diff the new capture against",
-    )
-    p.add_argument(
-        "--diff",
-        nargs=2,
-        metavar=("BEFORE", "AFTER"),
-        help="Diff two existing snapshot files without connecting to a device",
-    )
-    return p
+    
+    # Retrieve current configuration
+    current_config = get_device_config(device_params, logger)
+    if not current_config:
+        logger.error("Failed to retrieve configuration from device")
+        sys.exit(1)
+    
+    # Compare with previous backup if available
+    previous_backup_path = find_previous_backup(args.device, args.backup_dir)
+    if previous_backup_path:
+        logger.info(f"Found previous backup: {previous_backup_path}")
+        with open(previous_backup_path, 'r') as f:
+            previous_config = f.read()
+        display_diff(previous_config, current_config, args.device)
+    else:
+        logger.info("No previous backup found - first backup for this device")
+    
+    # Save current configuration
+    save_backup(current_config, args.device, args.backup_dir, logger)
 
 
 if __name__ == "__main__":
-    parser = build_parser()
-    args = parser.parse_args()
-
-    if args.diff:
-        before = load_snapshot(args.diff[0])
-        after = load_snapshot(args.diff[1])
-        changes = diff_snapshots(before, after)
-        sys.exit(0 if changes == 0 else 1)
-
-    if not args.host or not args.snapshot:
-        parser.error("--host and --snapshot are required when not using --diff")
-
-    password = args.password or getpass(f"Password for {args.username}@{args.host}: ")
-    routes = fetch_routes(args.host, args.username, password, args.device_type)
-    save_snapshot(args.host, args.snapshot, routes)
-
-    if args.compare:
-        before = load_snapshot(args.compare)
-        after_payload = {
-            "host": args.host,
-            "label": args.snapshot,
-            "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
-            "routes": routes,
-        }
-        changes = diff_snapshots(before, after_payload)
-        sys.exit(0 if changes == 0 else 1)
+    main()
