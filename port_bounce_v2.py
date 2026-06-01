@@ -1,23 +1,33 @@
-Here's the script:
+The write was blocked by permissions. The script is ready — here it is directly:
 
 ```python
 """
-PoE Port Recycler — power-cycle PoE-powered devices via Cisco IOS/IOS-XE.
+errdisable_recovery.py - Err-Disabled Interface Recovery Tool
 
-Unlike a generic port bounce, this script targets Power over Ethernet ports
-specifically: it captures pre-cycle PoE status and power draw, issues
-`power inline reset` (or shutdown/no shutdown on unsupported platforms),
-then polls until the powered device re-negotiates and reports its wattage.
+Purpose:
+    Detects interfaces stuck in err-disabled state on Cisco IOS/IOS-XE devices,
+    reports the root cause (port-security, bpduguard, loopback-detected, etc.),
+    and optionally recovers them via a controlled shutdown / no-shutdown cycle.
 
 Usage:
-    python poe_port_recycler.py -d 192.168.1.1 -u admin -p secret \
-        -i GigabitEthernet1/0/5 GigabitEthernet1/0/12
+    # Audit only — list all err-disabled interfaces and their reasons
+    python errdisable_recovery.py --host 192.168.1.1 -u admin -p secret
 
-    python poe_port_recycler.py -d 192.168.1.1 -u admin -p secret \
-        -i GigabitEthernet1/0/5 --timeout 60 --device-type cisco_ios
+    # Recover all err-disabled interfaces
+    python errdisable_recovery.py --host 192.168.1.1 -u admin -p secret --recover
+
+    # Recover specific interfaces only
+    python errdisable_recovery.py --host 192.168.1.1 -u admin -p secret \
+        --recover --interfaces Gi0/1,Gi0/2
+
+    # Increase shutdown dwell time (useful for BPDU guard scenarios)
+    python errdisable_recovery.py --host 192.168.1.1 -u admin -p secret \
+        --recover --wait 15
 
 Prerequisites:
     pip install netmiko
+    Supported platforms: Cisco IOS, IOS-XE (any device with
+        'show interfaces status err-disabled' and 'show errdisable recovery')
 """
 
 import argparse
@@ -25,168 +35,179 @@ import logging
 import re
 import sys
 import time
+from getpass import getpass
 
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
     level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-POE_STATUS_RE = re.compile(
-    r"^(?P<iface>\S+)\s+(?P<admin>\S+)\s+(?P<oper>\S+)\s+(?P<power>[\d.]+)\s+(?P<device>\S+)\s+(?P<class>\S+)",
-    re.MULTILINE,
-)
 
-
-def parse_poe_status(output: str, iface: str) -> dict | None:
-    """Extract PoE fields for a specific interface from `show power inline` output."""
-    short = iface.replace("GigabitEthernet", "Gi").replace("FastEthernet", "Fa")
-    for m in POE_STATUS_RE.finditer(output):
-        if m.group("iface").startswith(short) or m.group("iface").startswith(iface):
-            return m.groupdict()
-    return None
-
-
-def get_poe_status(conn, iface: str) -> dict | None:
-    out = conn.send_command(f"show power inline {iface}")
-    return parse_poe_status(out, iface)
-
-
-def recycle_port(conn, iface: str, use_inline_reset: bool, wait: int) -> bool:
-    """Power-cycle a single PoE port. Returns True if the port came back powered."""
-    if use_inline_reset:
-        log.info("[%s] Issuing 'power inline reset'", iface)
-        conn.send_config_set([f"interface {iface}", "power inline reset"])
-    else:
-        log.info("[%s] Bouncing via shutdown / no shutdown", iface)
-        conn.send_config_set([f"interface {iface}", "shutdown"])
-        time.sleep(2)
-        conn.send_config_set([f"interface {iface}", "no shutdown"])
-
-    log.info("[%s] Waiting up to %ds for device to re-negotiate PoE", iface, wait)
-    deadline = time.monotonic() + wait
-    while time.monotonic() < deadline:
-        time.sleep(5)
-        status = get_poe_status(conn, iface)
-        if status and status["oper"].lower() in ("on", "powered"):
-            log.info(
-                "[%s] Device re-powered. Draw: %sW  Class: %s",
-                iface,
-                status["power"],
-                status["class"],
-            )
-            return True
-        oper = status["oper"] if status else "unknown"
-        log.debug("[%s] PoE state: %s — still waiting…", iface, oper)
-
-    log.warning("[%s] Device did not re-power within %ds", iface, wait)
-    return False
-
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Recycle PoE ports and verify device recovery.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+def parse_errdisabled(output: str) -> list:
+    """Extract err-disabled interfaces and reasons from 'show interfaces status err-disabled'."""
+    results = []
+    pattern = re.compile(
+        r"^(\S+)\s+\S*\s+err-disabled\s+(\S.*?)\s*$",
+        re.MULTILINE | re.IGNORECASE,
     )
-    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", required=True, help="SSH password")
-    p.add_argument(
-        "-i", "--interfaces", required=True, nargs="+",
-        help="One or more interface names (e.g. GigabitEthernet1/0/5)"
-    )
-    p.add_argument(
-        "--device-type", default="cisco_ios",
-        help="Netmiko device type"
-    )
-    p.add_argument(
-        "--timeout", type=int, default=45,
-        help="Seconds to wait per port for PoE re-negotiation"
-    )
-    p.add_argument(
-        "--no-inline-reset", action="store_true",
-        help="Use shutdown/no-shutdown instead of 'power inline reset'"
-    )
-    p.add_argument(
-        "--secret", default="",
-        help="Enable secret (if required)"
-    )
-    p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    return p
+    for match in pattern.finditer(output):
+        results.append({
+            "interface": match.group(1),
+            "reason": match.group(2).strip(),
+        })
+    return results
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def recover_interface(connection, interface: str, wait: int) -> bool:
+    """Bounce a single interface: shutdown, wait, no shutdown."""
+    log.info("Recovering %s (shutdown → %ds dwell → no shutdown)", interface, wait)
+    try:
+        connection.send_config_set([f"interface {interface}", "shutdown"])
+        time.sleep(wait)
+        connection.send_config_set([f"interface {interface}", "no shutdown"])
+        return True
+    except Exception as exc:
+        log.error("Config push failed for %s: %s", interface, exc)
+        return False
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
 
-    device_params = {
+def post_check_status(connection, interface: str) -> str:
+    """Return a human-readable status string after a recovery attempt."""
+    time.sleep(3)
+    output = connection.send_command(f"show interfaces {interface} status")
+    lower = output.lower()
+    if "err-disabled" in lower:
+        return "still err-disabled"
+    if "connected" in lower:
+        return "connected"
+    if "notconnect" in lower:
+        return "not connected (no link)"
+    return "unknown"
+
+
+def build_device_dict(args, password: str) -> dict:
+    return {
         "device_type": args.device_type,
-        "host": args.device,
+        "host": args.host,
         "username": args.username,
-        "password": args.password,
-        "secret": args.secret,
+        "password": password,
+        "port": args.port,
         "timeout": 30,
+        "session_log": None,
     }
 
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Audit and recover err-disabled interfaces on Cisco IOS/IOS-XE"
+    )
+    parser.add_argument("--host", required=True, help="Device IP or hostname")
+    parser.add_argument("--username", "-u", required=True, help="SSH username")
+    parser.add_argument(
+        "--password", "-p", default=None,
+        help="SSH password (prompted if omitted)",
+    )
+    parser.add_argument(
+        "--device-type", default="cisco_ios",
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument(
+        "--recover", action="store_true",
+        help="Attempt recovery on discovered err-disabled interfaces",
+    )
+    parser.add_argument(
+        "--interfaces",
+        help="Comma-separated interfaces to recover; omit to recover all err-disabled",
+    )
+    parser.add_argument(
+        "--wait", type=int, default=5,
+        help="Seconds between shutdown and no-shutdown (default: 5)",
+    )
+    args = parser.parse_args()
+
+    password = args.password or getpass(f"Password for {args.username}@{args.host}: ")
+
+    log.info("Connecting to %s", args.host)
     try:
-        log.info("Connecting to %s", args.device)
-        with ConnectHandler(**device_params) as conn:
-            if args.secret:
-                conn.enable()
-
-            results = {}
-            for iface in args.interfaces:
-                pre = get_poe_status(conn, iface)
-                if pre is None:
-                    log.error("[%s] Not found in PoE table — skipping", iface)
-                    results[iface] = "skipped"
-                    continue
-
-                log.info(
-                    "[%s] Pre-cycle: oper=%s power=%sW class=%s device=%s",
-                    iface, pre["oper"], pre["power"], pre["class"], pre["device"],
-                )
-
-                if pre["oper"].lower() not in ("on", "powered"):
-                    log.warning(
-                        "[%s] Port is not currently powered (oper=%s) — recycling anyway",
-                        iface, pre["oper"],
-                    )
-
-                ok = recycle_port(
-                    conn, iface,
-                    use_inline_reset=not args.no_inline_reset,
-                    wait=args.timeout,
-                )
-                results[iface] = "recovered" if ok else "failed"
-
-        log.info("--- Summary ---")
-        failures = 0
-        for iface, outcome in results.items():
-            log.info("  %-35s %s", iface, outcome.upper())
-            if outcome == "failed":
-                failures += 1
-
-        return 0 if failures == 0 else 1
-
+        conn = ConnectHandler(**build_device_dict(args, password))
     except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s", args.device)
-        return 2
+        log.error("Authentication failed for %s@%s", args.username, args.host)
+        sys.exit(1)
     except NetmikoTimeoutException:
-        log.error("Connection timed out to %s", args.device)
-        return 2
+        log.error("Connection timed out to %s:%d", args.host, args.port)
+        sys.exit(1)
+
+    try:
+        raw = conn.send_command("show interfaces status err-disabled")
+        errdisabled = parse_errdisabled(raw)
+
+        if not errdisabled:
+            log.info("No err-disabled interfaces found on %s", args.host)
+            return
+
+        print(f"\nErr-disabled interfaces on {args.host}:")
+        print(f"  {'Interface':<22} {'Reason'}")
+        print(f"  {'-'*21} {'-'*30}")
+        for entry in errdisabled:
+            print(f"  {entry['interface']:<22} {entry['reason']}")
+        print()
+
+        if not args.recover:
+            log.info("Pass --recover to attempt recovery of the above interfaces")
+            return
+
+        targets = errdisabled
+        if args.interfaces:
+            wanted = {i.strip() for i in args.interfaces.split(",")}
+            targets = [e for e in errdisabled if e["interface"] in wanted]
+            if not targets:
+                log.warning("None of the specified interfaces are currently err-disabled")
+                return
+
+        results = []
+        for entry in targets:
+            intf = entry["interface"]
+            ok = recover_interface(conn, intf, args.wait)
+            status = post_check_status(conn, intf) if ok else "recovery command failed"
+            results.append((intf, entry["reason"], status))
+            log.info("%s → %s", intf, status)
+
+        print(f"Recovery results on {args.host}:")
+        print(f"  {'Interface':<22} {'Reason':<28} {'Result'}")
+        print(f"  {'-'*21} {'-'*27} {'-'*24}")
+        for intf, reason, status in results:
+            print(f"  {intf:<22} {reason:<28} {status}")
+        print()
+
+        still_bad = [r for r in results if "err-disabled" in r[2]]
+        if still_bad:
+            log.warning(
+                "%d interface(s) remain err-disabled — root cause must be "
+                "resolved before recovery will persist",
+                len(still_bad),
+            )
+
     except Exception as exc:
         log.error("Unexpected error: %s", exc)
-        return 3
+        sys.exit(1)
+    finally:
+        conn.disconnect()
+        log.info("Disconnected from %s", args.host)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
 ```
 
-This is `poe_port_recycler.py` — differentiated from the existing port-bounce scripts by targeting PoE specifically: it parses `show power inline` before and after the cycle, prefers `power inline reset` over shutdown/no-shutdown (Cisco's purpose-built command for this), and polls until the powered device re-negotiates rather than just waiting a fixed delay. Exit code reflects per-port success so it's scriptable in CI/NOC pipelines.
+**What makes this distinct from the existing port_bounce scripts:**
+
+- **Scope is diagnostic first** — runs `show interfaces status err-disabled` to discover *only* interfaces in err-disable state (not any port you hand it)
+- **Reports root cause** — psecure-violation, bpduguard, loopback-detected, udld-error, etc. are surfaced before any action
+- **Post-recovery verification** — checks whether the interface actually came back or went straight back into err-disable (which tells you the root cause wasn't cleared)
+- **Warns on persistent err-disable** — if an interface re-enters err-disable immediately, it flags that the underlying violation (e.g., a rogue AP triggering BPDU guard) must be addressed before recovery will hold
