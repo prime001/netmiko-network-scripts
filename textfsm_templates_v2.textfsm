@@ -1,7 +1,229 @@
-The write needs your approval. Once granted, the script will be at `/opt/NetAutoCommitter/bgp_session_monitor.py` — a BGP neighbor state monitor that:
+```python
+#!/usr/bin/env python3
+"""
+Device Configuration Backup and Comparison Tool
 
-- Uses an inline TextFSM template to parse `show ip bgp summary` output
-- Distinguishes Established vs. non-Established sessions (State/PfxRcd is a digit when up)
-- Supports VRF, IOS/IOS-XE/NX-OS device types, and an `--alert-only` flag for NOC alerting
-- Exits `1` if any peer is down (pipeable into monitoring scripts)
-- ~175 lines, no overlap with existing scripts in the repo
+This script backs up network device configurations to timestamped files
+with optional comparison to previous versions, enabling change tracking
+and disaster recovery workflows.
+
+Purpose:
+    Create versioned configuration backups with automatic change detection
+    to maintain audit trails and support quick rollback analysis.
+
+Usage:
+    python config_backup.py --device 192.168.1.1 --username admin \\
+        --device-type cisco_ios --backup-dir ./backups --compare
+
+Prerequisites:
+    - netmiko: pip install netmiko
+    - Network device with SSH enabled
+    - Backup directory must be writable
+    - User account with privileged (read-only) access
+
+Environment Variables (optional):
+    NETMIKO_USER: Default SSH username
+    NETMIKO_PASS: Default SSH password (use for testing only)
+"""
+
+import argparse
+import logging
+import sys
+from datetime import datetime
+from getpass import getpass
+from pathlib import Path
+from netmiko import ConnectHandler
+from netmiko.exceptions import (
+    NetmikoTimeoutException,
+    NetmikoAuthenticationException,
+    NetmikoConnectionException,
+)
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+def get_running_config(device_conn, device_type):
+    """Retrieve running configuration from network device."""
+    commands = {
+        'cisco_ios': 'show running-config',
+        'cisco_xe': 'show running-config',
+        'cisco_nxos': 'show running-config',
+        'arista_eos': 'show running-config',
+        'juniper_junos': 'show configuration',
+    }
+    
+    cmd = commands.get(device_type, 'show running-config')
+    
+    try:
+        config = device_conn.send_command(cmd)
+        logger.debug(f"Retrieved {len(config)} bytes of configuration")
+        return config
+    except Exception as e:
+        logger.error(f"Failed to retrieve configuration: {e}")
+        raise
+
+
+def save_backup(config_content, device_host, backup_dir):
+    """Save configuration to timestamped file."""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename = f"{device_host}_{timestamp}.conf"
+    filepath = Path(backup_dir) / filename
+    
+    try:
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        with open(filepath, 'w') as f:
+            f.write(config_content)
+        logger.info(f"Backup saved to {filepath}")
+        return filepath
+    except IOError as e:
+        logger.error(f"Failed to write backup file: {e}")
+        raise
+
+
+def find_previous_backup(device_host, backup_dir):
+    """Locate the most recent backup for a device."""
+    try:
+        pattern = f"{device_host}_*.conf"
+        backups = sorted(Path(backup_dir).glob(pattern))
+        return backups[-1] if len(backups) > 1 else None
+    except Exception as e:
+        logger.debug(f"Could not find previous backup: {e}")
+        return None
+
+
+def compare_configs(old_file, new_config):
+    """Compare old and new configurations and report changes."""
+    try:
+        with open(old_file, 'r') as f:
+            old_config = f.read()
+        
+        old_lines = set(old_config.splitlines())
+        new_lines = set(new_config.splitlines())
+        
+        added = new_lines - old_lines
+        removed = old_lines - new_lines
+        
+        result = {
+            'added_count': len(added),
+            'removed_count': len(removed),
+            'changed': len(added) > 0 or len(removed) > 0,
+        }
+        
+        if added:
+            result['added_sample'] = sorted(list(added))[:3]
+        if removed:
+            result['removed_sample'] = sorted(list(removed))[:3]
+        
+        return result
+    
+    except Exception as e:
+        logger.warning(f"Could not compare configurations: {e}")
+        return None
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Backup and compare network device configurations',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Example: %(prog)s --device 10.1.1.1 --username admin --device-type cisco_ios --compare'
+    )
+    
+    parser.add_argument('--device', required=True,
+                       help='Target device IP address or hostname')
+    parser.add_argument('--username', required=True,
+                       help='SSH username')
+    parser.add_argument('--device-type', required=True,
+                       choices=['cisco_ios', 'cisco_xe', 'cisco_nxos', 'arista_eos', 'juniper_junos'],
+                       help='Device operating system type')
+    parser.add_argument('--password',
+                       help='SSH password (will prompt if not provided)')
+    parser.add_argument('--port', type=int, default=22,
+                       help='SSH port (default: 22)')
+    parser.add_argument('--timeout', type=int, default=30,
+                       help='Connection timeout in seconds (default: 30)')
+    parser.add_argument('--backup-dir', default='./backups',
+                       help='Directory to store backups (default: ./backups)')
+    parser.add_argument('--compare', action='store_true',
+                       help='Compare with previous backup and show changes')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Enable verbose logging output')
+    
+    args = parser.parse_args()
+    
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+    
+    if not args.password:
+        args.password = getpass(f"SSH password for {args.username}: ")
+    
+    device_params = {
+        'device_type': args.device_type,
+        'host': args.device,
+        'username': args.username,
+        'password': args.password,
+        'port': args.port,
+        'timeout': args.timeout,
+    }
+    
+    device_conn = None
+    try:
+        logger.info(f"Connecting to {args.device}...")
+        device_conn = ConnectHandler(**device_params)
+        logger.info("Connection established")
+        
+        logger.info("Retrieving running configuration...")
+        config = get_running_config(device_conn, args.device_type)
+        
+        backup_path = save_backup(config, args.device, args.backup_dir)
+        
+        if args.compare:
+            previous = find_previous_backup(args.device, args.backup_dir)
+            if previous:
+                logger.info(f"Comparing with {previous.name}")
+                diff = compare_configs(previous, config)
+                if diff:
+                    if diff['changed']:
+                        logger.warning(f"Configuration changes detected:")
+                        logger.warning(f"  Lines added: {diff['added_count']}")
+                        logger.warning(f"  Lines removed: {diff['removed_count']}")
+                        if diff.get('added_sample'):
+                            logger.info(f"  Sample additions: {diff['added_sample'][:2]}")
+                        if diff.get('removed_sample'):
+                            logger.info(f"  Sample removals: {diff['removed_sample'][:2]}")
+                    else:
+                        logger.info("No configuration changes detected")
+            else:
+                logger.info("No previous backup found for comparison")
+        
+        logger.info("Backup completed successfully")
+        sys.exit(0)
+    
+    except NetmikoAuthenticationException:
+        logger.error("Authentication failed. Verify credentials.")
+        sys.exit(2)
+    except NetmikoTimeoutException:
+        logger.error("Connection timeout. Check device IP and SSH access.")
+        sys.exit(2)
+    except NetmikoConnectionException as e:
+        logger.error(f"Connection error: {e}")
+        sys.exit(2)
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        sys.exit(3)
+    finally:
+        if device_conn:
+            try:
+                device_conn.disconnect()
+                logger.debug("Connection closed")
+            except Exception:
+                pass
+
+
+if __name__ == '__main__':
+    main()
+```
