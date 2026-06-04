@@ -1,213 +1,219 @@
-The write was blocked by permissions. The script is ready — here it is directly:
-
-```python
+#!/usr/bin/env python3
 """
-errdisable_recovery.py - Err-Disabled Interface Recovery Tool
+BGP Peer Status Monitor
 
-Purpose:
-    Detects interfaces stuck in err-disabled state on Cisco IOS/IOS-XE devices,
-    reports the root cause (port-security, bpduguard, loopback-detected, etc.),
-    and optionally recovers them via a controlled shutdown / no-shutdown cycle.
+Monitors BGP peer status, route counts, and uptime on Cisco/Arista devices.
+Useful for circuit and peer health monitoring across production networks.
 
 Usage:
-    # Audit only — list all err-disabled interfaces and their reasons
-    python errdisable_recovery.py --host 192.168.1.1 -u admin -p secret
-
-    # Recover all err-disabled interfaces
-    python errdisable_recovery.py --host 192.168.1.1 -u admin -p secret --recover
-
-    # Recover specific interfaces only
-    python errdisable_recovery.py --host 192.168.1.1 -u admin -p secret \
-        --recover --interfaces Gi0/1,Gi0/2
-
-    # Increase shutdown dwell time (useful for BPDU guard scenarios)
-    python errdisable_recovery.py --host 192.168.1.1 -u admin -p secret \
-        --recover --wait 15
+    python bgp_monitor.py -d 192.168.1.1 -u admin -p password --device-type cisco_ios
+    python bgp_monitor.py -d 10.0.0.5 -u netadmin -p mypass -v
 
 Prerequisites:
-    pip install netmiko
-    Supported platforms: Cisco IOS, IOS-XE (any device with
-        'show interfaces status err-disabled' and 'show errdisable recovery')
+    - netmiko installed (pip install netmiko)
+    - Device must have BGP configured and enabled
+    - SSH credentials must have read access to device
+    - Device must be reachable via SSH (port 22 by default)
+
+Output:
+    Displays formatted BGP peer status table with address, ASN, state, and
+    prefix count. Alerts on peers in non-established states.
+
 """
 
 import argparse
 import logging
-import re
 import sys
-import time
-from getpass import getpass
-
+import re
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger(__name__)
 
-
-def parse_errdisabled(output: str) -> list:
-    """Extract err-disabled interfaces and reasons from 'show interfaces status err-disabled'."""
-    results = []
-    pattern = re.compile(
-        r"^(\S+)\s+\S*\s+err-disabled\s+(\S.*?)\s*$",
-        re.MULTILINE | re.IGNORECASE,
+def configure_logging(verbose=False):
+    """Configure logging for the script."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(levelname)s - %(message)s'
     )
-    for match in pattern.finditer(output):
-        results.append({
-            "interface": match.group(1),
-            "reason": match.group(2).strip(),
-        })
-    return results
+    return logging.getLogger(__name__)
 
 
-def recover_interface(connection, interface: str, wait: int) -> bool:
-    """Bounce a single interface: shutdown, wait, no shutdown."""
-    log.info("Recovering %s (shutdown → %ds dwell → no shutdown)", interface, wait)
+def connect_to_device(device_params, logger):
+    """Establish SSH connection to network device."""
     try:
-        connection.send_config_set([f"interface {interface}", "shutdown"])
-        time.sleep(wait)
-        connection.send_config_set([f"interface {interface}", "no shutdown"])
-        return True
-    except Exception as exc:
-        log.error("Config push failed for %s: %s", interface, exc)
-        return False
+        logger.info(f"Connecting to {device_params['host']}")
+        device = ConnectHandler(**device_params)
+        logger.info("Connection established successfully")
+        return device
+    except NetmikoAuthenticationException as e:
+        logger.error(f"Authentication failed: {e}")
+        sys.exit(1)
+    except NetmikoTimeoutException as e:
+        logger.error(f"Connection timeout: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Connection failed: {e}")
+        sys.exit(1)
 
 
-def post_check_status(connection, interface: str) -> str:
-    """Return a human-readable status string after a recovery attempt."""
-    time.sleep(3)
-    output = connection.send_command(f"show interfaces {interface} status")
-    lower = output.lower()
-    if "err-disabled" in lower:
-        return "still err-disabled"
-    if "connected" in lower:
-        return "connected"
-    if "notconnect" in lower:
-        return "not connected (no link)"
-    return "unknown"
+def get_bgp_summary(device, logger):
+    """Retrieve BGP summary information from device."""
+    try:
+        logger.debug("Sending 'show ip bgp summary' command")
+        output = device.send_command('show ip bgp summary')
+        logger.debug("BGP summary retrieved successfully")
+        return output
+    except Exception as e:
+        logger.error(f"Failed to retrieve BGP summary: {e}")
+        return ""
 
 
-def build_device_dict(args, password: str) -> dict:
-    return {
-        "device_type": args.device_type,
-        "host": args.host,
-        "username": args.username,
-        "password": password,
-        "port": args.port,
-        "timeout": 30,
-        "session_log": None,
+def parse_bgp_summary(output, logger):
+    """Parse BGP summary output into structured peer data."""
+    peers = []
+    peer_section = False
+    
+    for line in output.split('\n'):
+        line = line.strip()
+        
+        if not line or 'Neighbor' in line and 'V' in line:
+            peer_section = True
+            continue
+        
+        if not peer_section or not line:
+            continue
+        
+        if re.match(r'^\d+\.\d+\.\d+\.\d+', line):
+            parts = line.split()
+            if len(parts) >= 6:
+                peer = {
+                    'address': parts[0],
+                    'asn': parts[1],
+                    'version': parts[2],
+                    'msg_rcvd': parts[3],
+                    'msg_sent': parts[4],
+                    'tbl_ver': parts[5],
+                    'inp_q': parts[6] if len(parts) > 6 else '0',
+                    'out_q': parts[7] if len(parts) > 7 else '0',
+                    'state': parts[8] if len(parts) > 8 else 'Unknown'
+                }
+                peers.append(peer)
+                logger.debug(f"Parsed peer: {peer['address']} state: {peer['state']}")
+    
+    return peers
+
+
+def analyze_bgp_peers(peers, logger):
+    """Analyze BGP peer status and identify issues."""
+    total_peers = len(peers)
+    established = sum(1 for p in peers if p['state'].isdigit())
+    down_peers = [p for p in peers if not p['state'].isdigit()]
+    
+    analysis = {
+        'total': total_peers,
+        'established': established,
+        'down_peers': down_peers,
+        'down_count': len(down_peers),
+        'health_percentage': (established / total_peers * 100) if total_peers > 0 else 0
     }
+    
+    logger.info(f"BGP Analysis: {established}/{total_peers} peers established")
+    
+    return analysis
+
+
+def generate_report(device_ip, peers, analysis, logger):
+    """Generate formatted BGP status report."""
+    print(f"\n{'='*80}")
+    print(f"BGP Peer Status Monitor - {device_ip}")
+    print(f"{'='*80}\n")
+    
+    print(f"Peer Statistics:")
+    print(f"  Total Peers: {analysis['total']}")
+    print(f"  Established: {analysis['established']}")
+    print(f"  Down/Idle: {analysis['down_count']}")
+    print(f"  Health: {analysis['health_percentage']:.1f}%\n")
+    
+    if peers:
+        print(f"{'Neighbor':<18} {'ASN':<8} {'Msg Rcvd':<10} {'Msg Sent':<10} {'State':<15}")
+        print(f"{'-'*80}")
+        
+        for peer in peers:
+            state = peer['state']
+            if state.isdigit():
+                state_display = f"{state} prefixes"
+            else:
+                state_display = state
+            
+            print(f"{peer['address']:<18} {peer['asn']:<8} {peer['msg_rcvd']:<10} "
+                  f"{peer['msg_sent']:<10} {state_display:<15}")
+    
+    if analysis['down_peers']:
+        print(f"\n{'⚠️  ALERTS - Peers Not Established:':<80}")
+        for peer in analysis['down_peers']:
+            print(f"  {peer['address']:<18} ASN {peer['asn']:<8} State: {peer['state']}")
+    else:
+        print(f"\n{'✓ All peers established':<80}")
+    
+    print(f"\n{'='*80}\n")
 
 
 def main():
+    """Main execution function."""
     parser = argparse.ArgumentParser(
-        description="Audit and recover err-disabled interfaces on Cisco IOS/IOS-XE"
+        description='Monitor BGP peer status and connectivity'
     )
-    parser.add_argument("--host", required=True, help="Device IP or hostname")
-    parser.add_argument("--username", "-u", required=True, help="SSH username")
-    parser.add_argument(
-        "--password", "-p", default=None,
-        help="SSH password (prompted if omitted)",
-    )
-    parser.add_argument(
-        "--device-type", default="cisco_ios",
-        help="Netmiko device type (default: cisco_ios)",
-    )
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument(
-        "--recover", action="store_true",
-        help="Attempt recovery on discovered err-disabled interfaces",
-    )
-    parser.add_argument(
-        "--interfaces",
-        help="Comma-separated interfaces to recover; omit to recover all err-disabled",
-    )
-    parser.add_argument(
-        "--wait", type=int, default=5,
-        help="Seconds between shutdown and no-shutdown (default: 5)",
-    )
+    parser.add_argument('-d', '--device', required=True,
+                        help='Target device IP address or hostname')
+    parser.add_argument('-u', '--username', required=True,
+                        help='SSH username for device authentication')
+    parser.add_argument('-p', '--password', required=True,
+                        help='SSH password for device authentication')
+    parser.add_argument('-t', '--device-type', default='cisco_ios',
+                        help='Device type for netmiko (default: cisco_ios)')
+    parser.add_argument('--port', type=int, default=22,
+                        help='SSH port (default: 22)')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Enable verbose debug logging')
+    
     args = parser.parse_args()
-
-    password = args.password or getpass(f"Password for {args.username}@{args.host}: ")
-
-    log.info("Connecting to %s", args.host)
+    logger = configure_logging(args.verbose)
+    
+    device_params = {
+        'device_type': args.device_type,
+        'host': args.device,
+        'username': args.username,
+        'password': args.password,
+        'port': args.port,
+    }
+    
+    device = connect_to_device(device_params, logger)
+    
     try:
-        conn = ConnectHandler(**build_device_dict(args, password))
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.host)
+        output = get_bgp_summary(device, logger)
+        peers = parse_bgp_summary(output, logger)
+        
+        if not peers:
+            logger.warning("No BGP peers found or BGP not configured")
+            print("\n⚠️  No BGP peers detected on device.\n")
+        else:
+            analysis = analyze_bgp_peers(peers, logger)
+            generate_report(args.device, peers, analysis, logger)
+        
+        logger.info("BGP monitoring complete")
+    
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
         sys.exit(1)
-    except NetmikoTimeoutException:
-        log.error("Connection timed out to %s:%d", args.host, args.port)
-        sys.exit(1)
-
-    try:
-        raw = conn.send_command("show interfaces status err-disabled")
-        errdisabled = parse_errdisabled(raw)
-
-        if not errdisabled:
-            log.info("No err-disabled interfaces found on %s", args.host)
-            return
-
-        print(f"\nErr-disabled interfaces on {args.host}:")
-        print(f"  {'Interface':<22} {'Reason'}")
-        print(f"  {'-'*21} {'-'*30}")
-        for entry in errdisabled:
-            print(f"  {entry['interface']:<22} {entry['reason']}")
-        print()
-
-        if not args.recover:
-            log.info("Pass --recover to attempt recovery of the above interfaces")
-            return
-
-        targets = errdisabled
-        if args.interfaces:
-            wanted = {i.strip() for i in args.interfaces.split(",")}
-            targets = [e for e in errdisabled if e["interface"] in wanted]
-            if not targets:
-                log.warning("None of the specified interfaces are currently err-disabled")
-                return
-
-        results = []
-        for entry in targets:
-            intf = entry["interface"]
-            ok = recover_interface(conn, intf, args.wait)
-            status = post_check_status(conn, intf) if ok else "recovery command failed"
-            results.append((intf, entry["reason"], status))
-            log.info("%s → %s", intf, status)
-
-        print(f"Recovery results on {args.host}:")
-        print(f"  {'Interface':<22} {'Reason':<28} {'Result'}")
-        print(f"  {'-'*21} {'-'*27} {'-'*24}")
-        for intf, reason, status in results:
-            print(f"  {intf:<22} {reason:<28} {status}")
-        print()
-
-        still_bad = [r for r in results if "err-disabled" in r[2]]
-        if still_bad:
-            log.warning(
-                "%d interface(s) remain err-disabled — root cause must be "
-                "resolved before recovery will persist",
-                len(still_bad),
-            )
-
-    except Exception as exc:
-        log.error("Unexpected error: %s", exc)
-        sys.exit(1)
+    
     finally:
-        conn.disconnect()
-        log.info("Disconnected from %s", args.host)
+        try:
+            device.disconnect()
+            logger.debug("Device connection closed")
+        except Exception as e:
+            logger.warning(f"Error closing connection: {e}")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-```
-
-**What makes this distinct from the existing port_bounce scripts:**
-
-- **Scope is diagnostic first** — runs `show interfaces status err-disabled` to discover *only* interfaces in err-disable state (not any port you hand it)
-- **Reports root cause** — psecure-violation, bpduguard, loopback-detected, udld-error, etc. are surfaced before any action
-- **Post-recovery verification** — checks whether the interface actually came back or went straight back into err-disable (which tells you the root cause wasn't cleared)
-- **Warns on persistent err-disable** — if an interface re-enters err-disable immediately, it flags that the underlying violation (e.g., a rogue AP triggering BPDU guard) must be addressed before recovery will hold
