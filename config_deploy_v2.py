@@ -1,271 +1,206 @@
-```python
-#!/usr/bin/env python3
-"""
-Routing Table Audit Script
+acl_deploy.py - Deploy named ACLs to Cisco IOS/IOS-XE devices from a YAML definition file.
 
-Verifies critical routes exist on network devices. Compares actual routing table
-against expected routes, reports discrepancies, and alerts on missing/changed routes.
+Purpose:
+    Reads extended ACL entries from a structured YAML file and pushes them to a
+    target device via Netmiko. Optionally applies the ACL to a specified interface
+    in a given direction. Supports dry-run mode to preview commands before execution
+    and post-deploy verification.
 
 Usage:
-    python route_auditor.py --device 10.1.1.1 -u admin -p pass -t cisco_ios --routes routes.txt
-    python route_auditor.py --device 10.1.1.1 -u admin -p pass -t arista_eos --routes critical_routes.json
+    python acl_deploy.py --host 192.168.1.1 --username admin --password secret \
+        --acl-file acls.yaml --acl-name BLOCK_INBOUND
 
-Expected routes file format (text):
-    10.0.0.0/8 10.1.1.1
-    192.168.0.0/16 10.1.1.2
+    Apply to an interface after deploy:
+    python acl_deploy.py --host 192.168.1.1 --username admin --password secret \
+        --acl-file acls.yaml --acl-name BLOCK_INBOUND \
+        --interface GigabitEthernet0/1 --direction in --save
 
-Expected routes file format (JSON):
-    {"routes": [{"prefix": "10.0.0.0/8", "nexthop": "10.1.1.1"}]}
-
-Supports:
-    - Cisco IOS, IOS-XE, NXOS
-    - Arista EOS
-    - Juniper Junos
+    Preview without connecting:
+    python acl_deploy.py --host 192.168.1.1 --username admin --password secret \
+        --acl-file acls.yaml --acl-name BLOCK_INBOUND --dry-run
 
 Prerequisites:
-    - netmiko installed: pip install netmiko
-    - Network connectivity to target device
-    - Read access to routing table
-    - Expected routes file created
+    pip install netmiko pyyaml
 
-Exit codes:
-    0 = all expected routes present
-    1 = missing or changed routes
-    2 = error connecting or parsing
+ACL YAML format:
+    acls:
+      BLOCK_INBOUND:
+        - permit tcp 10.0.0.0 0.0.0.255 any eq 443
+        - permit tcp 10.0.0.0 0.0.0.255 any eq 80
+        - deny   ip any any log
+      ALLOW_MGMT:
+        - permit tcp 192.168.10.0 0.0.0.255 any eq 22
+        - deny   ip any any
 """
 
 import argparse
-import json
 import logging
 import sys
-import re
-from pathlib import Path
-from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+
+import yaml
+from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-def parse_ios_routing_table(output):
-    """Parse Cisco IOS 'show ip route' output."""
-    routes = {}
-    for line in output.split('\n'):
-        line = line.strip()
-        if not line or line.startswith('Codes') or line.startswith('Gateway'):
-            continue
-        
-        parts = line.split()
-        if len(parts) >= 2 and '.' in parts[0]:
-            prefix = parts[0]
-            if parts[0][0] in 'CSLRIDOB':
-                prefix = parts[1]
-            
-            nexthop = None
-            for i, part in enumerate(parts):
-                if '.' in part and part != prefix:
-                    nexthop = part
-                    break
-            
-            if prefix and nexthop:
-                routes[prefix] = nexthop
-    
-    return routes
+def load_acl_file(path: str) -> dict:
+    with open(path) as fh:
+        data = yaml.safe_load(fh)
+    if not isinstance(data, dict) or "acls" not in data:
+        raise ValueError(f"YAML must have a top-level 'acls' mapping: {path}")
+    return data["acls"]
 
 
-def parse_junos_routing_table(output):
-    """Parse Juniper Junos 'show route' output."""
-    routes = {}
-    for line in output.split('\n'):
-        line = line.strip()
-        if not line or line.startswith('Routing'):
-            continue
-        
-        parts = line.split()
-        if len(parts) >= 3 and '.' in parts[0]:
-            prefix = parts[0]
-            nexthop = None
-            
-            for i, part in enumerate(parts):
-                if '.' in part and part != prefix:
-                    nexthop = part
-                    break
-            
-            if prefix and nexthop:
-                routes[prefix] = nexthop
-    
-    return routes
+def build_acl_commands(acl_name: str, entries: list) -> list:
+    cmds = [f"ip access-list extended {acl_name}"]
+    for entry in entries:
+        cmds.append(f" {entry.strip()}")
+    return cmds
 
 
-def load_expected_routes(filepath):
-    """Load expected routes from text or JSON file."""
-    filepath = Path(filepath)
-    expected = {}
-    
-    try:
-        content = filepath.read_text()
-        
-        if filepath.suffix.lower() == '.json':
-            data = json.loads(content)
-            for route in data.get('routes', []):
-                expected[route['prefix']] = route['nexthop']
-        else:
-            for line in content.split('\n'):
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                parts = line.split()
-                if len(parts) >= 2:
-                    expected[parts[0]] = parts[1]
-        
-        logger.info(f"Loaded {len(expected)} expected routes from {filepath}")
-        return expected
-    
-    except FileNotFoundError:
-        logger.error(f"Route file not found: {filepath}")
-        raise
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in {filepath}: {e}")
-        raise
+def build_interface_commands(interface: str, acl_name: str, direction: str) -> list:
+    return [
+        f"interface {interface}",
+        f" ip access-group {acl_name} {direction}",
+    ]
 
 
-def get_routing_table(device, username, password, device_type, timeout=15):
-    """
-    Connect to device and retrieve routing table.
-    
-    Args:
-        device: IP or hostname
-        username: login username
-        password: login password
-        device_type: netmiko device type
-        timeout: connection timeout in seconds
-    
-    Returns:
-        dict: routes with their next hops
-    
-    Raises:
-        NetmikoAuthenticationException: invalid credentials
-        NetmikoTimeoutException: connection timeout
-    """
-    conn_params = {
-        'device_type': device_type,
-        'host': device,
-        'username': username,
-        'password': password,
-        'timeout': timeout,
-    }
-    
-    try:
-        device_conn = ConnectHandler(**conn_params)
-        logger.info(f"Connected to {device}")
-    except NetmikoAuthenticationException as e:
-        logger.error(f"Authentication failed: {e}")
-        raise
-    except NetmikoTimeoutException as e:
-        logger.error(f"Connection timeout: {e}")
-        raise
-    
-    try:
-        if 'cisco' in device_type.lower():
-            output = device_conn.send_command('show ip route')
-            routes = parse_ios_routing_table(output)
-        elif 'junos' in device_type.lower():
-            output = device_conn.send_command('show route')
-            routes = parse_junos_routing_table(output)
-        else:
-            logger.warning(f"Route parsing not implemented for {device_type}")
-            routes = {}
-    finally:
-        device_conn.disconnect()
-    
-    return routes
+def verify_acl(conn, acl_name: str) -> bool:
+    output = conn.send_command(f"show ip access-lists {acl_name}")
+    return f"Extended IP access list {acl_name}" in output
 
 
-def audit_routes(actual, expected):
-    """Compare actual and expected routes."""
-    missing = {}
-    changed = {}
-    
-    for prefix, expected_nh in expected.items():
-        if prefix not in actual:
-            missing[prefix] = expected_nh
-        elif actual[prefix] != expected_nh:
-            changed[prefix] = {
-                'expected': expected_nh,
-                'actual': actual[prefix]
-            }
-    
-    return missing, changed
+def deploy(args):
+    acls = load_acl_file(args.acl_file)
 
-
-def main():
-    parser = argparse.ArgumentParser(
-        description='Audit routing table against expected routes'
-    )
-    parser.add_argument(
-        '--device', '-d', required=True,
-        help='Target device IP or hostname'
-    )
-    parser.add_argument(
-        '--username', '-u', required=True,
-        help='Login username'
-    )
-    parser.add_argument(
-        '--password', '-p', required=True,
-        help='Login password'
-    )
-    parser.add_argument(
-        '--device-type', '-t', default='cisco_ios',
-        help='Netmiko device type (default: cisco_ios)'
-    )
-    parser.add_argument(
-        '--routes', '-r', required=True,
-        help='Path to expected routes file (text or JSON)'
-    )
-    parser.add_argument(
-        '--timeout', type=int, default=15,
-        help='Connection timeout in seconds (default: 15)'
-    )
-    
-    args = parser.parse_args()
-    
-    try:
-        expected = load_expected_routes(args.routes)
-        actual = get_routing_table(
-            args.device,
-            args.username,
-            args.password,
-            args.device_type,
-            args.timeout
+    if args.acl_name not in acls:
+        log.error(
+            "ACL '%s' not found in %s. Available: %s",
+            args.acl_name,
+            args.acl_file,
+            list(acls.keys()),
         )
-    except Exception as e:
-        logger.error(f"Failed to audit routes: {e}")
-        return 2
-    
-    missing, changed = audit_routes(actual, expected)
-    
-    if not missing and not changed:
-        logger.info(f"All {len(expected)} expected routes present on {args.device}")
-        return 0
-    
-    if missing:
-        logger.error(f"Missing {len(missing)} route(s):")
-        for prefix, nexthop in sorted(missing.items()):
-            logger.error(f"  {prefix} -> {nexthop}")
-    
-    if changed:
-        logger.warning(f"Changed {len(changed)} route(s):")
-        for prefix, data in sorted(changed.items()):
-            logger.warning(
-                f"  {prefix}: expected {data['expected']}, got {data['actual']}"
+        sys.exit(1)
+
+    entries = acls[args.acl_name]
+    if not entries:
+        log.error("ACL '%s' has no entries in %s", args.acl_name, args.acl_file)
+        sys.exit(1)
+
+    commands = build_acl_commands(args.acl_name, entries)
+    if args.interface:
+        commands += build_interface_commands(args.interface, args.acl_name, args.direction)
+
+    if args.dry_run:
+        log.info("Dry run — commands that would be sent to %s:", args.host)
+        for cmd in commands:
+            print(f"  {cmd}")
+        return
+
+    device = {
+        "device_type": args.device_type,
+        "host": args.host,
+        "port": args.port,
+        "username": args.username,
+        "password": args.password,
+        "secret": args.enable_secret or args.password,
+        "conn_timeout": 30,
+    }
+
+    log.info("Connecting to %s as %s", args.host, args.username)
+    try:
+        with ConnectHandler(**device) as conn:
+            if args.enable_secret:
+                conn.enable()
+
+            log.info(
+                "Deploying ACL '%s' with %d entries", args.acl_name, len(entries)
             )
-    
-    return 1
+            output = conn.send_config_set(commands)
+            log.debug("Config output:\n%s", output)
+
+            if args.save:
+                conn.save_config()
+                log.info("Running config saved to startup")
+
+            if verify_acl(conn, args.acl_name):
+                log.info(
+                    "Verification passed: ACL '%s' confirmed on %s",
+                    args.acl_name,
+                    args.host,
+                )
+            else:
+                log.error(
+                    "Verification failed: ACL '%s' not found after deploy", args.acl_name
+                )
+                sys.exit(1)
+
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.host)
+        sys.exit(1)
+    except NetmikoTimeoutException:
+        log.error("Connection timed out to %s", args.host)
+        sys.exit(1)
+    except Exception as exc:
+        log.error("Unexpected error: %s", exc)
+        sys.exit(1)
+
+    log.info("ACL deploy complete on %s", args.host)
 
 
-if __name__ == '__main__':
-    sys.exit(main())
-```
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Deploy named extended ACLs to Cisco IOS/IOS-XE from a YAML file"
+    )
+    parser.add_argument("--host", required=True, help="Device IP or hostname")
+    parser.add_argument("--username", required=True)
+    parser.add_argument("--password", required=True)
+    parser.add_argument(
+        "--enable-secret", default="", metavar="SECRET",
+        help="Enable/privilege-exec secret (uses --password if omitted)",
+    )
+    parser.add_argument(
+        "--device-type", default="cisco_ios",
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument(
+        "--acl-file", required=True, metavar="FILE",
+        help="Path to YAML file containing ACL definitions",
+    )
+    parser.add_argument(
+        "--acl-name", required=True, metavar="NAME",
+        help="Name of the ACL to deploy from the YAML file",
+    )
+    parser.add_argument(
+        "--interface", default="", metavar="INTF",
+        help="Interface to apply the ACL to after deploy (e.g. GigabitEthernet0/1)",
+    )
+    parser.add_argument(
+        "--direction", choices=["in", "out"], default="in",
+        help="ACL direction when binding to interface (default: in)",
+    )
+    parser.add_argument(
+        "--save", action="store_true",
+        help="Write memory after successful deploy",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Print commands without connecting to the device",
+    )
+    parser.add_argument(
+        "--debug", action="store_true", help="Enable debug-level logging"
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    deploy(args)
