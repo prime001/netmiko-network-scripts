@@ -1,179 +1,207 @@
-```python
-"""
-mac_tracker.py - MAC Address Location Tracker
+Here is the script:
 
-Searches Cisco IOS/IOS-XE switches for one or more MAC addresses, reporting
-the exact device and switchport where each address is learned. Useful for
-endpoint tracking, incident response, and access-layer audits.
+"""
+neighbor_map.py - Collect and display CDP/LLDP neighbor topology from network devices.
+
+Purpose:
+    Connects to one or more Cisco/Arista devices via SSH and retrieves CDP or LLDP
+    neighbor detail, producing a structured topology report. Useful for verifying
+    physical cabling, auditing unexpected adjacencies, and building network diagrams.
 
 Usage:
-    python mac_tracker.py --hosts 10.0.1.1 10.0.1.2 --mac 00:1a:2b:3c:4d:5e
-    python mac_tracker.py --hosts-file switches.txt --mac-file macs.txt
-    python mac_tracker.py --hosts 10.0.1.1 --mac aa:bb:cc:dd:ee:ff -u admin
+    python neighbor_map.py -d 192.168.1.1 -u admin -p secret
+    python neighbor_map.py -d 192.168.1.1 -u admin --protocol lldp
+    python neighbor_map.py --hosts hosts.txt -u admin --output json
+    python neighbor_map.py -d 192.168.1.1 -u admin --device-type cisco_nxos
 
 Prerequisites:
     pip install netmiko
-    SSH access with privilege level sufficient for 'show mac address-table'
-    Supported device types: cisco_ios, cisco_xe (NX-OS output format differs)
 """
 
 import argparse
-import getpass
+import json
 import logging
 import re
 import sys
-from dataclasses import dataclass
+from getpass import getpass
 
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
-logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.WARNING)
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
+)
 log = logging.getLogger(__name__)
 
-
-@dataclass
-class MACEntry:
-    host: str
-    mac: str
-    vlan: str
-    interface: str
-    entry_type: str
+CDP_CMD = "show cdp neighbors detail"
+LLDP_CMD = "show lldp neighbors detail"
 
 
-def normalize_mac(mac: str) -> str:
-    digits = re.sub(r"[^0-9a-fA-F]", "", mac)
-    if len(digits) != 12:
-        raise ValueError(f"Invalid MAC address: {mac!r}")
-    return ":".join(digits[i:i + 2] for i in range(0, 12, 2)).lower()
+def parse_cdp(output):
+    neighbors = []
+    for block in re.split(r"-{3,}", output):
+        if not block.strip():
+            continue
+        n = {}
+        m = re.search(r"Device ID:\s*(\S+)", block)
+        if m:
+            n["device_id"] = m.group(1)
+        m = re.search(r"IP address:\s*(\S+)", block, re.IGNORECASE)
+        if m:
+            n["ip"] = m.group(1)
+        m = re.search(r"Interface:\s*(\S+?),\s*Port ID.*?:\s*(\S+)", block)
+        if m:
+            n["local_port"] = m.group(1).rstrip(",")
+            n["remote_port"] = m.group(2)
+        m = re.search(r"Platform:\s*([^,\n]+)", block)
+        if m:
+            n["platform"] = m.group(1).strip()
+        m = re.search(r"Software Version.*?:\s*(.+)", block)
+        if m:
+            n["version"] = m.group(1).strip()[:80]
+        if n.get("device_id"):
+            neighbors.append(n)
+    return neighbors
 
 
-def parse_mac_table(host: str, output: str) -> list[MACEntry]:
-    """Parse IOS 'show mac address-table' output (dotted-hex format)."""
-    entries = []
-    pattern = re.compile(
-        r"^\s*(\d+)\s+"
-        r"([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+"
-        r"(\w+)\s+"
-        r"(\S+)",
-        re.IGNORECASE | re.MULTILINE,
-    )
-    for m in pattern.finditer(output):
-        vlan, mac_raw, entry_type, iface = m.groups()
-        digits = mac_raw.replace(".", "")
-        mac = ":".join(digits[i:i + 2] for i in range(0, 12, 2)).lower()
-        entries.append(MACEntry(host=host, mac=mac, vlan=vlan, interface=iface, entry_type=entry_type))
-    return entries
+def parse_lldp(output):
+    neighbors = []
+    for block in re.split(r"-{3,}", output):
+        if not block.strip():
+            continue
+        n = {}
+        m = re.search(r"System Name:\s*(\S+)", block)
+        if m:
+            n["device_id"] = m.group(1)
+        m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", block)
+        if m:
+            n["ip"] = m.group(1)
+        m = re.search(r"Local Port\s*(?:id)?:\s*(\S+)", block, re.IGNORECASE)
+        if m:
+            n["local_port"] = m.group(1)
+        m = re.search(r"Port(?:\s+Description)?.*?:\s*(\S+)", block)
+        if m:
+            n["remote_port"] = m.group(1)
+        m = re.search(r"System Description.*?:\n\s*(.+)", block)
+        if m:
+            n["platform"] = m.group(1).strip()[:80]
+        if n.get("device_id"):
+            neighbors.append(n)
+    return neighbors
 
 
-def search_device(
-    host: str,
-    device_type: str,
-    username: str,
-    password: str,
-    secret: str,
-    port: int,
-    use_enable: bool,
-    targets: set[str],
-) -> list[MACEntry]:
+def collect(host, username, password, device_type, protocol, enable_secret=None):
     params = {
         "device_type": device_type,
         "host": host,
         "username": username,
         "password": password,
-        "port": port,
     }
-    if secret:
-        params["secret"] = secret
+    if enable_secret:
+        params["secret"] = enable_secret
     try:
+        log.info("Connecting to %s", host)
         with ConnectHandler(**params) as conn:
-            if use_enable:
+            if enable_secret:
                 conn.enable()
-            output = conn.send_command("show mac address-table", read_timeout=30)
-        all_entries = parse_mac_table(host, output)
-        return [e for e in all_entries if e.mac in targets]
+            cmd = CDP_CMD if protocol == "cdp" else LLDP_CMD
+            raw = conn.send_command(cmd, read_timeout=60)
+            if "% Invalid" in raw or "not enabled" in raw.lower():
+                log.warning("%s: %s not available on this device", host, protocol.upper())
+                return []
+            return parse_cdp(raw) if protocol == "cdp" else parse_lldp(raw)
     except NetmikoAuthenticationException:
-        log.error("[%s] Authentication failed", host)
+        log.error("Authentication failed: %s", host)
     except NetmikoTimeoutException:
-        log.error("[%s] Connection timed out", host)
+        log.error("Connection timed out: %s", host)
     except Exception as exc:
-        log.error("[%s] %s: %s", host, type(exc).__name__, exc)
-    return []
+        log.error("Error on %s: %s", host, exc)
+    return None
 
 
-def load_lines(path: str) -> list[str]:
-    with open(path) as f:
-        return [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+def render_table(host, neighbors, protocol):
+    bar = "=" * 72
+    print(f"\n{bar}")
+    print(f"  {host}  —  {len(neighbors)} neighbor(s) via {protocol.upper()}")
+    print(bar)
+    if not neighbors:
+        print("  (none)")
+        return
+    hdr = "  {:<22} {:<16} {:<16} {:<16}"
+    print(hdr.format("Neighbor ID", "IP", "Local Port", "Remote Port"))
+    print("  " + "-" * 68)
+    row = "  {:<22} {:<16} {:<16} {:<16}"
+    for n in neighbors:
+        print(row.format(
+            n.get("device_id", "?")[:21],
+            n.get("ip", "N/A")[:15],
+            n.get("local_port", "?")[:15],
+            n.get("remote_port", "?")[:15],
+        ))
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Locate MAC addresses across Cisco IOS/IOS-XE switches"
+def build_args():
+    p = argparse.ArgumentParser(
+        description="Map CDP/LLDP neighbors on network devices.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    host_group = parser.add_mutually_exclusive_group(required=True)
-    host_group.add_argument("--hosts", nargs="+", metavar="IP", help="Switch IPs")
-    host_group.add_argument("--hosts-file", metavar="FILE", help="File with one IP per line")
+    target = p.add_mutually_exclusive_group(required=True)
+    target.add_argument("-d", "--device", help="Single device IP or hostname")
+    target.add_argument("--hosts", metavar="FILE", help="File listing one host per line")
+    p.add_argument("-u", "--username", required=True)
+    p.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
+    p.add_argument("-e", "--enable", dest="enable_secret", default=None,
+                   help="Enable secret for privilege escalation")
+    p.add_argument("--device-type", default="cisco_ios",
+                   help="Netmiko device type string")
+    p.add_argument("--protocol", choices=["cdp", "lldp"], default="cdp",
+                   help="Neighbor discovery protocol")
+    p.add_argument("--output", choices=["table", "json"], default="table")
+    p.add_argument("-v", "--verbose", action="store_true")
+    return p.parse_args()
 
-    mac_group = parser.add_mutually_exclusive_group(required=True)
-    mac_group.add_argument("--mac", nargs="+", metavar="MAC", help="MAC address(es) to locate")
-    mac_group.add_argument("--mac-file", metavar="FILE", help="File with one MAC per line")
 
-    parser.add_argument("-u", "--username", default="admin")
-    parser.add_argument("-p", "--password", help="Omit to prompt interactively")
-    parser.add_argument("--enable", action="store_true", help="Enter enable mode after login")
-    parser.add_argument("--secret", help="Enable secret (prompts if --enable is set)")
-    parser.add_argument("--port", type=int, default=22)
-    parser.add_argument(
-        "--device-type",
-        default="cisco_ios",
-        choices=["cisco_ios", "cisco_xe"],
-        help="Netmiko device type (default: cisco_ios)",
-    )
-    parser.add_argument("-v", "--verbose", action="store_true")
-    args = parser.parse_args()
+def load_hosts(args):
+    if args.device:
+        return [args.device]
+    try:
+        with open(args.hosts) as fh:
+            return [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
+    except OSError as exc:
+        log.error("Cannot read hosts file: %s", exc)
+        sys.exit(1)
+
+
+def main():
+    args = build_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    hosts = args.hosts if args.hosts else load_lines(args.hosts_file)
-    raw_macs = args.mac if args.mac else load_lines(args.mac_file)
+    password = args.password or getpass(f"SSH password for {args.username}: ")
 
-    try:
-        targets = {normalize_mac(m) for m in raw_macs}
-    except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-
-    password = args.password or getpass.getpass(f"Password for {args.username}: ")
-    secret = ""
-    if args.enable:
-        secret = args.secret or getpass.getpass("Enable secret: ")
-
-    all_found: list[MACEntry] = []
+    hosts = load_hosts(args)
+    results = {}
     for host in hosts:
-        print(f"Searching {host}...", end=" ", flush=True)
-        found = search_device(host, args.device_type, args.username, password,
-                               secret, args.port, args.enable, targets)
-        print(f"{len(found)} match(es)")
-        all_found.extend(found)
+        neighbors = collect(host, args.username, password,
+                            args.device_type, args.protocol, args.enable_secret)
+        results[host] = neighbors if neighbors is not None else []
+        if args.output == "table":
+            if neighbors is not None:
+                render_table(host, neighbors, args.protocol)
+            else:
+                print(f"\n[FAILED] {host}")
 
-    print()
-    if not all_found:
-        print("No matching MAC addresses found on any searched device.")
-        return 0
+    if args.output == "json":
+        print(json.dumps(results, indent=2))
 
-    col_mac, col_vlan, col_iface, col_type, col_switch = 19, 6, 30, 10, 0
-    header = f"{'MAC':<{col_mac}} {'VLAN':<{col_vlan}} {'INTERFACE':<{col_iface}} {'TYPE':<{col_type}} SWITCH"
-    print(header)
-    print("-" * (col_mac + col_vlan + col_iface + col_type + 40))
-    for e in sorted(all_found, key=lambda x: (x.mac, x.host)):
-        print(f"{e.mac:<{col_mac}} {e.vlan:<{col_vlan}} {e.interface:<{col_iface}} {e.entry_type:<{col_type}} {e.host}")
-
-    missing = targets - {e.mac for e in all_found}
-    if missing:
-        print(f"\nNot found on any device: {', '.join(sorted(missing))}")
-
-    return 0
+    failed = [h for h, n in results.items() if n is None]
+    if failed:
+        log.warning("%d host(s) unreachable: %s", len(failed), ", ".join(failed))
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
-```
+    main()
