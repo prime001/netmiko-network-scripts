@@ -1,265 +1,191 @@
-This is the NetAutoCommitter project, not the portfolio repo — the existing scripts list is from the prompt context. Here's the script:
+bgp_state_check.py — BGP neighbor state monitor for Cisco IOS/IOS-XE/IOS-XR and Juniper JunOS.
 
-```python
-"""
-bgp_session_monitor.py - BGP Neighbor Session Monitor
-
-Purpose:
-    Connects to a router and audits BGP neighbor sessions. Reports each
-    neighbor's state, remote AS, uptime, and received prefix count. Alerts
-    on any neighbor not in Established state and optionally validates that
-    the expected number of neighbors is present.
-
-    Exit codes: 0 = all sessions healthy, 1 = alerts raised, 2 = connection error.
-    The non-zero exit on alerts makes this suitable for Nagios/monitoring integrations.
+Connects to a router, pulls BGP summary output, and reports each neighbor's
+state and prefix count. Alerts on down neighbors and optional prefix thresholds.
 
 Usage:
-    python bgp_session_monitor.py -H 10.0.0.1 -u admin -p secret
-    python bgp_session_monitor.py -H 10.0.0.1 -u admin --key-file ~/.ssh/id_rsa \
-        --device-type cisco_xr --expected 4
-    python bgp_session_monitor.py -H 10.0.0.1 -u admin -p secret \
-        --output json --log-level DEBUG
+    python bgp_state_check.py -d 10.0.0.1 -u admin -p secret
+    python bgp_state_check.py -d 10.0.0.1 -u admin -p secret --device-type juniper_junos
+    python bgp_state_check.py -d 10.0.0.1 -u admin -p secret --min-prefixes 100 --max-prefixes 800000
 
 Prerequisites:
     pip install netmiko
-    Python 3.9+
-    Supported device types: cisco_ios, cisco_ios_xe, cisco_xr, juniper_junos
+
+Exit codes:
+    0  All BGP neighbors established and within prefix thresholds
+    1  One or more neighbors down or threshold violated
+    2  Connection or authentication failure
 """
 
 import argparse
-import json
 import logging
 import re
 import sys
-from dataclasses import asdict, dataclass
-from getpass import getpass
-from typing import Optional
 
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko.exceptions import AuthenticationException, NetmikoTimeoutException
+
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.WARNING)
+logger = logging.getLogger(__name__)
+
+SUPPORTED_DEVICE_TYPES = ["cisco_ios", "cisco_xe", "cisco_xr", "juniper_junos"]
 
 
-@dataclass
-class BgpNeighbor:
-    neighbor: str
-    remote_as: str
-    state: str
-    uptime: str
-    prefixes_received: Optional[int]
-    established: bool
-
-
-def _parse_ios_summary(output: str) -> list[BgpNeighbor]:
+def parse_ios_bgp_summary(output):
     neighbors = []
-    # Matches neighbor rows: IP  ver  AS  MsgRcvd MsgSent TblVer InQ OutQ Up/Down State|PfxRcd
-    pattern = re.compile(
-        r'^(\d+\.\d+\.\d+\.\d+|[0-9a-fA-F:]+)\s+'
-        r'\d+\s+(\d+)\s+'
-        r'\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+'
-        r'(\S+)\s+(\S+)\s*$',
-        re.MULTILINE,
-    )
-    for m in pattern.finditer(output):
-        peer, remote_as, uptime, state_field = m.groups()
-        try:
-            pfx_count = int(state_field)
-            established, state = True, 'Established'
-        except ValueError:
-            pfx_count = None
-            established, state = False, state_field
-        neighbors.append(BgpNeighbor(
-            neighbor=peer,
-            remote_as=remote_as,
-            state=state,
-            uptime=uptime,
-            prefixes_received=pfx_count,
-            established=established,
-        ))
+    in_data = False
+    for line in output.splitlines():
+        if re.match(r"^\s*Neighbor\s+V\s+AS", line):
+            in_data = True
+            continue
+        if not in_data:
+            continue
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 9:
+            continue
+        neighbors.append({
+            "neighbor": parts[0],
+            "as": parts[2],
+            "updown": parts[7],
+            "state_or_prefixes": parts[8],
+        })
     return neighbors
 
 
-def _parse_junos_summary(output: str) -> list[BgpNeighbor]:
+def parse_junos_bgp_summary(output):
     neighbors = []
-    # Junos: Peer  AS  InPkt OutPkt OutQ Flaps Up/Dwn State|Active/Received/Accepted/Damped
-    pattern = re.compile(
-        r'^(\d+\.\d+\.\d+\.\d+)\s+(\d+)\s+'
-        r'\d+\s+\d+\s+\d+\s+\d+\s+(\S+)\s+(\S+)',
-        re.MULTILINE,
-    )
-    for m in pattern.finditer(output):
-        peer, remote_as, uptime, state_field = m.groups()
-        if '/' in state_field:
-            parts = state_field.split('/')
-            try:
-                pfx_count = int(parts[1])
-                established, state = True, 'Established'
-            except (ValueError, IndexError):
-                pfx_count = None
-                established, state = False, state_field
-        else:
-            pfx_count = None
-            established = state_field.lower() == 'established'
-            state = state_field
-        neighbors.append(BgpNeighbor(
-            neighbor=peer,
-            remote_as=remote_as,
-            state=state,
-            uptime=uptime,
-            prefixes_received=pfx_count,
-            established=established,
-        ))
-    return neighbors
-
-
-_BGP_COMMANDS = {
-    'cisco_ios': 'show ip bgp summary',
-    'cisco_ios_xe': 'show ip bgp summary',
-    'cisco_xr': 'show bgp summary',
-    'juniper_junos': 'show bgp summary',
-}
-
-_PARSERS = {
-    'cisco_ios': _parse_ios_summary,
-    'cisco_ios_xe': _parse_ios_summary,
-    'cisco_xr': _parse_ios_summary,
-    'juniper_junos': _parse_junos_summary,
-}
-
-
-def check_bgp_sessions(
-    host: str,
-    username: str,
-    password: str,
-    device_type: str,
-    port: int = 22,
-    expected_count: Optional[int] = None,
-    key_file: Optional[str] = None,
-) -> tuple[list[BgpNeighbor], list[str]]:
-    device_params = {
-        'device_type': device_type,
-        'host': host,
-        'username': username,
-        'password': password,
-        'port': port,
-    }
-    if key_file:
-        device_params.update({'use_keys': True, 'key_file': key_file})
-
-    logging.info("Connecting to %s (%s)", host, device_type)
-    with ConnectHandler(**device_params) as conn:
-        command = _BGP_COMMANDS[device_type]
-        logging.debug("Sending: %s", command)
-        output = conn.send_command(command)
-
-    neighbors = _PARSERS[device_type](output)
-    alerts: list[str] = []
-
-    if not neighbors:
-        alerts.append(f"No BGP neighbors parsed from output — verify device type and BGP config")
-        return neighbors, alerts
-
-    for n in neighbors:
-        if not n.established:
-            alerts.append(
-                f"Neighbor {n.neighbor} (AS {n.remote_as}) is {n.state}, not Established"
-            )
-
-    if expected_count is not None and len(neighbors) != expected_count:
-        alerts.append(
-            f"Expected {expected_count} neighbor(s), found {len(neighbors)}"
+    for line in output.splitlines():
+        m = re.match(
+            r"^(\d+\.\d+\.\d+\.\d+)\s+(\d+)\s+\d+\s+(\S+)\s+(\S+)\s+\S+\s+(\S+)", line.strip()
         )
-
-    return neighbors, alerts
-
-
-def _print_table(neighbors: list[BgpNeighbor], alerts: list[str], host: str) -> None:
-    print(f"\nBGP Session Report — {host}")
-    print(f"{'Neighbor':<22} {'Remote AS':<12} {'State':<14} {'Uptime':<14} Pfx Rcvd")
-    print('─' * 74)
-    for n in neighbors:
-        pfx = str(n.prefixes_received) if n.prefixes_received is not None else '—'
-        print(f"{n.neighbor:<22} {n.remote_as:<12} {n.state:<14} {n.uptime:<14} {pfx}")
-    print()
-    if alerts:
-        print("ALERTS:")
-        for a in alerts:
-            print(f"  [!] {a}")
-    else:
-        print("  All BGP sessions are Established.")
-    print()
+        if m:
+            neighbors.append({
+                "neighbor": m.group(1),
+                "as": m.group(2),
+                "updown": m.group(3),
+                "state_or_prefixes": m.group(5),
+            })
+    return neighbors
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description='Audit BGP neighbor sessions on a router',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument('-H', '--host', required=True, help='Device hostname or IP')
-    parser.add_argument('-u', '--username', required=True, help='SSH username')
-    parser.add_argument('-p', '--password', help='SSH password (prompted if omitted)')
-    parser.add_argument('--key-file', help='Path to SSH private key')
-    parser.add_argument(
-        '--device-type', default='cisco_ios',
-        choices=list(_BGP_COMMANDS.keys()),
-        help='Netmiko device type',
-    )
-    parser.add_argument('--port', type=int, default=22, help='SSH port')
-    parser.add_argument(
-        '--expected', type=int, metavar='N',
-        help='Alert if neighbor count does not equal N',
-    )
-    parser.add_argument(
-        '--output', choices=['table', 'json'], default='table',
-        help='Output format',
-    )
-    parser.add_argument(
-        '--log-level', default='WARNING',
-        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-        help='Logging verbosity',
-    )
-    args = parser.parse_args()
+def evaluate_neighbor(neighbor, min_prefixes, max_prefixes):
+    state = neighbor["state_or_prefixes"]
+    nbr = neighbor["neighbor"]
+    asn = neighbor["as"]
+    updown = neighbor["updown"]
 
-    logging.basicConfig(
-        format='%(asctime)s %(levelname)s %(message)s',
-        level=getattr(logging, args.log_level),
-    )
+    if state.isdigit():
+        count = int(state)
+        if min_prefixes and count < min_prefixes:
+            return False, (
+                f"WARN  {nbr} (AS {asn}) established but only {count} prefixes "
+                f"(min: {min_prefixes}), up {updown}"
+            )
+        if max_prefixes and count > max_prefixes:
+            return False, (
+                f"WARN  {nbr} (AS {asn}) prefix count {count} exceeds "
+                f"max {max_prefixes}, up {updown}"
+            )
+        return True, f"OK    {nbr} (AS {asn}) established, {count} prefixes, up {updown}"
 
-    password = args.password or getpass(f'Password for {args.username}@{args.host}: ')
+    return False, f"DOWN  {nbr} (AS {asn}) state={state}, up/down: {updown}"
+
+
+def run_check(args):
+    device_params = {
+        "device_type": args.device_type,
+        "host": args.device,
+        "username": args.username,
+        "password": args.password,
+        "port": args.port,
+        "timeout": args.timeout,
+        "conn_timeout": args.timeout,
+    }
+    if args.enable_secret:
+        device_params["secret"] = args.enable_secret
 
     try:
-        neighbors, alerts = check_bgp_sessions(
-            host=args.host,
-            username=args.username,
-            password=password,
-            device_type=args.device_type,
-            port=args.port,
-            expected_count=args.expected,
-            key_file=args.key_file,
-        )
-    except NetmikoAuthenticationException:
-        logging.error("Authentication failed for %s@%s", args.username, args.host)
-        sys.exit(2)
+        logger.info("Connecting to %s", args.device)
+        with ConnectHandler(**device_params) as conn:
+            if args.enable_secret:
+                conn.enable()
+            if args.device_type in ("cisco_ios", "cisco_xe"):
+                raw = conn.send_command("show ip bgp summary")
+                neighbors = parse_ios_bgp_summary(raw)
+            elif args.device_type == "cisco_xr":
+                raw = conn.send_command("show bgp ipv4 unicast summary")
+                neighbors = parse_ios_bgp_summary(raw)
+            else:
+                raw = conn.send_command("show bgp summary")
+                neighbors = parse_junos_bgp_summary(raw)
+    except AuthenticationException:
+        print(f"Authentication failed for {args.device}", file=sys.stderr)
+        return 2
     except NetmikoTimeoutException:
-        logging.error("Connection timed out: %s", args.host)
-        sys.exit(2)
+        print(f"Connection timed out to {args.device}", file=sys.stderr)
+        return 2
     except Exception as exc:
-        logging.error("Unexpected error: %s", exc)
-        sys.exit(2)
+        print(f"Connection error: {exc}", file=sys.stderr)
+        return 2
 
-    if args.output == 'json':
-        result = {
-            'host': args.host,
-            'neighbors': [asdict(n) for n in neighbors],
-            'alerts': alerts,
-            'ok': not alerts,
-        }
-        print(json.dumps(result, indent=2))
-    else:
-        _print_table(neighbors, alerts, args.host)
+    if not neighbors:
+        print(f"No BGP neighbors parsed from {args.device} — verify device-type and BGP config.")
+        return 1
 
-    sys.exit(1 if alerts else 0)
+    failures = 0
+    print(f"\nBGP Neighbor Status — {args.device} ({args.device_type})")
+    print("-" * 65)
+    for nbr in neighbors:
+        ok, msg = evaluate_neighbor(nbr, args.min_prefixes, args.max_prefixes)
+        print(msg)
+        if not ok:
+            failures += 1
+    print("-" * 65)
+    total = len(neighbors)
+    print(f"Result: {total - failures}/{total} neighbors healthy\n")
+    return 0 if failures == 0 else 1
 
 
-if __name__ == '__main__':
-    main()
-```
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Check BGP neighbor states and prefix counts via netmiko."
+    )
+    parser.add_argument("-d", "--device", required=True, help="Device hostname or IP")
+    parser.add_argument("-u", "--username", required=True, help="Login username")
+    parser.add_argument("-p", "--password", required=True, help="Login password")
+    parser.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        choices=SUPPORTED_DEVICE_TYPES,
+        dest="device_type",
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument(
+        "--timeout", type=int, default=30, help="Connection timeout in seconds (default: 30)"
+    )
+    parser.add_argument(
+        "--enable-secret", dest="enable_secret", default="",
+        help="Enable/privileged mode secret"
+    )
+    parser.add_argument(
+        "--min-prefixes", type=int, default=0, dest="min_prefixes",
+        help="Alert when an established neighbor advertises fewer than N prefixes"
+    )
+    parser.add_argument(
+        "--max-prefixes", type=int, default=0, dest="max_prefixes",
+        help="Alert when an established neighbor exceeds N prefixes"
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    return parser
+
+
+if __name__ == "__main__":
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    sys.exit(run_check(args))
