@@ -1,229 +1,200 @@
 ```python
 #!/usr/bin/env python3
 """
-Device Configuration Backup and Comparison Tool
+Device Credential and Connectivity Validator
 
-This script backs up network device configurations to timestamped files
-with optional comparison to previous versions, enabling change tracking
-and disaster recovery workflows.
-
-Purpose:
-    Create versioned configuration backups with automatic change detection
-    to maintain audit trails and support quick rollback analysis.
+Validates SSH connectivity and credentials across multiple network devices.
+Useful for pre-deployment audits, credential rotation verification, and
+operational readiness checks.
 
 Usage:
-    python config_backup.py --device 192.168.1.1 --username admin \\
-        --device-type cisco_ios --backup-dir ./backups --compare
+    python device_validator.py devices.txt -u admin -p secret -d cisco_ios
+    python device_validator.py inventory.txt -u admin -p secret -d cisco_ios -o results.csv
 
 Prerequisites:
-    - netmiko: pip install netmiko
-    - Network device with SSH enabled
-    - Backup directory must be writable
-    - User account with privileged (read-only) access
+    - netmiko library installed (pip install netmiko)
+    - Input file with device IPs/hostnames (one per line)
+    - SSH connectivity to target devices with appropriate credentials
 
-Environment Variables (optional):
-    NETMIKO_USER: Default SSH username
-    NETMIKO_PASS: Default SSH password (use for testing only)
+Output:
+    Console report showing validation results and optional CSV export.
+    Failed devices are logged for troubleshooting.
 """
 
 import argparse
+import csv
 import logging
 import sys
 from datetime import datetime
-from getpass import getpass
-from pathlib import Path
-from netmiko import ConnectHandler
-from netmiko.exceptions import (
-    NetmikoTimeoutException,
-    NetmikoAuthenticationException,
-    NetmikoConnectionException,
-)
+from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+def setup_logging(log_file):
+    """Configure logging for the script."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
 
 
-def get_running_config(device_conn, device_type):
-    """Retrieve running configuration from network device."""
-    commands = {
-        'cisco_ios': 'show running-config',
-        'cisco_xe': 'show running-config',
-        'cisco_nxos': 'show running-config',
-        'arista_eos': 'show running-config',
-        'juniper_junos': 'show configuration',
+def load_devices(file_path):
+    """Load device list from file (one IP/hostname per line)."""
+    devices = []
+    try:
+        with open(file_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    devices.append(line)
+        logging.info(f'Loaded {len(devices)} devices from {file_path}')
+        return devices
+    except FileNotFoundError:
+        logging.error(f'File not found: {file_path}')
+        raise
+
+
+def validate_device(host, username, password, device_type, timeout):
+    """Test SSH connectivity and credentials, retrieve basic device info."""
+    result = {
+        'host': host,
+        'status': 'Failed',
+        'error': None,
+        'uptime': None,
     }
-    
-    cmd = commands.get(device_type, 'show running-config')
-    
+
+    device_params = {
+        'device_type': device_type,
+        'host': host,
+        'username': username,
+        'password': password,
+        'timeout': timeout,
+        'banner_timeout': 10,
+    }
+
     try:
-        config = device_conn.send_command(cmd)
-        logger.debug(f"Retrieved {len(config)} bytes of configuration")
-        return config
+        device = ConnectHandler(**device_params)
+        result['status'] = 'Success'
+
+        try:
+            output = device.send_command('show version', expect_string=None)
+            for line in output.split('\n'):
+                if 'uptime' in line.lower():
+                    result['uptime'] = line.strip()[:50]
+                    break
+        except Exception:
+            pass
+
+        device.disconnect()
+        logging.info(f'✓ {host} - Credentials valid')
+
+    except NetmikoAuthenticationException:
+        result['error'] = 'Authentication failed'
+        logging.warning(f'✗ {host} - Authentication failed')
+    except NetmikoTimeoutException:
+        result['error'] = 'Connection timeout'
+        logging.warning(f'✗ {host} - Connection timeout')
     except Exception as e:
-        logger.error(f"Failed to retrieve configuration: {e}")
-        raise
+        result['error'] = str(e)[:40]
+        logging.warning(f'✗ {host} - {e}')
+
+    return result
 
 
-def save_backup(config_content, device_host, backup_dir):
-    """Save configuration to timestamped file."""
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f"{device_host}_{timestamp}.conf"
-    filepath = Path(backup_dir) / filename
-    
+def print_report(results):
+    """Print formatted validation report."""
+    print(f"\n{'='*85}")
+    print(f"Device Validation Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*85}")
+    print(f"{'Host':<20} {'Status':<12} {'Error/Uptime':<50}")
+    print(f"{'-'*85}")
+
+    success_count = 0
+    for result in results:
+        status = '✓ Success' if result['status'] == 'Success' else '✗ Failed'
+        detail = result['uptime'] if result['uptime'] else result['error'] or '-'
+        print(f"{result['host']:<20} {status:<12} {detail:<50}")
+        if result['status'] == 'Success':
+            success_count += 1
+
+    print(f"{'-'*85}")
+    print(f"Summary: {success_count}/{len(results)} devices validated successfully")
+    print(f"{'='*85}\n")
+
+    return success_count
+
+
+def write_csv_report(results, output_file):
+    """Write validation results to CSV file."""
     try:
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-        with open(filepath, 'w') as f:
-            f.write(config_content)
-        logger.info(f"Backup saved to {filepath}")
-        return filepath
+        with open(output_file, 'w', newline='') as f:
+            fieldnames = ['host', 'status', 'error', 'uptime']
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for result in results:
+                writer.writerow({
+                    'host': result['host'],
+                    'status': result['status'],
+                    'error': result['error'] or '',
+                    'uptime': result['uptime'] or ''
+                })
+        logging.info(f'Report written to {output_file}')
     except IOError as e:
-        logger.error(f"Failed to write backup file: {e}")
-        raise
-
-
-def find_previous_backup(device_host, backup_dir):
-    """Locate the most recent backup for a device."""
-    try:
-        pattern = f"{device_host}_*.conf"
-        backups = sorted(Path(backup_dir).glob(pattern))
-        return backups[-1] if len(backups) > 1 else None
-    except Exception as e:
-        logger.debug(f"Could not find previous backup: {e}")
-        return None
-
-
-def compare_configs(old_file, new_config):
-    """Compare old and new configurations and report changes."""
-    try:
-        with open(old_file, 'r') as f:
-            old_config = f.read()
-        
-        old_lines = set(old_config.splitlines())
-        new_lines = set(new_config.splitlines())
-        
-        added = new_lines - old_lines
-        removed = old_lines - new_lines
-        
-        result = {
-            'added_count': len(added),
-            'removed_count': len(removed),
-            'changed': len(added) > 0 or len(removed) > 0,
-        }
-        
-        if added:
-            result['added_sample'] = sorted(list(added))[:3]
-        if removed:
-            result['removed_sample'] = sorted(list(removed))[:3]
-        
-        return result
-    
-    except Exception as e:
-        logger.warning(f"Could not compare configurations: {e}")
-        return None
+        logging.error(f'Failed to write report: {e}')
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Backup and compare network device configurations',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='Example: %(prog)s --device 10.1.1.1 --username admin --device-type cisco_ios --compare'
+        description='Validate connectivity and credentials to network devices'
     )
-    
-    parser.add_argument('--device', required=True,
-                       help='Target device IP address or hostname')
-    parser.add_argument('--username', required=True,
-                       help='SSH username')
-    parser.add_argument('--device-type', required=True,
-                       choices=['cisco_ios', 'cisco_xe', 'cisco_nxos', 'arista_eos', 'juniper_junos'],
-                       help='Device operating system type')
-    parser.add_argument('--password',
-                       help='SSH password (will prompt if not provided)')
-    parser.add_argument('--port', type=int, default=22,
-                       help='SSH port (default: 22)')
-    parser.add_argument('--timeout', type=int, default=30,
-                       help='Connection timeout in seconds (default: 30)')
-    parser.add_argument('--backup-dir', default='./backups',
-                       help='Directory to store backups (default: ./backups)')
-    parser.add_argument('--compare', action='store_true',
-                       help='Compare with previous backup and show changes')
-    parser.add_argument('--verbose', '-v', action='store_true',
-                       help='Enable verbose logging output')
-    
+    parser.add_argument('devices', help='File containing device IPs/hostnames')
+    parser.add_argument('-u', '--username', required=True, help='SSH username')
+    parser.add_argument('-p', '--password', required=True, help='SSH password')
+    parser.add_argument('-d', '--device-type', required=True,
+                        help='Device type (cisco_ios, cisco_xe, juniper_junos, etc.)')
+    parser.add_argument('-t', '--timeout', type=int, default=15,
+                        help='SSH timeout in seconds (default: 15)')
+    parser.add_argument('-o', '--output', help='Output CSV file for results')
+    parser.add_argument('--log-file', default='device_validator.log',
+                        help='Log file path (default: device_validator.log)')
+
     args = parser.parse_args()
-    
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
-    
-    if not args.password:
-        args.password = getpass(f"SSH password for {args.username}: ")
-    
-    device_params = {
-        'device_type': args.device_type,
-        'host': args.device,
-        'username': args.username,
-        'password': args.password,
-        'port': args.port,
-        'timeout': args.timeout,
-    }
-    
-    device_conn = None
+
+    logger = setup_logging(args.log_file)
+    logger.info('Device validation started')
+
     try:
-        logger.info(f"Connecting to {args.device}...")
-        device_conn = ConnectHandler(**device_params)
-        logger.info("Connection established")
-        
-        logger.info("Retrieving running configuration...")
-        config = get_running_config(device_conn, args.device_type)
-        
-        backup_path = save_backup(config, args.device, args.backup_dir)
-        
-        if args.compare:
-            previous = find_previous_backup(args.device, args.backup_dir)
-            if previous:
-                logger.info(f"Comparing with {previous.name}")
-                diff = compare_configs(previous, config)
-                if diff:
-                    if diff['changed']:
-                        logger.warning(f"Configuration changes detected:")
-                        logger.warning(f"  Lines added: {diff['added_count']}")
-                        logger.warning(f"  Lines removed: {diff['removed_count']}")
-                        if diff.get('added_sample'):
-                            logger.info(f"  Sample additions: {diff['added_sample'][:2]}")
-                        if diff.get('removed_sample'):
-                            logger.info(f"  Sample removals: {diff['removed_sample'][:2]}")
-                    else:
-                        logger.info("No configuration changes detected")
-            else:
-                logger.info("No previous backup found for comparison")
-        
-        logger.info("Backup completed successfully")
-        sys.exit(0)
-    
-    except NetmikoAuthenticationException:
-        logger.error("Authentication failed. Verify credentials.")
-        sys.exit(2)
-    except NetmikoTimeoutException:
-        logger.error("Connection timeout. Check device IP and SSH access.")
-        sys.exit(2)
-    except NetmikoConnectionException as e:
-        logger.error(f"Connection error: {e}")
-        sys.exit(2)
+        devices = load_devices(args.devices)
+
+        if not devices:
+            logger.error('No devices to validate')
+            return 1
+
+        results = []
+        for idx, host in enumerate(devices, 1):
+            print(f"[{idx}/{len(devices)}] Validating {host}...", end=' ', flush=True)
+            result = validate_device(host, args.username, args.password,
+                                     args.device_type, args.timeout)
+            results.append(result)
+            print('')
+
+        success_count = print_report(results)
+
+        if args.output:
+            write_csv_report(results, args.output)
+
+        logger.info(f'Validation complete: {success_count}/{len(results)} successful')
+        return 0 if success_count == len(results) else 1
+
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        sys.exit(3)
-    finally:
-        if device_conn:
-            try:
-                device_conn.disconnect()
-                logger.debug("Connection closed")
-            except Exception:
-                pass
+        logger.error(f'Script failed: {e}')
+        return 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
 ```
