@@ -1,34 +1,31 @@
-The file was blocked by permissions. The script content is ready — here it is:
-
 ```python
 """
-mac_port_locator.py - Locate a device's switch port by IP or MAC address.
+cdp_lldp_mapper.py - Network topology discovery via CDP/LLDP neighbor walks.
 
 Purpose:
-    Given a target IP or MAC address, connects to a Cisco IOS/IOS-XE switch,
-    resolves the MAC via ARP table if needed, then traces it through the MAC
-    address table to identify the physical access port and its description.
+    Connects to a seed device, collects CDP and/or LLDP neighbor tables,
+    and optionally recurses into discovered neighbors to build a full
+    layer-2/layer-3 topology map. Outputs results as JSON or a human-
+    readable adjacency table. Unlike IP-sweep discovery, this uses
+    control-plane neighbor data already exchanged between devices.
 
 Usage:
-    python mac_port_locator.py --host 10.0.0.1 --username admin --password secret \
-        --target 192.168.1.50
-    python mac_port_locator.py --host 10.0.0.1 --username admin --password secret \
-        --target aa:bb:cc:dd:ee:ff --vlan 100
-    python mac_port_locator.py --host 10.0.0.1 --username admin --password secret \
-        --target 192.168.1.50 --device-type cisco_ios --secret enable_pw
+    python cdp_lldp_mapper.py --host 10.0.0.1 --username admin --password secret
+    python cdp_lldp_mapper.py --host 10.0.0.1 -u admin -p secret --recurse --depth 3
+    python cdp_lldp_mapper.py --host 10.0.0.1 -u admin -p secret --protocol lldp --json
 
 Prerequisites:
     pip install netmiko
-    Netmiko >= 4.0 recommended.
-    Device must support: show ip arp, show mac address-table.
-    SSH credentials require at minimum read-only (show) access.
+    CDP or LLDP must be enabled on target devices.
+    Account needs at minimum read-only (show) access.
 """
 
 import argparse
+import json
 import logging
 import re
 import sys
-from typing import Dict, List, Optional
+from collections import deque
 
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
@@ -36,196 +33,181 @@ from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutExc
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-def normalize_mac(mac: str) -> str:
-    """Normalize any common MAC format to Cisco dotted-quad (e.g. aabb.ccdd.eeff)."""
-    clean = re.sub(r"[:\-\.\s]", "", mac).lower()
-    if len(clean) != 12 or not re.fullmatch(r"[0-9a-f]{12}", clean):
-        raise ValueError(f"Invalid MAC address: {mac!r}")
-    return f"{clean[0:4]}.{clean[4:8]}.{clean[8:12]}"
-
-
-def resolve_ip_to_mac(conn, ip: str) -> Optional[str]:
-    """Return the MAC address for an IP from the device ARP table, or None."""
-    output = conn.send_command(f"show ip arp {ip}")
-    match = re.search(
-        r"Internet\s+" + re.escape(ip) + r"\s+\S+\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})",
-        output,
-        re.IGNORECASE,
-    )
-    return match.group(1).lower() if match else None
-
-
-def find_mac_in_table(conn, mac: str, vlan: Optional[str]) -> List[Dict[str, str]]:
-    """Query the MAC address table and return all matching entries."""
-    cmd = f"show mac address-table address {mac}"
-    if vlan:
-        cmd = f"show mac address-table vlan {vlan} address {mac}"
-    output = conn.send_command(cmd)
-
-    entries = []
-    for line in output.splitlines():
-        # Matches Cisco IOS/IOS-XE: vlan  mac  type  port
-        m = re.match(
-            r"\s*(\d+)\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+(\S+)\s+(\S+)",
-            line,
-            re.IGNORECASE,
-        )
+def parse_cdp_neighbors(output):
+    neighbors = []
+    for block in re.split(r"-{10,}", output):
+        if "Device ID" not in block:
+            continue
+        n = {}
+        m = re.search(r"Device ID:\s*(\S+)", block)
         if m:
-            entries.append({
-                "vlan": m.group(1),
-                "mac": m.group(2).lower(),
-                "type": m.group(3),
-                "port": m.group(4),
-            })
-    return entries
+            n["device_id"] = m.group(1)
+        m = re.search(r"IP address:\s*(\S+)", block, re.IGNORECASE)
+        if m:
+            n["mgmt_ip"] = m.group(1)
+        m = re.search(r"Platform:\s*(.+?),", block)
+        if m:
+            n["platform"] = m.group(1).strip()
+        m = re.search(r"Interface:\s*(\S+),\s+Port ID.*?:\s*(\S+)", block)
+        if m:
+            n["local_port"] = m.group(1)
+            n["remote_port"] = m.group(2)
+        m = re.search(r"Capabilities:\s*(.+)", block)
+        if m:
+            n["capabilities"] = m.group(1).strip()
+        if n:
+            neighbors.append(n)
+    return neighbors
 
 
-def get_port_description(conn, port: str) -> str:
-    """Return the configured description for an interface, or empty string."""
-    output = conn.send_command(f"show interface {port}")
-    m = re.search(r"Description:\s+(.+)", output)
-    return m.group(1).strip() if m else ""
+def parse_lldp_neighbors(output):
+    neighbors = []
+    for block in re.split(r"(?=Local Intf:)", output):
+        if "System Name" not in block:
+            continue
+        n = {}
+        m = re.search(r"Local Intf:\s*(\S+)", block)
+        if m:
+            n["local_port"] = m.group(1)
+        m = re.search(r"System Name:\s*(\S+)", block)
+        if m:
+            n["device_id"] = m.group(1)
+        m = re.search(r"Management Address:\s*(\S+)", block)
+        if m:
+            n["mgmt_ip"] = m.group(1)
+        m = re.search(r"Port Description:\s*(\S+)", block)
+        if m:
+            n["remote_port"] = m.group(1)
+        m = re.search(r"System Capabilities:\s*(.+)", block)
+        if m:
+            n["capabilities"] = m.group(1).strip()
+        if n:
+            neighbors.append(n)
+    return neighbors
 
 
-def is_uplink_port(port: str) -> bool:
-    """Heuristic: high-speed interfaces are typically uplinks/trunks, not access ports."""
-    uplink_prefixes = ("Te", "TenGig", "Fo", "FortyGig", "Hu", "HundredGig", "Po")
-    return any(port.startswith(p) for p in uplink_prefixes)
-
-
-def locate_device(conn, target: str, vlan: Optional[str]) -> Dict:
-    result = {
-        "target": target,
-        "mac": None,
-        "vlan": None,
-        "port": None,
-        "description": None,
-        "warning": None,
+def collect_neighbors(host, username, password, device_type, protocol):
+    params = {
+        "device_type": device_type,
+        "host": host,
+        "username": username,
+        "password": password,
+        "timeout": 20,
     }
-
-    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", target):
-        logger.info("Resolving IP %s to MAC via ARP table", target)
-        mac = resolve_ip_to_mac(conn, target)
-        if not mac:
-            result["warning"] = f"IP {target} not found in ARP table — device may be offline or unreachable from this switch"
-            return result
-        result["mac"] = mac
-    else:
-        try:
-            mac = normalize_mac(target)
-        except ValueError as exc:
-            result["warning"] = str(exc)
-            return result
-        result["mac"] = mac
-
-    logger.info("Searching MAC address table for %s", mac)
-    entries = find_mac_in_table(conn, mac, vlan)
-
-    if not entries:
-        result["warning"] = f"MAC {mac} not found in address table — device may have aged out or be on a different switch"
-        return result
-
-    # Prefer non-uplink entries; device may appear on multiple ports in a stack
-    access_entries = [e for e in entries if not is_uplink_port(e["port"])]
-    chosen = access_entries[0] if access_entries else entries[0]
-
-    result["vlan"] = chosen["vlan"]
-    result["port"] = chosen["port"]
-    result["description"] = get_port_description(conn, chosen["port"])
-
-    if not access_entries:
-        result["warning"] = "Only uplink/trunk ports found — device is likely behind another switch"
-
-    return result
+    try:
+        log.info("Connecting to %s", host)
+        with ConnectHandler(**params) as conn:
+            hostname = conn.find_prompt().rstrip("#>").strip()
+            cdp_neighbors, lldp_neighbors = [], []
+            if protocol in ("cdp", "both"):
+                out = conn.send_command("show cdp neighbors detail", read_timeout=30)
+                cdp_neighbors = parse_cdp_neighbors(out)
+            if protocol in ("lldp", "both"):
+                out = conn.send_command("show lldp neighbors detail", read_timeout=30)
+                lldp_neighbors = parse_lldp_neighbors(out)
+        deduped = {}
+        for n in cdp_neighbors + lldp_neighbors:
+            key = n.get("device_id") or n.get("mgmt_ip", "unknown")
+            deduped.setdefault(key, n)
+        return hostname, list(deduped.values())
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s", host)
+    except NetmikoTimeoutException:
+        log.error("Connection timed out for %s", host)
+    except Exception as exc:
+        log.error("Error on %s: %s", host, exc)
+    return None, []
 
 
-def print_result(result: Dict) -> None:
-    print("\n=== MAC Port Locator Results ===")
-    print(f"  Target      : {result['target']}")
-    if result["mac"]:
-        print(f"  MAC Address : {result['mac']}")
-    if result["vlan"]:
-        print(f"  VLAN        : {result['vlan']}")
-    if result["port"]:
-        print(f"  Switch Port : {result['port']}")
-    if result["description"]:
-        print(f"  Port Desc   : {result['description']}")
-    if result["warning"]:
-        print(f"  WARNING     : {result['warning']}")
-    print()
+def walk_topology(seed, username, password, device_type, protocol, max_depth):
+    topology = {}
+    visited = {seed}
+    queue = deque([(seed, 0)])
+
+    while queue:
+        host, depth = queue.popleft()
+        hostname, neighbors = collect_neighbors(host, username, password, device_type, protocol)
+        if hostname is None:
+            continue
+        topology[host] = {"hostname": hostname, "neighbors": neighbors, "depth": depth}
+        log.info("%-20s (%s)  %d neighbor(s)", hostname, host, len(neighbors))
+        if depth < max_depth:
+            for n in neighbors:
+                ip = n.get("mgmt_ip")
+                if ip and ip not in visited:
+                    visited.add(ip)
+                    queue.append((ip, depth + 1))
+
+    return topology
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Locate a device's physical switch port by IP or MAC address.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+def print_table(topology):
+    width = 72
+    print(f"\n{'='*width}")
+    print(f"{'NETWORK TOPOLOGY — CDP/LLDP MAP':^{width}}")
+    print(f"{'='*width}")
+    for ip, data in topology.items():
+        indent = "  " * data["depth"]
+        print(f"\n{indent}[{data['hostname']}] {ip}  (hop {data['depth']})")
+        if not data["neighbors"]:
+            print(f"{indent}  (no neighbors discovered)")
+        for n in data["neighbors"]:
+            dev = n.get("device_id", "unknown")
+            mgmt = n.get("mgmt_ip", "no-ip")
+            local = n.get("local_port", "?")
+            remote = n.get("remote_port", "?")
+            plat = n.get("platform", "")
+            print(f"{indent}  ├─ {dev} ({mgmt})  {local} -> {remote}  {plat}")
+    print(f"\n{'='*width}")
+    print(f"Total devices discovered: {len(topology)}\n")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Map network topology by walking CDP/LLDP neighbor tables."
     )
-    parser.add_argument("--host", required=True, help="Switch IP address or hostname")
-    parser.add_argument("--username", required=True, help="SSH username")
-    parser.add_argument("--password", required=True, help="SSH password")
-    parser.add_argument("--secret", default="", help="Enable/privileged mode secret")
-    parser.add_argument(
-        "--target", required=True,
-        help="Target IP address or MAC address to locate"
-    )
-    parser.add_argument(
-        "--vlan", default=None,
-        help="Restrict MAC table lookup to a specific VLAN ID"
-    )
-    parser.add_argument(
-        "--device-type", default="cisco_ios",
-        help="Netmiko device type (default: cisco_ios)"
-    )
-    parser.add_argument(
-        "--port", type=int, default=22,
-        help="SSH port (default: 22)"
-    )
-    return parser
+    p.add_argument("--host", required=True, help="Seed device IP or hostname")
+    p.add_argument("-u", "--username", required=True)
+    p.add_argument("-p", "--password", required=True)
+    p.add_argument("--device-type", default="cisco_ios",
+                   help="Netmiko device type (default: cisco_ios)")
+    p.add_argument("--protocol", choices=["cdp", "lldp", "both"], default="cdp",
+                   help="Neighbor protocol to query (default: cdp)")
+    p.add_argument("--recurse", action="store_true",
+                   help="Recurse into discovered neighbors")
+    p.add_argument("--depth", type=int, default=2,
+                   help="Max hop depth when --recurse is set (default: 2)")
+    p.add_argument("--json", action="store_true", dest="json_output",
+                   help="Emit JSON instead of a human-readable table")
+    p.add_argument("--debug", action="store_true")
+    return p
 
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    device = {
-        "device_type": args.device_type,
-        "host": args.host,
-        "username": args.username,
-        "password": args.password,
-        "secret": args.secret,
-        "port": args.port,
-    }
+    topology = walk_topology(
+        args.host,
+        args.username,
+        args.password,
+        args.device_type,
+        args.protocol,
+        args.depth if args.recurse else 0,
+    )
 
-    logger.info("Connecting to %s", args.host)
-    try:
-        with ConnectHandler(**device) as conn:
-            if args.secret:
-                conn.enable()
-            result = locate_device(conn, args.target, args.vlan)
-    except NetmikoAuthenticationException:
-        logger.error("Authentication failed for %s", args.host)
-        sys.exit(1)
-    except NetmikoTimeoutException:
-        logger.error("Connection timed out to %s", args.host)
-        sys.exit(1)
-    except Exception as exc:
-        logger.error("Unexpected error: %s", exc)
+    if not topology:
+        log.error("No devices discovered. Check connectivity and credentials.")
         sys.exit(1)
 
-    print_result(result)
-    sys.exit(0 if result["port"] else 1)
+    if args.json_output:
+        print(json.dumps(topology, indent=2))
+    else:
+        print_table(topology)
 ```
-
-**What this does:** `mac_port_locator.py` — a MAC-to-port tracer that:
-- Accepts either an IP address or MAC address as the target
-- If given an IP, resolves it to MAC via `show ip arp`
-- Normalizes any MAC format (colon, dash, dotted-quad) to Cisco format
-- Looks up the MAC in `show mac address-table`, with optional VLAN filter
-- Heuristically distinguishes access ports from uplinks (TenGig, PortChannel, etc.) and prefers the access port
-- Fetches the port's configured description for context
-- Exits 0 on success, 1 on failure (CI-friendly)
-
-This is distinct from the existing `device_discovery.py` scripts, which find devices on the network — this finds *where* a specific device is physically connected.
