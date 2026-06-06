@@ -1,25 +1,22 @@
-The write was blocked by permissions. Here is the complete script — copy it into `vlan_audit.py`:
-
 ```python
 """
-vlan_audit.py - VLAN inventory collector and compliance auditor for Cisco IOS/IOS-XE switches.
+bgp_session_monitor.py - BGP session state monitor and parser
 
 Purpose:
-    Connects to a switch via SSH, collects the VLAN database from 'show vlan brief',
-    and optionally compares it against an expected VLAN list to detect configuration drift.
-    Exits with code 2 when a compliance check fails, making it CI/CD pipeline friendly.
+    Connect to a network device, run the BGP summary command, and parse
+    peer states, AS numbers, prefix counts, and session uptime. Exits
+    non-zero when any peers are not Established, making it suitable for
+    use in monitoring pipelines and alerting scripts.
 
 Usage:
-    python vlan_audit.py -d 192.168.1.1 -u admin -p secret
-    python vlan_audit.py -d 192.168.1.1 -u admin -p secret --expected vlans.txt
-    python vlan_audit.py -d 192.168.1.1 -u admin -p secret --output report.json --json
+    python bgp_session_monitor.py -d 192.168.1.1 -u admin
+    python bgp_session_monitor.py -d 192.168.1.1 -u admin -t cisco_xr
+    python bgp_session_monitor.py -d 192.168.1.1 -u admin --json --alert-down
 
 Prerequisites:
     pip install netmiko
-    SSH access with privilege level sufficient to run 'show vlan brief'.
-
-Expected VLAN file format (vlans.txt):
-    One VLAN ID per line. Lines starting with # are treated as comments.
+    SSH must be enabled on the target device.
+    Tested against: cisco_ios, cisco_xe, cisco_xr, cisco_nxos
 """
 
 import argparse
@@ -27,191 +24,171 @@ import json
 import logging
 import re
 import sys
-from datetime import datetime, timezone
+from getpass import getpass
 
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko.exceptions import NetMikoAuthenticationException, NetMikoTimeoutException
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.WARNING,
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-def parse_vlan_brief(output: str) -> dict:
-    """Return dict keyed by int VLAN ID from 'show vlan brief' output."""
-    vlans = {}
-    vlan_line = re.compile(
-        r"^(\d+)\s+(\S+)\s+(active|act/lshut|act/unsup|suspended|sus/lshut)\s*(.*)?$",
-        re.MULTILINE,
-    )
-    continuation = re.compile(r"^\s{21,}(.+)$")
+BGP_COMMANDS = {
+    "cisco_ios": "show ip bgp summary",
+    "cisco_xe": "show ip bgp summary",
+    "cisco_xr": "show bgp ipv4 unicast summary",
+    "cisco_nxos": "show bgp ipv4 unicast summary",
+}
 
-    last_id = None
-    for line in output.splitlines():
-        m = vlan_line.match(line)
-        if m:
-            vid = int(m.group(1))
-            ports = [p.strip() for p in m.group(4).split(",") if p.strip()]
-            vlans[vid] = {"name": m.group(2), "status": m.group(3), "ports": ports}
-            last_id = vid
-        elif last_id is not None:
-            c = continuation.match(line)
-            if c:
-                extra = [p.strip() for p in c.group(1).split(",") if p.strip()]
-                vlans[last_id]["ports"].extend(extra)
+# neighbor  V  AS  MsgRcvd  MsgSent  TblVer  InQ  OutQ  Up/Down  State/PfxRcd
+_IOS_PEER_RE = re.compile(
+    r"^(?P<neighbor>\d+\.\d+\.\d+\.\d+)\s+"
+    r"\d+\s+(?P<remote_as>\d+)\s+"
+    r"\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+"
+    r"(?P<updown>\S+)\s+(?P<state>\S+)",
+    re.MULTILINE,
+)
 
-    return vlans
+# IOS-XR: neighbor  AS  SpkrId  MsgRcvd  MsgSent  TblVer  InQ  OutQ  Up/Down  State/PfxRcd
+_XR_PEER_RE = re.compile(
+    r"^(?P<neighbor>\d+\.\d+\.\d+\.\d+)\s+"
+    r"(?P<remote_as>\d+)\s+"
+    r"\S+\s+\S+\s+\S+\s+\S+\s+"
+    r"(?P<updown>\S+)\s+(?P<state>\S+)",
+    re.MULTILINE,
+)
 
-
-def load_expected_vlans(path: str) -> set:
-    """Load expected VLAN IDs from a file, one per line, # comments ignored."""
-    expected = set()
-    with open(path) as fh:
-        for raw in fh:
-            line = raw.split("#")[0].strip()
-            if not line:
-                continue
-            try:
-                expected.add(int(line))
-            except ValueError:
-                logger.warning("Ignoring non-integer VLAN entry: %r", line)
-    return expected
+_LOCAL_AS_RE = re.compile(r"local AS number\s+(\d+)", re.IGNORECASE)
+_ROUTER_ID_RE = re.compile(r"router identifier\s+(\d+\.\d+\.\d+\.\d+)", re.IGNORECASE)
 
 
-def run_audit(discovered: dict, expected: set) -> dict:
-    found = set(discovered)
+def parse_bgp_summary(output: str, device_type: str) -> dict:
+    pattern = _XR_PEER_RE if device_type == "cisco_xr" else _IOS_PEER_RE
+    local_as_m = _LOCAL_AS_RE.search(output)
+    router_id_m = _ROUTER_ID_RE.search(output)
+
+    peers = []
+    for m in pattern.finditer(output):
+        state = m.group("state")
+        established = state.isdigit()
+        peers.append({
+            "neighbor": m.group("neighbor"),
+            "remote_as": int(m.group("remote_as")),
+            "updown": m.group("updown"),
+            "state": "Established" if established else state,
+            "prefixes_received": int(state) if established else None,
+            "established": established,
+        })
+
     return {
-        "missing": sorted(expected - found),
-        "unexpected": sorted(found - expected),
-        "compliant": sorted(found & expected),
+        "local_as": int(local_as_m.group(1)) if local_as_m else None,
+        "router_id": router_id_m.group(1) if router_id_m else None,
+        "peers": peers,
+        "total": len(peers),
+        "established_count": sum(1 for p in peers if p["established"]),
+        "down_count": sum(1 for p in peers if not p["established"]),
     }
 
 
-def collect(args) -> dict:
-    device_params = {
-        "device_type": args.device_type,
-        "host": args.device,
-        "username": args.username,
-        "password": args.password,
-        "port": args.port,
-    }
-    if args.enable_secret:
-        device_params["secret"] = args.enable_secret
-
-    logger.info("Connecting to %s", args.device)
-    try:
-        with ConnectHandler(**device_params) as conn:
-            if args.enable_secret:
-                conn.enable()
-            logger.info("Running 'show vlan brief'")
-            raw = conn.send_command("show vlan brief")
-    except NetmikoAuthenticationException:
-        logger.error("Authentication failed for %s", args.device)
-        sys.exit(1)
-    except NetmikoTimeoutException:
-        logger.error("Connection timed out to %s", args.device)
-        sys.exit(1)
-
-    vlans = parse_vlan_brief(raw)
-    logger.info("Discovered %d VLANs", len(vlans))
-
-    result = {
-        "device": args.device,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "vlans": {str(k): v for k, v in sorted(vlans.items())},
-    }
-
-    if args.expected:
-        expected_set = load_expected_vlans(args.expected)
-        result["audit"] = run_audit(vlans, expected_set)
-        missing = result["audit"]["missing"]
-        unexpected = result["audit"]["unexpected"]
-        if missing:
-            logger.warning("Missing VLANs (expected but absent): %s", missing)
-        if unexpected:
-            logger.warning("Unexpected VLANs (present but not expected): %s", unexpected)
-        if not missing and not unexpected:
-            logger.info("VLAN inventory is fully compliant")
-
-    return result
-
-
-def print_table(result: dict) -> None:
-    print(f"\nVLAN Report  —  {result['device']}  @  {result['timestamp']}")
-    print("=" * 70)
-    print(f"{'VLAN':<6} {'Name':<22} {'Status':<14} Ports")
-    print("-" * 70)
-    for vid, info in result["vlans"].items():
-        ports = ", ".join(info["ports"]) if info["ports"] else "(unassigned)"
-        print(f"{vid:<6} {info['name']:<22} {info['status']:<14} {ports}")
-
-    if "audit" not in result:
-        return
-
-    audit = result["audit"]
-    print("\nCompliance Check")
-    print("-" * 40)
-    print(f"  Compliant  : {len(audit['compliant'])} VLANs")
-    if audit["missing"]:
-        print(f"  MISSING    : {audit['missing']}")
-    if audit["unexpected"]:
-        print(f"  UNEXPECTED : {audit['unexpected']}")
-    status = "PASS" if not audit["missing"] and not audit["unexpected"] else "FAIL"
-    print(f"  Result     : {status}")
+def print_table(result: dict, hostname: str) -> None:
+    rid = result["router_id"] or "unknown"
+    las = result["local_as"] or "unknown"
+    print(f"\nHost: {hostname}  Router-ID: {rid}  Local AS: {las}")
+    print(
+        f"Peers: {result['total']}  "
+        f"Established: {result['established_count']}  "
+        f"Down: {result['down_count']}\n"
+    )
+    hdr = f"{'Neighbor':<18} {'Remote AS':<12} {'State':<16} {'Up/Down':<14} Pfx Rcvd"
+    print(hdr)
+    print("-" * len(hdr))
+    for p in result["peers"]:
+        pfx = str(p["prefixes_received"]) if p["prefixes_received"] is not None else "-"
+        state_str = p["state"] if p["established"] else f"** {p['state']} **"
+        print(f"{p['neighbor']:<18} {p['remote_as']:<12} {state_str:<16} {p['updown']:<14} {pfx}")
+    print()
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Collect and audit VLAN inventory from Cisco IOS/IOS-XE switches."
+        description="Parse BGP session summary from a network device",
     )
-    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    p.add_argument("-d", "--device", required=True, help="Device hostname or IP")
     p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", required=True, help="SSH password")
-    p.add_argument("-e", "--enable-secret", metavar="SECRET", help="Enable secret")
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
     p.add_argument(
-        "--device-type", default="cisco_ios",
+        "-t", "--device-type",
+        default="cisco_ios",
+        choices=list(BGP_COMMANDS.keys()),
         help="Netmiko device type (default: cisco_ios)",
     )
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
     p.add_argument(
-        "--expected", metavar="FILE",
-        help="File of expected VLAN IDs for compliance check (one per line)",
+        "--json", action="store_true", dest="output_json",
+        help="Emit JSON instead of a formatted table",
     )
-    p.add_argument("--output", metavar="FILE", help="Write JSON report to this path")
-    p.add_argument("--json", action="store_true", help="Print JSON instead of table")
-    p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    p.add_argument(
+        "--alert-down", action="store_true",
+        help="Exit with code 1 if any peers are not Established",
+    )
+    p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     return p
 
 
-if __name__ == "__main__":
+def main() -> int:
     args = build_parser().parse_args()
 
-    if args.debug:
+    if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    result = collect(args)
+    password = args.password or getpass(f"Password for {args.username}@{args.device}: ")
 
-    if args.json:
+    device_params = {
+        "device_type": args.device_type,
+        "host": args.device,
+        "username": args.username,
+        "password": password,
+        "port": args.port,
+    }
+
+    try:
+        log.debug("Connecting to %s", args.device)
+        with ConnectHandler(**device_params) as conn:
+            hostname = conn.find_prompt().strip("#>")
+            cmd = BGP_COMMANDS[args.device_type]
+            log.debug("Running: %s", cmd)
+            output = conn.send_command(cmd, read_timeout=30)
+    except NetMikoAuthenticationException:
+        print(f"ERROR: Authentication failed for {args.username}@{args.device}", file=sys.stderr)
+        return 2
+    except NetMikoTimeoutException:
+        print(f"ERROR: Connection timed out to {args.device}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    result = parse_bgp_summary(output, args.device_type)
+
+    if args.output_json:
         print(json.dumps(result, indent=2))
     else:
-        print_table(result)
+        print_table(result, hostname)
 
-    if args.output:
-        with open(args.output, "w") as fh:
-            json.dump(result, fh, indent=2)
-        logger.info("Report written to %s", args.output)
+    if args.alert_down and result["down_count"] > 0:
+        if not args.output_json:
+            print(
+                f"ALERT: {result['down_count']} peer(s) not in Established state",
+                file=sys.stderr,
+            )
+        return 1
 
-    if "audit" in result:
-        audit = result["audit"]
-        if audit["missing"] or audit["unexpected"]:
-            sys.exit(2)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 ```
-
-The script is a VLAN audit tool — distinct from the existing show_command_parser scripts. Key design choices:
-
-- **`parse_vlan_brief`** handles multi-line port lists (Cisco wraps long port lists onto continuation lines with 21+ leading spaces)
-- **Compliance mode** (`--expected vlans.txt`) diffs discovered vs expected VLANs and exits 2 on failure, so it integrates cleanly into automated checks or Ansible playbooks
-- **Dual output** — human-readable table by default, `--json` for machine consumption, `--output` to write both
-- **`run_audit` returns `missing`, `unexpected`, and `compliant`** separately so the caller (or a consuming script) can act on each category independently
