@@ -1,206 +1,203 @@
-acl_deploy.py - Deploy named ACLs to Cisco IOS/IOS-XE devices from a YAML definition file.
+vlan_manager.py - Bulk VLAN provisioning and audit across Cisco switches.
 
 Purpose:
-    Reads extended ACL entries from a structured YAML file and pushes them to a
-    target device via Netmiko. Optionally applies the ACL to a specified interface
-    in a given direction. Supports dry-run mode to preview commands before execution
-    and post-deploy verification.
+    Deploy, remove, or audit VLANs across one or more Cisco IOS/IOS-XE switches
+    in a single pass. Useful for VLAN standardization projects, new site buildouts,
+    and pre/post-change audits.
 
 Usage:
-    python acl_deploy.py --host 192.168.1.1 --username admin --password secret \
-        --acl-file acls.yaml --acl-name BLOCK_INBOUND
+    # Add VLANs 100 and 200 to a switch
+    python vlan_manager.py --host 192.168.1.1 --username admin --password secret \
+        --action add --vlans 100,200 --names "DATA,VOICE"
 
-    Apply to an interface after deploy:
-    python acl_deploy.py --host 192.168.1.1 --username admin --password secret \
-        --acl-file acls.yaml --acl-name BLOCK_INBOUND \
-        --interface GigabitEthernet0/1 --direction in --save
+    # Remove a VLAN
+    python vlan_manager.py --host 192.168.1.1 --username admin --password secret \
+        --action remove --vlans 300
 
-    Preview without connecting:
-    python acl_deploy.py --host 192.168.1.1 --username admin --password secret \
-        --acl-file acls.yaml --acl-name BLOCK_INBOUND --dry-run
+    # Audit current VLANs (read-only)
+    python vlan_manager.py --host 192.168.1.1 --username admin --password secret \
+        --action audit
+
+    # Bulk operation from hostfile (one host per line)
+    python vlan_manager.py --hostfile switches.txt --username admin --password secret \
+        --action add --vlans 100,200 --names "DATA,VOICE"
 
 Prerequisites:
-    pip install netmiko pyyaml
-
-ACL YAML format:
-    acls:
-      BLOCK_INBOUND:
-        - permit tcp 10.0.0.0 0.0.0.255 any eq 443
-        - permit tcp 10.0.0.0 0.0.0.255 any eq 80
-        - deny   ip any any log
-      ALLOW_MGMT:
-        - permit tcp 192.168.10.0 0.0.0.255 any eq 22
-        - deny   ip any any
+    pip install netmiko
+    Cisco IOS or IOS-XE target with SSH enabled.
+    Privilege 15 required for add/remove actions.
 """
 
 import argparse
 import logging
+import re
 import sys
+from getpass import getpass
 
-import yaml
 from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
 
-def load_acl_file(path: str) -> dict:
-    with open(path) as fh:
-        data = yaml.safe_load(fh)
-    if not isinstance(data, dict) or "acls" not in data:
-        raise ValueError(f"YAML must have a top-level 'acls' mapping: {path}")
-    return data["acls"]
+def parse_vlan_brief(output):
+    vlans = {}
+    for line in output.splitlines():
+        match = re.match(r"^(\d+)\s+(\S+)\s+active", line)
+        if match:
+            vlans[int(match.group(1))] = match.group(2)
+    return vlans
 
 
-def build_acl_commands(acl_name: str, entries: list) -> list:
-    cmds = [f"ip access-list extended {acl_name}"]
-    for entry in entries:
-        cmds.append(f" {entry.strip()}")
-    return cmds
+def audit_vlans(conn, host):
+    output = conn.send_command("show vlan brief")
+    vlans = parse_vlan_brief(output)
+    log.info("[%s] %d active VLANs", host, len(vlans))
+    for vid, name in sorted(vlans.items()):
+        print(f"  VLAN {vid:4d}  {name}")
+    return vlans
 
 
-def build_interface_commands(interface: str, acl_name: str, direction: str) -> list:
-    return [
-        f"interface {interface}",
-        f" ip access-group {acl_name} {direction}",
-    ]
+def add_vlans(conn, host, vlan_ids, vlan_names):
+    commands = []
+    for i, vid in enumerate(vlan_ids):
+        commands.append(f"vlan {vid}")
+        if i < len(vlan_names) and vlan_names[i]:
+            commands.append(f" name {vlan_names[i]}")
+
+    log.info("[%s] Configuring VLANs: %s", host, vlan_ids)
+    output = conn.send_config_set(commands)
+    log.debug("[%s] Output:\n%s", host, output)
+
+    current = parse_vlan_brief(conn.send_command("show vlan brief"))
+    missing = [v for v in vlan_ids if v not in current]
+    if missing:
+        log.error("[%s] VLANs not in table after config: %s", host, missing)
+        return False
+
+    log.info("[%s] All VLANs verified present: %s", host, vlan_ids)
+    return True
 
 
-def verify_acl(conn, acl_name: str) -> bool:
-    output = conn.send_command(f"show ip access-lists {acl_name}")
-    return f"Extended IP access list {acl_name}" in output
+def remove_vlans(conn, host, vlan_ids):
+    commands = [f"no vlan {vid}" for vid in vlan_ids]
+    log.info("[%s] Removing VLANs: %s", host, vlan_ids)
+    output = conn.send_config_set(commands)
+    log.debug("[%s] Output:\n%s", host, output)
+
+    current = parse_vlan_brief(conn.send_command("show vlan brief"))
+    still_present = [v for v in vlan_ids if v in current]
+    if still_present:
+        log.error("[%s] VLANs still present after removal: %s", host, still_present)
+        return False
+
+    log.info("[%s] All VLANs confirmed removed: %s", host, vlan_ids)
+    return True
 
 
-def deploy(args):
-    acls = load_acl_file(args.acl_file)
-
-    if args.acl_name not in acls:
-        log.error(
-            "ACL '%s' not found in %s. Available: %s",
-            args.acl_name,
-            args.acl_file,
-            list(acls.keys()),
-        )
-        sys.exit(1)
-
-    entries = acls[args.acl_name]
-    if not entries:
-        log.error("ACL '%s' has no entries in %s", args.acl_name, args.acl_file)
-        sys.exit(1)
-
-    commands = build_acl_commands(args.acl_name, entries)
-    if args.interface:
-        commands += build_interface_commands(args.interface, args.acl_name, args.direction)
-
-    if args.dry_run:
-        log.info("Dry run — commands that would be sent to %s:", args.host)
-        for cmd in commands:
-            print(f"  {cmd}")
-        return
-
+def process_host(host, username, password, action, vlan_ids, vlan_names, device_type):
     device = {
-        "device_type": args.device_type,
-        "host": args.host,
-        "port": args.port,
-        "username": args.username,
-        "password": args.password,
-        "secret": args.enable_secret or args.password,
-        "conn_timeout": 30,
+        "device_type": device_type,
+        "host": host,
+        "username": username,
+        "password": password,
     }
-
-    log.info("Connecting to %s as %s", args.host, args.username)
     try:
         with ConnectHandler(**device) as conn:
-            if args.enable_secret:
-                conn.enable()
-
-            log.info(
-                "Deploying ACL '%s' with %d entries", args.acl_name, len(entries)
-            )
-            output = conn.send_config_set(commands)
-            log.debug("Config output:\n%s", output)
-
-            if args.save:
-                conn.save_config()
-                log.info("Running config saved to startup")
-
-            if verify_acl(conn, args.acl_name):
-                log.info(
-                    "Verification passed: ACL '%s' confirmed on %s",
-                    args.acl_name,
-                    args.host,
-                )
-            else:
-                log.error(
-                    "Verification failed: ACL '%s' not found after deploy", args.acl_name
-                )
-                sys.exit(1)
-
+            conn.enable()
+            if action == "audit":
+                audit_vlans(conn, host)
+                return True
+            elif action == "add":
+                return add_vlans(conn, host, vlan_ids, vlan_names)
+            elif action == "remove":
+                return remove_vlans(conn, host, vlan_ids)
     except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.host)
-        sys.exit(1)
+        log.error("[%s] Authentication failed", host)
     except NetmikoTimeoutException:
-        log.error("Connection timed out to %s", args.host)
-        sys.exit(1)
+        log.error("[%s] Connection timed out", host)
     except Exception as exc:
-        log.error("Unexpected error: %s", exc)
-        sys.exit(1)
-
-    log.info("ACL deploy complete on %s", args.host)
+        log.error("[%s] Unexpected error: %s", host, exc)
+    return False
 
 
-def parse_args():
+def main():
     parser = argparse.ArgumentParser(
-        description="Deploy named extended ACLs to Cisco IOS/IOS-XE from a YAML file"
+        description="Provision or audit VLANs across Cisco switches via Netmiko."
     )
-    parser.add_argument("--host", required=True, help="Device IP or hostname")
-    parser.add_argument("--username", required=True)
-    parser.add_argument("--password", required=True)
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--host", help="Single device IP or hostname")
+    target.add_argument("--hostfile", help="File with one host per line")
+
+    parser.add_argument("--username", required=True, help="SSH username")
+    parser.add_argument("--password", help="SSH password (prompted if omitted)")
     parser.add_argument(
-        "--enable-secret", default="", metavar="SECRET",
-        help="Enable/privilege-exec secret (uses --password if omitted)",
+        "--action",
+        required=True,
+        choices=["add", "remove", "audit"],
+        help="Operation to perform",
     )
     parser.add_argument(
-        "--device-type", default="cisco_ios",
+        "--vlans",
+        help="Comma-separated VLAN IDs (required for add/remove)",
+    )
+    parser.add_argument(
+        "--names",
+        default="",
+        help="Comma-separated VLAN names aligned to --vlans (add only)",
+    )
+    parser.add_argument(
+        "--device-type",
+        default="cisco_ios",
         help="Netmiko device type (default: cisco_ios)",
     )
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument(
-        "--acl-file", required=True, metavar="FILE",
-        help="Path to YAML file containing ACL definitions",
-    )
-    parser.add_argument(
-        "--acl-name", required=True, metavar="NAME",
-        help="Name of the ACL to deploy from the YAML file",
-    )
-    parser.add_argument(
-        "--interface", default="", metavar="INTF",
-        help="Interface to apply the ACL to after deploy (e.g. GigabitEthernet0/1)",
-    )
-    parser.add_argument(
-        "--direction", choices=["in", "out"], default="in",
-        help="ACL direction when binding to interface (default: in)",
-    )
-    parser.add_argument(
-        "--save", action="store_true",
-        help="Write memory after successful deploy",
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Print commands without connecting to the device",
-    )
-    parser.add_argument(
-        "--debug", action="store_true", help="Enable debug-level logging"
-    )
-    return parser.parse_args()
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    password = args.password or getpass(f"Password for {args.username}: ")
+
+    vlan_ids = []
+    vlan_names = []
+    if args.action in ("add", "remove"):
+        if not args.vlans:
+            parser.error("--vlans is required for add/remove")
+        try:
+            vlan_ids = [int(v.strip()) for v in args.vlans.split(",")]
+        except ValueError:
+            parser.error("--vlans must be comma-separated integers")
+        vlan_names = [n.strip() for n in args.names.split(",")] if args.names else []
+
+    if args.host:
+        hosts = [args.host]
+    else:
+        with open(args.hostfile) as f:
+            hosts = [
+                line.strip()
+                for line in f
+                if line.strip() and not line.startswith("#")
+            ]
+
+    results = {}
+    for host in hosts:
+        results[host] = process_host(
+            host, args.username, password, args.action,
+            vlan_ids, vlan_names, args.device_type,
+        )
+
+    failed = [h for h, ok in results.items() if not ok]
+    if failed:
+        log.error("Failed hosts (%d): %s", len(failed), failed)
+        sys.exit(1)
+
+    log.info("Done. %d/%d hosts succeeded.", len(hosts) - len(failed), len(hosts))
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-    deploy(args)
+    main()
