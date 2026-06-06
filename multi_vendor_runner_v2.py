@@ -1,272 +1,216 @@
-The user has provided a complete, detailed specification with explicit output instructions ("Output ONLY the script content"). The brainstorming skill's design-first gate applies to ambiguous creative work — not to fully-specified requirements where the user has explicitly stated what to produce. Following the user instruction priority rule, I'll write the script directly.
-
 ```python
 """
-interface_error_monitor.py - Network interface error counter monitor
+interface_error_monitor.py - Monitor interface error counters on network devices.
 
 Purpose:
-    Connects to one or more network devices and collects interface error
-    counters (CRC errors, input errors, output drops, interface resets).
-    Flags interfaces whose counters exceed configurable thresholds and
-    optionally clears counters after collection.
+    Connects to a network device via SSH and inspects interface error counters
+    (input errors, output errors, CRC, giants, runts). Flags any interface whose
+    counters exceed configurable thresholds. Useful for scheduled NOC checks or
+    post-incident audits across Cisco IOS/IOS-XE/NX-OS and Juniper JunOS devices.
 
 Usage:
-    Single device:
-        python interface_error_monitor.py --host 192.168.1.1 \
-            --device-type cisco_ios --username admin --password secret
-
-    Multiple devices from file (one host per line):
-        python interface_error_monitor.py --hosts-file devices.txt \
-            --device-type cisco_ios --username admin --password secret
-
-    Custom thresholds with CSV output:
-        python interface_error_monitor.py --host 10.0.0.1 \
-            --device-type cisco_nxos --username admin --password secret \
-            --crc-threshold 50 --drops-threshold 200 --output errors.csv
-
-    Clear counters after collecting:
-        python interface_error_monitor.py --host 10.0.0.1 \
-            --device-type cisco_ios --username admin --password secret --clear
+    python interface_error_monitor.py -H 192.168.1.1 -u admin -p secret
+    python interface_error_monitor.py -H 10.0.0.1 -u admin -p secret \\
+        --device-type cisco_nxos --crc-threshold 50 --error-threshold 100
+    python interface_error_monitor.py -H 10.0.0.1 -u admin -p secret \\
+        --interfaces Gi0/1 Gi0/2 --output results.json
 
 Prerequisites:
     pip install netmiko
+    SSH must be enabled; account needs at minimum read-only (show) privileges.
+    Supported device types: cisco_ios, cisco_xe, cisco_nxos, juniper_junos
 """
 
 import argparse
-import csv
+import json
 import logging
+import re
 import sys
-from dataclasses import dataclass, field
-from typing import List
+from getpass import getpass
 
 from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.INFO,
-    stream=sys.stderr,
-)
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-SHOW_CMD = {
-    "cisco_ios": "show interfaces",
-    "cisco_xe": "show interfaces",
-    "cisco_nxos": "show interface",
-    "cisco_xr": "show interfaces",
-    "arista_eos": "show interfaces",
+VENDOR_CONFIG = {
+    "cisco_ios": {
+        "command": "show interfaces",
+        "iface_re": re.compile(r"^(\S+)\s+is\s+(?:up|down|administratively down)", re.M),
+        "counters_re": re.compile(
+            r"(\d+) input errors.*?(\d+) CRC.*?(\d+) giants.*?(\d+) runts.*?(\d+) output errors",
+            re.DOTALL,
+        ),
+    },
+    "cisco_xe": {
+        "command": "show interfaces",
+        "iface_re": re.compile(r"^(\S+)\s+is\s+(?:up|down|administratively down)", re.M),
+        "counters_re": re.compile(
+            r"(\d+) input errors.*?(\d+) CRC.*?(\d+) giants.*?(\d+) runts.*?(\d+) output errors",
+            re.DOTALL,
+        ),
+    },
+    "cisco_nxos": {
+        "command": "show interface",
+        "iface_re": re.compile(r"^(\S+)\s+is\s+(?:up|down|administratively down)", re.M),
+        "counters_re": re.compile(
+            r"(\d+) input error.*?(\d+) CRC.*?(\d+) giant.*?(\d+) runt.*?(\d+) output error",
+            re.DOTALL,
+        ),
+    },
+    "juniper_junos": {
+        "command": "show interfaces detail",
+        "iface_re": re.compile(r"^Physical interface:\s+(\S+)", re.M),
+        "counters_re": re.compile(
+            r"Input errors:\s+(\d+).*?Framing errors:\s+(\d+).*?"
+            r"Giant frames:\s+(\d+).*?Runts:\s+(\d+).*?Output errors:\s+(\d+)",
+            re.DOTALL,
+        ),
+    },
 }
 
-CLEAR_CMD = {
-    "cisco_ios": "clear counters",
-    "cisco_xe": "clear counters",
-    "cisco_nxos": "clear counters",
-    "cisco_xr": "clear counters all",
-    "arista_eos": "clear counters",
-}
 
-IFACE_PREFIXES = (
-    "GigabitEthernet", "FastEthernet", "TenGigabitEthernet", "HundredGigE",
-    "FortyGigabitEthernet", "Ethernet", "Management", "Port-channel",
-    "Loopback", "Vlan", "eth", "mgmt",
-)
+def split_interface_blocks(output, vendor):
+    iface_re = VENDOR_CONFIG[vendor]["iface_re"]
+    matches = list(iface_re.finditer(output))
+    blocks = {}
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(output)
+        blocks[m.group(1)] = output[m.start():end]
+    return blocks
 
 
-@dataclass
-class IfaceErrors:
-    device: str
-    interface: str
-    input_errors: int = 0
-    crc_errors: int = 0
-    output_drops: int = 0
-    resets: int = 0
-    flags: List[str] = field(default_factory=list)
-
-
-def parse_errors(output: str, device: str) -> List[IfaceErrors]:
-    results: List[IfaceErrors] = []
-    current: IfaceErrors | None = None
-
-    for line in output.splitlines():
-        stripped = line.strip()
-
-        if line and not line[0].isspace():
-            parts = stripped.split()
-            if parts and stripped.startswith(IFACE_PREFIXES):
-                if current:
-                    results.append(current)
-                current = IfaceErrors(device=device, interface=parts[0])
-
-        if current is None:
-            continue
-
-        tokens = stripped.split()
-        if not tokens:
-            continue
-
-        if "input errors" in stripped:
-            try:
-                current.input_errors = int(tokens[0])
-            except (ValueError, IndexError):
-                pass
-            if "CRC" in stripped:
-                try:
-                    idx = next(i for i, t in enumerate(tokens) if "CRC" in t)
-                    current.crc_errors = int(tokens[idx - 1])
-                except (StopIteration, ValueError, IndexError):
-                    pass
-
-        elif "output drops" in stripped or "output drop" in stripped:
-            try:
-                current.output_drops = int(tokens[0])
-            except (ValueError, IndexError):
-                pass
-
-        elif "interface resets" in stripped:
-            try:
-                current.resets = int(tokens[0])
-            except (ValueError, IndexError):
-                pass
-
-    if current:
-        results.append(current)
-    return results
-
-
-def apply_thresholds(
-    ifaces: List[IfaceErrors],
-    crc: int,
-    drops: int,
-    input_err: int,
-    resets: int,
-) -> List[IfaceErrors]:
-    flagged = []
-    for iface in ifaces:
-        iface.flags = []
-        if iface.crc_errors >= crc:
-            iface.flags.append(f"crc={iface.crc_errors}")
-        if iface.output_drops >= drops:
-            iface.flags.append(f"drops={iface.output_drops}")
-        if iface.input_errors >= input_err:
-            iface.flags.append(f"in_err={iface.input_errors}")
-        if iface.resets >= resets:
-            iface.flags.append(f"resets={iface.resets}")
-        if iface.flags:
-            flagged.append(iface)
-    return flagged
-
-
-def poll_device(
-    host: str, device_type: str, username: str, password: str,
-    secret: str, clear: bool,
-) -> List[IfaceErrors]:
-    params = {
-        "device_type": device_type,
-        "host": host,
-        "username": username,
-        "password": password,
-        "secret": secret,
-        "timeout": 30,
+def extract_counters(block, vendor):
+    m = VENDOR_CONFIG[vendor]["counters_re"].search(block)
+    if not m:
+        return None
+    vals = [int(x) for x in m.groups()]
+    return {
+        "input_errors": vals[0],
+        "crc_errors": vals[1],
+        "giants": vals[2],
+        "runts": vals[3],
+        "output_errors": vals[4],
     }
+
+
+def find_violations(counters, error_threshold, crc_threshold):
+    checks = [
+        ("input_errors", counters["input_errors"], error_threshold),
+        ("output_errors", counters["output_errors"], error_threshold),
+        ("crc_errors", counters["crc_errors"], crc_threshold),
+    ]
+    return [(f, v, t) for f, v, t in checks if v > t]
+
+
+def run(args):
+    if args.device_type not in VENDOR_CONFIG:
+        log.error("Unsupported device type: %s", args.device_type)
+        return 1
+
+    log.info("Connecting to %s (%s)", args.host, args.device_type)
     try:
-        log.info("Connecting to %s", host)
-        with ConnectHandler(**params) as conn:
-            if secret:
-                conn.enable()
-            cmd = SHOW_CMD.get(device_type, "show interfaces")
-            output = conn.send_command(cmd, read_timeout=60)
-            ifaces = parse_errors(output, host)
-            if clear and device_type in CLEAR_CMD:
-                conn.send_command_timing(CLEAR_CMD[device_type])
-                log.info("Counters cleared on %s", host)
-            return ifaces
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed: %s", host)
-    except NetmikoTimeoutException:
-        log.error("Timeout: %s", host)
-    except Exception as exc:
-        log.error("Error on %s: %s", host, exc)
-    return []
-
-
-def write_csv(rows: List[IfaceErrors], path: str) -> None:
-    with open(path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["device", "interface", "input_errors", "crc_errors",
-                         "output_drops", "resets", "flags"])
-        for r in rows:
-            writer.writerow([r.device, r.interface, r.input_errors, r.crc_errors,
-                             r.output_drops, r.resets, "; ".join(r.flags)])
-    log.info("Results written to %s", path)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Collect and threshold-check interface error counters via netmiko"
-    )
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("--host", help="Device IP or hostname")
-    target.add_argument("--hosts-file", help="File with one host per line")
-    parser.add_argument("--device-type", required=True, choices=list(SHOW_CMD),
-                        help="Netmiko device type")
-    parser.add_argument("--username", required=True)
-    parser.add_argument("--password", required=True)
-    parser.add_argument("--secret", default="", help="Enable secret")
-    parser.add_argument("--crc-threshold", type=int, default=10,
-                        help="Flag interfaces with CRC errors >= N (default: 10)")
-    parser.add_argument("--drops-threshold", type=int, default=100,
-                        help="Flag interfaces with output drops >= N (default: 100)")
-    parser.add_argument("--input-threshold", type=int, default=50,
-                        help="Flag interfaces with input errors >= N (default: 50)")
-    parser.add_argument("--resets-threshold", type=int, default=5,
-                        help="Flag interfaces with resets >= N (default: 5)")
-    parser.add_argument("--clear", action="store_true",
-                        help="Clear counters on device after collecting")
-    parser.add_argument("--output", metavar="CSV", help="Write flagged results to CSV")
-    parser.add_argument("--all", dest="show_all", action="store_true",
-                        help="Print all interfaces, not just flagged ones")
-    args = parser.parse_args()
-
-    if args.host:
-        hosts = [args.host]
-    else:
-        try:
-            with open(args.hosts_file) as f:
-                hosts = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-        except OSError as e:
-            log.error("Cannot read hosts file: %s", e)
-            sys.exit(1)
-
-    all_flagged: List[IfaceErrors] = []
-
-    for host in hosts:
-        ifaces = poll_device(host, args.device_type, args.username, args.password,
-                             args.secret, args.clear)
-        flagged = apply_thresholds(
-            ifaces,
-            crc=args.crc_threshold,
-            drops=args.drops_threshold,
-            input_err=args.input_threshold,
-            resets=args.resets_threshold,
+        conn = ConnectHandler(
+            device_type=args.device_type,
+            host=args.host,
+            username=args.username,
+            password=args.password,
+            port=args.port,
+            timeout=args.timeout,
         )
-        display = ifaces if args.show_all else flagged
-        for iface in display:
-            tag = f"  [{', '.join(iface.flags)}]" if iface.flags else ""
-            print(f"{iface.device:<20}  {iface.interface:<30}  "
-                  f"crc:{iface.crc_errors:<6} drops:{iface.output_drops:<6} "
-                  f"in_err:{iface.input_errors:<6} resets:{iface.resets}{tag}")
-        log.info("%s: %d interfaces, %d flagged", host, len(ifaces), len(flagged))
-        all_flagged.extend(flagged)
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.host)
+        return 1
+    except NetmikoTimeoutException:
+        log.error("Connection timed out: %s", args.host)
+        return 1
 
-    if args.output and all_flagged:
-        write_csv(all_flagged, args.output)
+    cmd = VENDOR_CONFIG[args.device_type]["command"]
+    log.info("Running: %s", cmd)
+    output = conn.send_command(cmd)
+    conn.disconnect()
 
-    if all_flagged:
-        print(f"\n{len(all_flagged)} interface(s) exceeded thresholds.")
-        sys.exit(1)
+    blocks = split_interface_blocks(output, args.device_type)
+    if args.interfaces:
+        blocks = {k: v for k, v in blocks.items() if k in args.interfaces}
+
+    results = {}
+    flagged = 0
+
+    for iface, block in blocks.items():
+        counters = extract_counters(block, args.device_type)
+        if counters is None:
+            log.debug("No counter data parsed for %s, skipping", iface)
+            continue
+
+        violations = find_violations(counters, args.error_threshold, args.crc_threshold)
+        results[iface] = {
+            "counters": counters,
+            "violations": [{"field": f, "value": v, "threshold": t} for f, v, t in violations],
+        }
+
+        if violations:
+            flagged += 1
+            detail = ", ".join(f"{f}={v} (>{t})" for f, v, t in violations)
+            log.warning("THRESHOLD EXCEEDED  %-30s  %s", iface, detail)
+        else:
+            log.info("OK  %s", iface)
+
+    log.info("Checked %d interface(s); %d flagged.", len(results), flagged)
+
+    payload = json.dumps(results, indent=2)
+    if args.output:
+        with open(args.output, "w") as fh:
+            fh.write(payload)
+        log.info("Results written to %s", args.output)
     else:
-        print("\nAll interfaces within thresholds.")
+        print(payload)
+
+    return 1 if flagged else 0
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Monitor interface error counters and alert on threshold violations."
+    )
+    p.add_argument("-H", "--host", required=True, help="Device IP or hostname")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
+    p.add_argument(
+        "-t", "--device-type",
+        dest="device_type",
+        default="cisco_ios",
+        choices=list(VENDOR_CONFIG.keys()),
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds (default: 30)")
+    p.add_argument(
+        "--interfaces", nargs="+", metavar="INTF",
+        help="Limit check to named interfaces, e.g. --interfaces Gi0/1 Gi0/2",
+    )
+    p.add_argument(
+        "--error-threshold", type=int, default=0,
+        help="Alert when input/output error count exceeds this (default: 0)",
+    )
+    p.add_argument(
+        "--crc-threshold", type=int, default=0,
+        help="Alert when CRC error count exceeds this (default: 0)",
+    )
+    p.add_argument("-o", "--output", metavar="FILE", help="Write JSON results to FILE instead of stdout")
+    p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    return p
 
 
 if __name__ == "__main__":
-    main()
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.password is None:
+        args.password = getpass(f"Password for {args.username}@{args.host}: ")
+
+    sys.exit(run(args))
 ```
