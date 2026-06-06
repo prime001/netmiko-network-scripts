@@ -1,219 +1,199 @@
-#!/usr/bin/env python3
-"""
-BGP Peer Status Monitor
+err_disabled_recovery.py - Recover err-disabled interfaces via targeted port-bounce
 
-Monitors BGP peer status, route counts, and uptime on Cisco/Arista devices.
-Useful for circuit and peer health monitoring across production networks.
+Purpose:
+    Detects interfaces in err-disabled state on Cisco IOS/IOS-XE devices and
+    recovers them by performing a shutdown/no-shutdown cycle. Supports filtering
+    by err-disable reason (bpduguard, psecure-violation, loopback, etc.) and
+    includes pre/post verification that the interface actually leaves err-disabled.
 
 Usage:
-    python bgp_monitor.py -d 192.168.1.1 -u admin -p password --device-type cisco_ios
-    python bgp_monitor.py -d 10.0.0.5 -u netadmin -p mypass -v
+    python err_disabled_recovery.py -H 192.168.1.1 -u admin
+    python err_disabled_recovery.py -H 192.168.1.1 -u admin --reason bpduguard
+    python err_disabled_recovery.py -H 192.168.1.1 -u admin --dry-run
+    python err_disabled_recovery.py -H 192.168.1.1 -u admin --interface GigabitEthernet0/1
 
 Prerequisites:
-    - netmiko installed (pip install netmiko)
-    - Device must have BGP configured and enabled
-    - SSH credentials must have read access to device
-    - Device must be reachable via SSH (port 22 by default)
-
-Output:
-    Displays formatted BGP peer status table with address, ASN, state, and
-    prefix count. Alerts on peers in non-established states.
-
+    pip install netmiko
+    IOS/IOS-XE device with SSH enabled and privilege level 15 access
+    'errdisable recovery' may need to be disabled if auto-recovery is configured
 """
 
 import argparse
 import logging
-import sys
 import re
+import sys
+import time
+from getpass import getpass
+
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
-
-def configure_logging(verbose=False):
-    """Configure logging for the script."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
-    return logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger(__name__)
 
 
-def connect_to_device(device_params, logger):
-    """Establish SSH connection to network device."""
-    try:
-        logger.info(f"Connecting to {device_params['host']}")
-        device = ConnectHandler(**device_params)
-        logger.info("Connection established successfully")
-        return device
-    except NetmikoAuthenticationException as e:
-        logger.error(f"Authentication failed: {e}")
-        sys.exit(1)
-    except NetmikoTimeoutException as e:
-        logger.error(f"Connection timeout: {e}")
-        sys.exit(1)
-    except Exception as e:
-        logger.error(f"Connection failed: {e}")
-        sys.exit(1)
-
-
-def get_bgp_summary(device, logger):
-    """Retrieve BGP summary information from device."""
-    try:
-        logger.debug("Sending 'show ip bgp summary' command")
-        output = device.send_command('show ip bgp summary')
-        logger.debug("BGP summary retrieved successfully")
-        return output
-    except Exception as e:
-        logger.error(f"Failed to retrieve BGP summary: {e}")
-        return ""
-
-
-def parse_bgp_summary(output, logger):
-    """Parse BGP summary output into structured peer data."""
-    peers = []
-    peer_section = False
-    
-    for line in output.split('\n'):
-        line = line.strip()
-        
-        if not line or 'Neighbor' in line and 'V' in line:
-            peer_section = True
+def parse_err_disabled(output: str) -> list[dict]:
+    """Parse 'show interfaces status err-disabled' output into list of dicts."""
+    results = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.lower().startswith("port"):
             continue
-        
-        if not peer_section or not line:
-            continue
-        
-        if re.match(r'^\d+\.\d+\.\d+\.\d+', line):
-            parts = line.split()
-            if len(parts) >= 6:
-                peer = {
-                    'address': parts[0],
-                    'asn': parts[1],
-                    'version': parts[2],
-                    'msg_rcvd': parts[3],
-                    'msg_sent': parts[4],
-                    'tbl_ver': parts[5],
-                    'inp_q': parts[6] if len(parts) > 6 else '0',
-                    'out_q': parts[7] if len(parts) > 7 else '0',
-                    'state': parts[8] if len(parts) > 8 else 'Unknown'
-                }
-                peers.append(peer)
-                logger.debug(f"Parsed peer: {peer['address']} state: {peer['state']}")
-    
-    return peers
+        parts = stripped.split()
+        if len(parts) >= 2:
+            results.append({"interface": parts[0], "reason": parts[1]})
+    return results
 
 
-def analyze_bgp_peers(peers, logger):
-    """Analyze BGP peer status and identify issues."""
-    total_peers = len(peers)
-    established = sum(1 for p in peers if p['state'].isdigit())
-    down_peers = [p for p in peers if not p['state'].isdigit()]
-    
-    analysis = {
-        'total': total_peers,
-        'established': established,
-        'down_peers': down_peers,
-        'down_count': len(down_peers),
-        'health_percentage': (established / total_peers * 100) if total_peers > 0 else 0
-    }
-    
-    logger.info(f"BGP Analysis: {established}/{total_peers} peers established")
-    
-    return analysis
+def recover_interface(conn, interface: str, delay: int) -> bool:
+    """Cycle interface shutdown/no-shutdown. Returns True if commands succeeded."""
+    try:
+        log.info("  Shutting down %s", interface)
+        conn.send_config_set([f"interface {interface}", "shutdown"])
+        time.sleep(delay)
+        log.info("  Bringing up %s", interface)
+        conn.send_config_set([f"interface {interface}", "no shutdown"])
+        return True
+    except Exception as exc:
+        log.error("  Config failed on %s: %s", interface, exc)
+        return False
 
 
-def generate_report(device_ip, peers, analysis, logger):
-    """Generate formatted BGP status report."""
-    print(f"\n{'='*80}")
-    print(f"BGP Peer Status Monitor - {device_ip}")
-    print(f"{'='*80}\n")
-    
-    print(f"Peer Statistics:")
-    print(f"  Total Peers: {analysis['total']}")
-    print(f"  Established: {analysis['established']}")
-    print(f"  Down/Idle: {analysis['down_count']}")
-    print(f"  Health: {analysis['health_percentage']:.1f}%\n")
-    
-    if peers:
-        print(f"{'Neighbor':<18} {'ASN':<8} {'Msg Rcvd':<10} {'Msg Sent':<10} {'State':<15}")
-        print(f"{'-'*80}")
-        
-        for peer in peers:
-            state = peer['state']
-            if state.isdigit():
-                state_display = f"{state} prefixes"
-            else:
-                state_display = state
-            
-            print(f"{peer['address']:<18} {peer['asn']:<8} {peer['msg_rcvd']:<10} "
-                  f"{peer['msg_sent']:<10} {state_display:<15}")
-    
-    if analysis['down_peers']:
-        print(f"\n{'⚠️  ALERTS - Peers Not Established:':<80}")
-        for peer in analysis['down_peers']:
-            print(f"  {peer['address']:<18} ASN {peer['asn']:<8} State: {peer['state']}")
-    else:
-        print(f"\n{'✓ All peers established':<80}")
-    
-    print(f"\n{'='*80}\n")
+def verify_recovered(conn, interface: str, timeout: int) -> bool:
+    """Poll interface status until err-disabled clears or timeout expires."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        out = conn.send_command(f"show interfaces {interface} status")
+        if "err-disabled" not in out.lower():
+            return True
+        remaining = int(deadline - time.time())
+        log.info("  %s still err-disabled, waiting... (%ds remaining)", interface, remaining)
+        time.sleep(5)
+    return False
 
 
-def main():
-    """Main execution function."""
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Monitor BGP peer status and connectivity'
+        description="Recover err-disabled interfaces on Cisco IOS/IOS-XE"
     )
-    parser.add_argument('-d', '--device', required=True,
-                        help='Target device IP address or hostname')
-    parser.add_argument('-u', '--username', required=True,
-                        help='SSH username for device authentication')
-    parser.add_argument('-p', '--password', required=True,
-                        help='SSH password for device authentication')
-    parser.add_argument('-t', '--device-type', default='cisco_ios',
-                        help='Device type for netmiko (default: cisco_ios)')
-    parser.add_argument('--port', type=int, default=22,
-                        help='SSH port (default: 22)')
-    parser.add_argument('-v', '--verbose', action='store_true',
-                        help='Enable verbose debug logging')
-    
+    parser.add_argument("-H", "--host", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
+    parser.add_argument("--secret", help="Enable secret (defaults to password)")
+    parser.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        choices=["cisco_ios", "cisco_xe", "cisco_nxos"],
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    parser.add_argument(
+        "--interface",
+        help="Recover only this specific interface (e.g. GigabitEthernet0/1)",
+    )
+    parser.add_argument(
+        "--reason",
+        help="Filter by err-disable reason (e.g. bpduguard, psecure-violation)",
+    )
+    parser.add_argument(
+        "--delay",
+        type=int,
+        default=3,
+        help="Seconds between shutdown and no-shutdown (default: 3)",
+    )
+    parser.add_argument(
+        "--verify-timeout",
+        type=int,
+        default=30,
+        help="Seconds to wait for interface to recover (default: 30)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show err-disabled interfaces without making changes",
+    )
     args = parser.parse_args()
-    logger = configure_logging(args.verbose)
-    
+
+    password = args.password or getpass(f"Password for {args.username}@{args.host}: ")
+    secret = args.secret or password
+
     device_params = {
-        'device_type': args.device_type,
-        'host': args.device,
-        'username': args.username,
-        'password': args.password,
-        'port': args.port,
+        "device_type": args.device_type,
+        "host": args.host,
+        "username": args.username,
+        "password": password,
+        "secret": secret,
+        "timeout": 30,
+        "session_log": None,
     }
-    
-    device = connect_to_device(device_params, logger)
-    
+
     try:
-        output = get_bgp_summary(device, logger)
-        peers = parse_bgp_summary(output, logger)
-        
-        if not peers:
-            logger.warning("No BGP peers found or BGP not configured")
-            print("\n⚠️  No BGP peers detected on device.\n")
-        else:
-            analysis = analyze_bgp_peers(peers, logger)
-            generate_report(args.device, peers, analysis, logger)
-        
-        logger.info("BGP monitoring complete")
-    
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        log.info("Connecting to %s", args.host)
+        conn = ConnectHandler(**device_params)
+        conn.enable()
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.host)
         sys.exit(1)
-    
+    except NetmikoTimeoutException:
+        log.error("Connection timed out to %s", args.host)
+        sys.exit(1)
+
+    try:
+        raw = conn.send_command("show interfaces status err-disabled")
+        candidates = parse_err_disabled(raw)
+
+        if args.interface:
+            candidates = [
+                c for c in candidates
+                if args.interface.lower() in c["interface"].lower()
+            ]
+            if not candidates:
+                log.info("%s is not currently err-disabled", args.interface)
+                return
+
+        if args.reason:
+            candidates = [c for c in candidates if c["reason"] == args.reason]
+
+        if not candidates:
+            log.info("No err-disabled interfaces found matching the specified criteria")
+            return
+
+        log.info("Found %d err-disabled interface(s):", len(candidates))
+        for entry in candidates:
+            log.info("  %-35s  reason: %s", entry["interface"], entry["reason"])
+
+        if args.dry_run:
+            log.info("Dry-run mode — no changes applied")
+            return
+
+        recovered, failed = [], []
+        for entry in candidates:
+            intf = entry["interface"]
+            log.info("Recovering %s (reason: %s)", intf, entry["reason"])
+            if recover_interface(conn, intf, args.delay):
+                if verify_recovered(conn, intf, args.verify_timeout):
+                    log.info("  %s recovered successfully", intf)
+                    recovered.append(intf)
+                else:
+                    log.warning("  %s bounced but did not clear err-disabled state", intf)
+                    failed.append(intf)
+            else:
+                failed.append(intf)
+
+        log.info(
+            "Done — recovered: %d  failed: %d",
+            len(recovered),
+            len(failed),
+        )
+        if failed:
+            log.warning("Interfaces still in err-disabled: %s", ", ".join(failed))
+            sys.exit(1)
+
     finally:
-        try:
-            device.disconnect()
-            logger.debug("Device connection closed")
-        except Exception as e:
-            logger.warning(f"Error closing connection: {e}")
+        conn.disconnect()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
