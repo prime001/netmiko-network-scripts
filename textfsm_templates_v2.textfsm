@@ -1,200 +1,249 @@
 ```python
 #!/usr/bin/env python3
 """
-Device Credential and Connectivity Validator
+Device Configuration Compliance Checker - Validates device configurations.
 
-Validates SSH connectivity and credentials across multiple network devices.
-Useful for pre-deployment audits, credential rotation verification, and
-operational readiness checks.
+Verifies that network devices meet minimum configuration standards including
+NTP configuration, syslog servers, SSH settings, AAA configuration, and
+logging levels. Generates compliance reports identifying gaps.
 
 Usage:
-    python device_validator.py devices.txt -u admin -p secret -d cisco_ios
-    python device_validator.py inventory.txt -u admin -p secret -d cisco_ios -o results.csv
+    python3 compliance_checker.py 192.168.1.1 admin password123
 
 Prerequisites:
-    - netmiko library installed (pip install netmiko)
-    - Input file with device IPs/hostnames (one per line)
-    - SSH connectivity to target devices with appropriate credentials
-
-Output:
-    Console report showing validation results and optional CSV export.
-    Failed devices are logged for troubleshooting.
+    - netmiko installed (pip install netmiko)
+    - SSH access to network device
+    - User credentials with show privilege
 """
 
 import argparse
-import csv
+import json
 import logging
 import sys
 from datetime import datetime
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler
+from netmiko.ssh_exception import NetMikoTimeoutException, NetMikoAuthenticationException
 
 
-def setup_logging(log_file):
-    """Configure logging for the script."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler()
-        ]
-    )
-    return logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
-def load_devices(file_path):
-    """Load device list from file (one IP/hostname per line)."""
-    devices = []
-    try:
-        with open(file_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    devices.append(line)
-        logging.info(f'Loaded {len(devices)} devices from {file_path}')
-        return devices
-    except FileNotFoundError:
-        logging.error(f'File not found: {file_path}')
-        raise
-
-
-def validate_device(host, username, password, device_type, timeout):
-    """Test SSH connectivity and credentials, retrieve basic device info."""
-    result = {
-        'host': host,
-        'status': 'Failed',
-        'error': None,
-        'uptime': None,
+COMPLIANCE_RULES = {
+    'ntp_configured': {
+        'description': 'NTP server configured',
+        'ios_command': 'show run | include ntp server',
+        'check_pattern': 'ntp server'
+    },
+    'logging_configured': {
+        'description': 'Syslog server configured',
+        'ios_command': 'show run | include logging',
+        'check_pattern': 'logging'
+    },
+    'ssh_enabled': {
+        'description': 'SSH enabled (not Telnet only)',
+        'ios_command': 'show run | include transport input',
+        'check_pattern': 'ssh'
+    },
+    'aaa_configured': {
+        'description': 'AAA authentication configured',
+        'ios_command': 'show run | include aaa',
+        'check_pattern': 'aaa'
+    },
+    'snmp_configured': {
+        'description': 'SNMP configured',
+        'ios_command': 'show run | include snmp',
+        'check_pattern': 'snmp-server'
     }
+}
 
-    device_params = {
-        'device_type': device_type,
-        'host': host,
-        'username': username,
-        'password': password,
-        'timeout': timeout,
-        'banner_timeout': 10,
-    }
 
+def connect_device(device_config):
+    """Establish SSH connection to device."""
     try:
-        device = ConnectHandler(**device_params)
-        result['status'] = 'Success'
-
-        try:
-            output = device.send_command('show version', expect_string=None)
-            for line in output.split('\n'):
-                if 'uptime' in line.lower():
-                    result['uptime'] = line.strip()[:50]
-                    break
-        except Exception:
-            pass
-
-        device.disconnect()
-        logging.info(f'✓ {host} - Credentials valid')
-
-    except NetmikoAuthenticationException:
-        result['error'] = 'Authentication failed'
-        logging.warning(f'✗ {host} - Authentication failed')
-    except NetmikoTimeoutException:
-        result['error'] = 'Connection timeout'
-        logging.warning(f'✗ {host} - Connection timeout')
+        logger.info(f"Connecting to {device_config['host']}...")
+        conn = ConnectHandler(**device_config)
+        logger.info("Connected successfully")
+        return conn
+    except NetMikoTimeoutException:
+        logger.error("Connection timeout - device unreachable")
+        sys.exit(1)
+    except NetMikoAuthenticationException:
+        logger.error("Authentication failed - invalid credentials")
+        sys.exit(1)
     except Exception as e:
-        result['error'] = str(e)[:40]
-        logging.warning(f'✗ {host} - {e}')
-
-    return result
+        logger.error(f"Connection error: {e}")
+        sys.exit(1)
 
 
-def print_report(results):
-    """Print formatted validation report."""
-    print(f"\n{'='*85}")
-    print(f"Device Validation Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'='*85}")
-    print(f"{'Host':<20} {'Status':<12} {'Error/Uptime':<50}")
-    print(f"{'-'*85}")
+def run_compliance_checks(conn, device_type):
+    """Execute compliance checks against device configuration."""
+    results = {
+        'timestamp': datetime.now().isoformat(),
+        'device_type': device_type,
+        'checks': {},
+        'passed': 0,
+        'failed': 0
+    }
+    
+    for check_name, check_config in COMPLIANCE_RULES.items():
+        try:
+            if 'cisco' in device_type.lower():
+                command = check_config['ios_command']
+            else:
+                command = check_config['ios_command']
+            
+            logger.info(f"Running check: {check_name}")
+            output = conn.send_command(command)
+            
+            check_passed = check_config['check_pattern'].lower() in output.lower()
+            
+            results['checks'][check_name] = {
+                'description': check_config['description'],
+                'passed': check_passed,
+                'status': 'PASS' if check_passed else 'FAIL'
+            }
+            
+            if check_passed:
+                results['passed'] += 1
+            else:
+                results['failed'] += 1
+                logger.warning(f"Check failed: {check_name}")
+        
+        except Exception as e:
+            logger.error(f"Error running check {check_name}: {e}")
+            results['checks'][check_name] = {
+                'description': check_config['description'],
+                'passed': False,
+                'status': 'ERROR',
+                'error': str(e)
+            }
+            results['failed'] += 1
+    
+    return results
 
-    success_count = 0
-    for result in results:
-        status = '✓ Success' if result['status'] == 'Success' else '✗ Failed'
-        detail = result['uptime'] if result['uptime'] else result['error'] or '-'
-        print(f"{result['host']:<20} {status:<12} {detail:<50}")
-        if result['status'] == 'Success':
-            success_count += 1
 
-    print(f"{'-'*85}")
-    print(f"Summary: {success_count}/{len(results)} devices validated successfully")
-    print(f"{'='*85}\n")
-
-    return success_count
-
-
-def write_csv_report(results, output_file):
-    """Write validation results to CSV file."""
+def get_device_facts(conn):
+    """Retrieve basic device information."""
     try:
-        with open(output_file, 'w', newline='') as f:
-            fieldnames = ['host', 'status', 'error', 'uptime']
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for result in results:
-                writer.writerow({
-                    'host': result['host'],
-                    'status': result['status'],
-                    'error': result['error'] or '',
-                    'uptime': result['uptime'] or ''
-                })
-        logging.info(f'Report written to {output_file}')
-    except IOError as e:
-        logging.error(f'Failed to write report: {e}')
+        version_output = conn.send_command('show version', use_textfsm=False)
+        lines = version_output.split('\n')
+        
+        facts = {'model': 'Unknown', 'serial': 'Unknown'}
+        for line in lines:
+            if 'model' in line.lower():
+                facts['model'] = line.split(':')[-1].strip() if ':' in line else 'Unknown'
+            elif 'serial' in line.lower():
+                facts['serial'] = line.split(':')[-1].strip() if ':' in line else 'Unknown'
+        
+        return facts
+    except Exception:
+        return {'model': 'Unknown', 'serial': 'Unknown'}
+
+
+def print_compliance_report(host, facts, results):
+    """Print formatted compliance report."""
+    print(f"\n{'='*70}")
+    print(f"Configuration Compliance Report")
+    print(f"{'='*70}")
+    print(f"Host:              {host}")
+    print(f"Model:             {facts.get('model', 'Unknown')}")
+    print(f"Serial:            {facts.get('serial', 'Unknown')}")
+    print(f"Device Type:       {results.get('device_type', 'Unknown')}")
+    print(f"Timestamp:         {results.get('timestamp', 'Unknown')}")
+    print(f"\nCompliance Summary")
+    print(f"-" * 70)
+    print(f"Passed:            {results['passed']}/{len(results['checks'])}")
+    print(f"Failed:            {results['failed']}/{len(results['checks'])}")
+    compliance_percentage = (results['passed'] / len(results['checks']) * 100) if results['checks'] else 0
+    print(f"Compliance:        {compliance_percentage:.0f}%")
+    
+    print(f"\nDetailed Results")
+    print(f"-" * 70)
+    print(f"{'Check':<30} {'Status':<10} {'Description':<30}")
+    print("-" * 70)
+    
+    for check_name, check_result in results['checks'].items():
+        status = check_result['status']
+        description = check_result['description']
+        print(f"{check_name:<30} {status:<10} {description:<30}")
+    
+    print(f"{'='*70}\n")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Validate connectivity and credentials to network devices'
+        description='Check network device configuration compliance',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Example: python3 compliance_checker.py 192.168.1.1 admin password123'
     )
-    parser.add_argument('devices', help='File containing device IPs/hostnames')
-    parser.add_argument('-u', '--username', required=True, help='SSH username')
-    parser.add_argument('-p', '--password', required=True, help='SSH password')
-    parser.add_argument('-d', '--device-type', required=True,
-                        help='Device type (cisco_ios, cisco_xe, juniper_junos, etc.)')
-    parser.add_argument('-t', '--timeout', type=int, default=15,
-                        help='SSH timeout in seconds (default: 15)')
-    parser.add_argument('-o', '--output', help='Output CSV file for results')
-    parser.add_argument('--log-file', default='device_validator.log',
-                        help='Log file path (default: device_validator.log)')
-
+    
+    parser.add_argument('host', help='Device IP address or hostname')
+    parser.add_argument('username', help='SSH username')
+    parser.add_argument('password', help='SSH password')
+    parser.add_argument(
+        '--device-type',
+        default='cisco_ios',
+        choices=['cisco_ios', 'cisco_xe', 'cisco_xr', 'arista_eos', 'juniper_junos'],
+        help='Device type (default: cisco_ios)'
+    )
+    parser.add_argument(
+        '--port',
+        type=int,
+        default=22,
+        help='SSH port (default: 22)'
+    )
+    parser.add_argument(
+        '--timeout',
+        type=int,
+        default=30,
+        help='Connection timeout in seconds (default: 30)'
+    )
+    parser.add_argument(
+        '--json',
+        action='store_true',
+        help='Output results as JSON'
+    )
+    
     args = parser.parse_args()
-
-    logger = setup_logging(args.log_file)
-    logger.info('Device validation started')
-
+    
+    device_config = {
+        'device_type': args.device_type,
+        'host': args.host,
+        'username': args.username,
+        'password': args.password,
+        'port': args.port,
+        'timeout': args.timeout,
+    }
+    
+    logger.info(f"Starting compliance check for {args.host}")
+    
+    conn = connect_device(device_config)
+    
     try:
-        devices = load_devices(args.devices)
-
-        if not devices:
-            logger.error('No devices to validate')
-            return 1
-
-        results = []
-        for idx, host in enumerate(devices, 1):
-            print(f"[{idx}/{len(devices)}] Validating {host}...", end=' ', flush=True)
-            result = validate_device(host, args.username, args.password,
-                                     args.device_type, args.timeout)
-            results.append(result)
-            print('')
-
-        success_count = print_report(results)
-
-        if args.output:
-            write_csv_report(results, args.output)
-
-        logger.info(f'Validation complete: {success_count}/{len(results)} successful')
-        return 0 if success_count == len(results) else 1
-
-    except Exception as e:
-        logger.error(f'Script failed: {e}')
-        return 1
+        facts = get_device_facts(conn)
+        results = run_compliance_checks(conn, args.device_type)
+    finally:
+        conn.disconnect()
+        logger.info("Disconnected from device")
+    
+    if args.json:
+        results['facts'] = facts
+        print(json.dumps(results, indent=2))
+    else:
+        print_compliance_report(args.host, facts, results)
+    
+    if results['failed'] > 0:
+        logger.warning(f"Compliance check complete: {results['failed']} checks failed")
+        sys.exit(1)
+    else:
+        logger.info("Device is fully compliant")
+        sys.exit(0)
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    main()
 ```
