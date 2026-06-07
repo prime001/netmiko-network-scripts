@@ -1,194 +1,189 @@
 ```python
 """
-bgp_session_monitor.py - BGP session state monitor and parser
+mac_port_mapper.py - Map MAC addresses to switch ports with optional ARP IP correlation.
 
 Purpose:
-    Connect to a network device, run the BGP summary command, and parse
-    peer states, AS numbers, prefix counts, and session uptime. Exits
-    non-zero when any peers are not Established, making it suitable for
-    use in monitoring pipelines and alerting scripts.
+    Connects to a Cisco IOS/IOS-XE switch via SSH, retrieves the MAC address table
+    and optionally the ARP table, then produces a report mapping MACs to switch ports
+    and (when --arp is set) their associated IP addresses. Useful for device location
+    tracking, rogue device detection, and network audits.
 
 Usage:
-    python bgp_session_monitor.py -d 192.168.1.1 -u admin
-    python bgp_session_monitor.py -d 192.168.1.1 -u admin -t cisco_xr
-    python bgp_session_monitor.py -d 192.168.1.1 -u admin --json --alert-down
+    python mac_port_mapper.py -d 192.168.1.1 -u admin -p secret
+    python mac_port_mapper.py -d 192.168.1.1 -u admin -p secret --arp
+    python mac_port_mapper.py -d 192.168.1.1 -u admin -p secret --vlan 100
+    python mac_port_mapper.py -d 192.168.1.1 -u admin -p secret --mac 00:1a:2b:3c:4d:5e
+    python mac_port_mapper.py -d 192.168.1.1 -u admin -p secret --output results.csv
 
 Prerequisites:
-    pip install netmiko
-    SSH must be enabled on the target device.
-    Tested against: cisco_ios, cisco_xe, cisco_xr, cisco_nxos
+    - netmiko >= 4.0: pip install netmiko
+    - SSH access to a Cisco IOS/IOS-XE switch
+    - Account with 'show' command privileges
 """
 
 import argparse
-import json
+import csv
 import logging
 import re
 import sys
-from getpass import getpass
 
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetMikoAuthenticationException, NetMikoTimeoutException
 
+
 logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.WARNING,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-BGP_COMMANDS = {
-    "cisco_ios": "show ip bgp summary",
-    "cisco_xe": "show ip bgp summary",
-    "cisco_xr": "show bgp ipv4 unicast summary",
-    "cisco_nxos": "show bgp ipv4 unicast summary",
-}
-
-# neighbor  V  AS  MsgRcvd  MsgSent  TblVer  InQ  OutQ  Up/Down  State/PfxRcd
-_IOS_PEER_RE = re.compile(
-    r"^(?P<neighbor>\d+\.\d+\.\d+\.\d+)\s+"
-    r"\d+\s+(?P<remote_as>\d+)\s+"
-    r"\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+"
-    r"(?P<updown>\S+)\s+(?P<state>\S+)",
-    re.MULTILINE,
-)
-
-# IOS-XR: neighbor  AS  SpkrId  MsgRcvd  MsgSent  TblVer  InQ  OutQ  Up/Down  State/PfxRcd
-_XR_PEER_RE = re.compile(
-    r"^(?P<neighbor>\d+\.\d+\.\d+\.\d+)\s+"
-    r"(?P<remote_as>\d+)\s+"
-    r"\S+\s+\S+\s+\S+\s+\S+\s+"
-    r"(?P<updown>\S+)\s+(?P<state>\S+)",
-    re.MULTILINE,
-)
-
-_LOCAL_AS_RE = re.compile(r"local AS number\s+(\d+)", re.IGNORECASE)
-_ROUTER_ID_RE = re.compile(r"router identifier\s+(\d+\.\d+\.\d+\.\d+)", re.IGNORECASE)
-
-
-def parse_bgp_summary(output: str, device_type: str) -> dict:
-    pattern = _XR_PEER_RE if device_type == "cisco_xr" else _IOS_PEER_RE
-    local_as_m = _LOCAL_AS_RE.search(output)
-    router_id_m = _ROUTER_ID_RE.search(output)
-
-    peers = []
-    for m in pattern.finditer(output):
-        state = m.group("state")
-        established = state.isdigit()
-        peers.append({
-            "neighbor": m.group("neighbor"),
-            "remote_as": int(m.group("remote_as")),
-            "updown": m.group("updown"),
-            "state": "Established" if established else state,
-            "prefixes_received": int(state) if established else None,
-            "established": established,
+def parse_mac_table(output):
+    """Parse 'show mac address-table' into list of dicts."""
+    entries = []
+    pattern = re.compile(
+        r"^\s*(\d+)\s+([\da-f]{4}\.[\da-f]{4}\.[\da-f]{4})\s+(\w+)\s+([\w/.:()-]+)",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    for match in pattern.finditer(output):
+        entries.append({
+            "vlan": match.group(1),
+            "mac": match.group(2).lower(),
+            "type": match.group(3),
+            "port": match.group(4),
+            "ip": "",
         })
-
-    return {
-        "local_as": int(local_as_m.group(1)) if local_as_m else None,
-        "router_id": router_id_m.group(1) if router_id_m else None,
-        "peers": peers,
-        "total": len(peers),
-        "established_count": sum(1 for p in peers if p["established"]),
-        "down_count": sum(1 for p in peers if not p["established"]),
-    }
+    return entries
 
 
-def print_table(result: dict, hostname: str) -> None:
-    rid = result["router_id"] or "unknown"
-    las = result["local_as"] or "unknown"
-    print(f"\nHost: {hostname}  Router-ID: {rid}  Local AS: {las}")
-    print(
-        f"Peers: {result['total']}  "
-        f"Established: {result['established_count']}  "
-        f"Down: {result['down_count']}\n"
+def parse_arp_table(output):
+    """Parse 'show ip arp' and return a mac -> ip mapping dict."""
+    arp_map = {}
+    pattern = re.compile(
+        r"^\s*Internet\s+([\d.]+)\s+\S+\s+([\da-f]{4}\.[\da-f]{4}\.[\da-f]{4})",
+        re.IGNORECASE | re.MULTILINE,
     )
-    hdr = f"{'Neighbor':<18} {'Remote AS':<12} {'State':<16} {'Up/Down':<14} Pfx Rcvd"
-    print(hdr)
-    print("-" * len(hdr))
-    for p in result["peers"]:
-        pfx = str(p["prefixes_received"]) if p["prefixes_received"] is not None else "-"
-        state_str = p["state"] if p["established"] else f"** {p['state']} **"
-        print(f"{p['neighbor']:<18} {p['remote_as']:<12} {state_str:<16} {p['updown']:<14} {pfx}")
-    print()
+    for match in pattern.finditer(output):
+        arp_map[match.group(2).lower()] = match.group(1)
+    return arp_map
 
 
-def build_parser() -> argparse.ArgumentParser:
+def normalize_mac(mac_str):
+    """Accept any common MAC format; return Cisco dotted-quartet notation."""
+    digits = re.sub(r"[^0-9a-fA-F]", "", mac_str).lower()
+    if len(digits) != 12:
+        raise ValueError(f"Invalid MAC address: {mac_str!r}")
+    return f"{digits[0:4]}.{digits[4:8]}.{digits[8:12]}"
+
+
+def print_table(entries):
+    if not entries:
+        print("No entries matched the specified filters.")
+        return
+    header = f"{'VLAN':<6} {'MAC':<16} {'TYPE':<10} {'PORT':<26} {'IP':<17}"
+    print(header)
+    print("-" * len(header))
+    for e in entries:
+        print(f"{e['vlan']:<6} {e['mac']:<16} {e['type']:<10} {e['port']:<26} {e['ip']:<17}")
+    print(f"\nTotal: {len(entries)} entries")
+
+
+def write_csv(entries, filepath):
+    fieldnames = ["vlan", "mac", "type", "port", "ip"]
+    with open(filepath, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(entries)
+    logger.info("Results written to %s", filepath)
+
+
+def build_parser():
     p = argparse.ArgumentParser(
-        description="Parse BGP session summary from a network device",
+        description="Map switch MAC address table to ports with optional ARP IP correlation."
     )
-    p.add_argument("-d", "--device", required=True, help="Device hostname or IP")
+    p.add_argument("-d", "--device", required=True, help="Switch IP or hostname")
     p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
+    p.add_argument("-p", "--password", required=True, help="SSH password")
     p.add_argument(
-        "-t", "--device-type",
-        default="cisco_ios",
-        choices=list(BGP_COMMANDS.keys()),
-        help="Netmiko device type (default: cisco_ios)",
+        "--device-type", default="cisco_ios",
+        help="Netmiko device type (default: cisco_ios)"
     )
     p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("--mac", help="Filter by MAC address (any standard format)")
+    p.add_argument("--vlan", help="Filter by VLAN ID")
     p.add_argument(
-        "--json", action="store_true", dest="output_json",
-        help="Emit JSON instead of a formatted table",
+        "--interface",
+        help="Filter by port name substring (e.g. 'Gi1/0' or 'Fa0')"
     )
     p.add_argument(
-        "--alert-down", action="store_true",
-        help="Exit with code 1 if any peers are not Established",
+        "--arp", action="store_true",
+        help="Fetch ARP table and correlate IPs to MAC entries"
     )
-    p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    p.add_argument("--output", help="Write results to a CSV file instead of stdout")
     return p
 
 
-def main() -> int:
+def main():
     args = build_parser().parse_args()
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    password = args.password or getpass(f"Password for {args.username}@{args.device}: ")
+    mac_filter = None
+    if args.mac:
+        try:
+            mac_filter = normalize_mac(args.mac)
+        except ValueError as exc:
+            logger.error(exc)
+            sys.exit(1)
 
     device_params = {
         "device_type": args.device_type,
         "host": args.device,
         "username": args.username,
-        "password": password,
+        "password": args.password,
         "port": args.port,
     }
 
     try:
-        log.debug("Connecting to %s", args.device)
+        logger.info("Connecting to %s", args.device)
         with ConnectHandler(**device_params) as conn:
-            hostname = conn.find_prompt().strip("#>")
-            cmd = BGP_COMMANDS[args.device_type]
-            log.debug("Running: %s", cmd)
-            output = conn.send_command(cmd, read_timeout=30)
+            logger.info("Retrieving MAC address table")
+            mac_output = conn.send_command("show mac address-table")
+
+            arp_map = {}
+            if args.arp:
+                logger.info("Retrieving ARP table")
+                arp_map = parse_arp_table(conn.send_command("show ip arp"))
+
     except NetMikoAuthenticationException:
-        print(f"ERROR: Authentication failed for {args.username}@{args.device}", file=sys.stderr)
-        return 2
+        logger.error("Authentication failed for %s@%s", args.username, args.device)
+        sys.exit(1)
     except NetMikoTimeoutException:
-        print(f"ERROR: Connection timed out to {args.device}", file=sys.stderr)
-        return 2
+        logger.error("Connection to %s timed out", args.device)
+        sys.exit(1)
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 2
+        logger.error("Unexpected error: %s", exc)
+        sys.exit(1)
 
-    result = parse_bgp_summary(output, args.device_type)
+    entries = parse_mac_table(mac_output)
+    logger.info("Parsed %d MAC table entries", len(entries))
 
-    if args.output_json:
-        print(json.dumps(result, indent=2))
+    for entry in entries:
+        entry["ip"] = arp_map.get(entry["mac"], "")
+
+    if mac_filter:
+        entries = [e for e in entries if e["mac"] == mac_filter]
+    if args.vlan:
+        entries = [e for e in entries if e["vlan"] == args.vlan]
+    if args.interface:
+        substr = args.interface.lower()
+        entries = [e for e in entries if substr in e["port"].lower()]
+
+    if args.output:
+        write_csv(entries, args.output)
     else:
-        print_table(result, hostname)
-
-    if args.alert_down and result["down_count"] > 0:
-        if not args.output_json:
-            print(
-                f"ALERT: {result['down_count']} peer(s) not in Established state",
-                file=sys.stderr,
-            )
-        return 1
-
-    return 0
+        print_table(entries)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
 ```
