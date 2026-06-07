@@ -1,207 +1,238 @@
-Here is the script:
-
+```python
 """
-neighbor_map.py - Collect and display CDP/LLDP neighbor topology from network devices.
+firmware_upgrade_readiness.py - Pre-upgrade readiness checker for Cisco IOS/IOS-XE devices.
 
 Purpose:
-    Connects to one or more Cisco/Arista devices via SSH and retrieves CDP or LLDP
-    neighbor detail, producing a structured topology report. Useful for verifying
-    physical cabling, auditing unexpected adjacencies, and building network diagrams.
+    Validates whether a device is ready for a firmware upgrade before a maintenance
+    window. Checks available flash space, boot variable configuration, and whether
+    the target image is already staged on flash. Exits with code 1 if any check fails,
+    making it suitable for use in CI/pre-change automation gates.
 
 Usage:
-    python neighbor_map.py -d 192.168.1.1 -u admin -p secret
-    python neighbor_map.py -d 192.168.1.1 -u admin --protocol lldp
-    python neighbor_map.py --hosts hosts.txt -u admin --output json
-    python neighbor_map.py -d 192.168.1.1 -u admin --device-type cisco_nxos
+    python firmware_upgrade_readiness.py -d 192.168.1.1 -u admin -p secret \
+        --target-image c2960x-universalk9-mz.152-7.E6.bin --min-flash-mb 128
 
 Prerequisites:
     pip install netmiko
+    SSH access to the target device with 'show' privilege (enable optional).
 """
 
 import argparse
-import json
 import logging
 import re
 import sys
-from getpass import getpass
+from dataclasses import dataclass, field
+from typing import Optional
 
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
+
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
     level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-CDP_CMD = "show cdp neighbors detail"
-LLDP_CMD = "show lldp neighbors detail"
+
+@dataclass
+class ReadinessResult:
+    host: str
+    hostname: Optional[str] = None
+    current_version: Optional[str] = None
+    flash_total_mb: Optional[float] = None
+    flash_free_mb: Optional[float] = None
+    boot_variable: Optional[str] = None
+    target_image_present: bool = False
+    checks_passed: list = field(default_factory=list)
+    checks_failed: list = field(default_factory=list)
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.checks_passed) and not self.checks_failed
+
+    def summary(self) -> str:
+        status = "READY" if self.ready else "NOT READY"
+        lines = [
+            f"=== Firmware Upgrade Readiness: {status} ===",
+            f"Host         : {self.host}",
+            f"Hostname     : {self.hostname or 'unknown'}",
+            f"IOS Version  : {self.current_version or 'unknown'}",
+        ]
+        if self.flash_total_mb is not None:
+            lines.append(f"Flash Total  : {self.flash_total_mb:.1f} MB")
+        if self.flash_free_mb is not None:
+            lines.append(f"Flash Free   : {self.flash_free_mb:.1f} MB")
+        lines.append(f"Boot Variable: {self.boot_variable or 'not explicitly set'}")
+        lines.append(f"Target Image : {'present' if self.target_image_present else 'absent/not checked'}")
+        if self.checks_passed:
+            lines.append("\nPassed:")
+            for c in self.checks_passed:
+                lines.append(f"  [OK]   {c}")
+        if self.checks_failed:
+            lines.append("\nFailed:")
+            for c in self.checks_failed:
+                lines.append(f"  [FAIL] {c}")
+        return "\n".join(lines)
 
 
-def parse_cdp(output):
-    neighbors = []
-    for block in re.split(r"-{3,}", output):
-        if not block.strip():
-            continue
-        n = {}
-        m = re.search(r"Device ID:\s*(\S+)", block)
-        if m:
-            n["device_id"] = m.group(1)
-        m = re.search(r"IP address:\s*(\S+)", block, re.IGNORECASE)
-        if m:
-            n["ip"] = m.group(1)
-        m = re.search(r"Interface:\s*(\S+?),\s*Port ID.*?:\s*(\S+)", block)
-        if m:
-            n["local_port"] = m.group(1).rstrip(",")
-            n["remote_port"] = m.group(2)
-        m = re.search(r"Platform:\s*([^,\n]+)", block)
-        if m:
-            n["platform"] = m.group(1).strip()
-        m = re.search(r"Software Version.*?:\s*(.+)", block)
-        if m:
-            n["version"] = m.group(1).strip()[:80]
-        if n.get("device_id"):
-            neighbors.append(n)
-    return neighbors
+def _get_version_info(conn) -> tuple:
+    output = conn.send_command("show version", use_textfsm=False)
+    version = None
+    hostname = None
+    ver_match = re.search(r"Version\s+(\S+)", output)
+    if ver_match:
+        version = ver_match.group(1).rstrip(",")
+    host_match = re.search(r"^(\S+)\s+uptime", output, re.MULTILINE)
+    if host_match:
+        hostname = host_match.group(1)
+    return version, hostname
 
 
-def parse_lldp(output):
-    neighbors = []
-    for block in re.split(r"-{3,}", output):
-        if not block.strip():
-            continue
-        n = {}
-        m = re.search(r"System Name:\s*(\S+)", block)
-        if m:
-            n["device_id"] = m.group(1)
-        m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", block)
-        if m:
-            n["ip"] = m.group(1)
-        m = re.search(r"Local Port\s*(?:id)?:\s*(\S+)", block, re.IGNORECASE)
-        if m:
-            n["local_port"] = m.group(1)
-        m = re.search(r"Port(?:\s+Description)?.*?:\s*(\S+)", block)
-        if m:
-            n["remote_port"] = m.group(1)
-        m = re.search(r"System Description.*?:\n\s*(.+)", block)
-        if m:
-            n["platform"] = m.group(1).strip()[:80]
-        if n.get("device_id"):
-            neighbors.append(n)
-    return neighbors
+def _get_flash_space(conn) -> tuple:
+    output = conn.send_command("show flash: | include bytes", use_textfsm=False)
+    match = re.search(r"(\d+)\s+bytes total.*?(\d+)\s+bytes free", output)
+    if match:
+        total_mb = int(match.group(1)) / (1024 * 1024)
+        free_mb = int(match.group(2)) / (1024 * 1024)
+        return round(total_mb, 1), round(free_mb, 1)
+    return None, None
 
 
-def collect(host, username, password, device_type, protocol, enable_secret=None):
-    params = {
+def _get_boot_variable(conn) -> Optional[str]:
+    output = conn.send_command("show boot", use_textfsm=False)
+    match = re.search(r"BOOT variable\s*=\s*(\S+)", output, re.IGNORECASE)
+    if match:
+        return match.group(1).rstrip(";")
+    return None
+
+
+def _image_on_flash(conn, image_name: str) -> bool:
+    output = conn.send_command(
+        f"show flash: | include {image_name}", use_textfsm=False
+    )
+    return image_name in output
+
+
+def check_readiness(
+    host: str,
+    username: str,
+    password: str,
+    target_image: Optional[str] = None,
+    min_flash_mb: float = 64.0,
+    device_type: str = "cisco_ios",
+    port: int = 22,
+    secret: Optional[str] = None,
+) -> ReadinessResult:
+    result = ReadinessResult(host=host)
+    device_params = {
         "device_type": device_type,
         "host": host,
         "username": username,
         "password": password,
+        "port": port,
     }
-    if enable_secret:
-        params["secret"] = enable_secret
+    if secret:
+        device_params["secret"] = secret
+
     try:
         log.info("Connecting to %s", host)
-        with ConnectHandler(**params) as conn:
-            if enable_secret:
+        with ConnectHandler(**device_params) as conn:
+            if secret:
                 conn.enable()
-            cmd = CDP_CMD if protocol == "cdp" else LLDP_CMD
-            raw = conn.send_command(cmd, read_timeout=60)
-            if "% Invalid" in raw or "not enabled" in raw.lower():
-                log.warning("%s: %s not available on this device", host, protocol.upper())
-                return []
-            return parse_cdp(raw) if protocol == "cdp" else parse_lldp(raw)
+            result.current_version, result.hostname = _get_version_info(conn)
+            result.flash_total_mb, result.flash_free_mb = _get_flash_space(conn)
+            result.boot_variable = _get_boot_variable(conn)
+            if target_image:
+                result.target_image_present = _image_on_flash(conn, target_image)
     except NetmikoAuthenticationException:
-        log.error("Authentication failed: %s", host)
+        log.error("Authentication failed for %s", host)
+        result.checks_failed.append("SSH authentication failed")
+        return result
     except NetmikoTimeoutException:
-        log.error("Connection timed out: %s", host)
+        log.error("Connection timed out for %s", host)
+        result.checks_failed.append("SSH connection timed out")
+        return result
     except Exception as exc:
-        log.error("Error on %s: %s", host, exc)
-    return None
+        log.error("Unexpected error on %s: %s", host, exc)
+        result.checks_failed.append(f"Connection error: {exc}")
+        return result
+
+    if result.flash_free_mb is not None:
+        if result.flash_free_mb >= min_flash_mb:
+            result.checks_passed.append(
+                f"Flash free {result.flash_free_mb:.1f} MB >= required {min_flash_mb} MB"
+            )
+        else:
+            result.checks_failed.append(
+                f"Insufficient flash: {result.flash_free_mb:.1f} MB free, need {min_flash_mb} MB"
+            )
+    else:
+        result.checks_failed.append("Could not parse flash space from 'show flash'")
+
+    if result.boot_variable:
+        result.checks_passed.append(f"Boot variable explicitly configured: {result.boot_variable}")
+    else:
+        result.checks_failed.append("Boot variable not set — upgrade may boot wrong image")
+
+    if target_image:
+        if result.target_image_present:
+            result.checks_passed.append(f"Target image '{target_image}' is staged on flash")
+        else:
+            result.checks_failed.append(f"Target image '{target_image}' not found on flash")
+
+    return result
 
 
-def render_table(host, neighbors, protocol):
-    bar = "=" * 72
-    print(f"\n{bar}")
-    print(f"  {host}  —  {len(neighbors)} neighbor(s) via {protocol.upper()}")
-    print(bar)
-    if not neighbors:
-        print("  (none)")
-        return
-    hdr = "  {:<22} {:<16} {:<16} {:<16}"
-    print(hdr.format("Neighbor ID", "IP", "Local Port", "Remote Port"))
-    print("  " + "-" * 68)
-    row = "  {:<22} {:<16} {:<16} {:<16}"
-    for n in neighbors:
-        print(row.format(
-            n.get("device_id", "?")[:21],
-            n.get("ip", "N/A")[:15],
-            n.get("local_port", "?")[:15],
-            n.get("remote_port", "?")[:15],
-        ))
-
-
-def build_args():
-    p = argparse.ArgumentParser(
-        description="Map CDP/LLDP neighbors on network devices.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Assess Cisco IOS/IOS-XE firmware upgrade readiness before a maintenance window."
     )
-    target = p.add_mutually_exclusive_group(required=True)
-    target.add_argument("-d", "--device", help="Single device IP or hostname")
-    target.add_argument("--hosts", metavar="FILE", help="File listing one host per line")
-    p.add_argument("-u", "--username", required=True)
-    p.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
-    p.add_argument("-e", "--enable", dest="enable_secret", default=None,
-                   help="Enable secret for privilege escalation")
-    p.add_argument("--device-type", default="cisco_ios",
-                   help="Netmiko device type string")
-    p.add_argument("--protocol", choices=["cdp", "lldp"], default="cdp",
-                   help="Neighbor discovery protocol")
-    p.add_argument("--output", choices=["table", "json"], default="table")
-    p.add_argument("-v", "--verbose", action="store_true")
-    return p.parse_args()
+    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
+    parser.add_argument("--secret", default=None, help="Enable secret (if required)")
+    parser.add_argument(
+        "--target-image",
+        default=None,
+        metavar="FILENAME",
+        help="Image filename to verify on flash (e.g. c2960x-universalk9-mz.bin)",
+    )
+    parser.add_argument(
+        "--min-flash-mb",
+        type=float,
+        default=64.0,
+        metavar="MB",
+        help="Minimum free flash space in MB required to pass (default: 64)",
+    )
+    parser.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    return parser
 
 
-def load_hosts(args):
-    if args.device:
-        return [args.device]
-    try:
-        with open(args.hosts) as fh:
-            return [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
-    except OSError as exc:
-        log.error("Cannot read hosts file: %s", exc)
-        sys.exit(1)
-
-
-def main():
-    args = build_args()
+if __name__ == "__main__":
+    args = build_parser().parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    password = args.password or getpass(f"SSH password for {args.username}: ")
+    result = check_readiness(
+        host=args.device,
+        username=args.username,
+        password=args.password,
+        target_image=args.target_image,
+        min_flash_mb=args.min_flash_mb,
+        device_type=args.device_type,
+        port=args.port,
+        secret=args.secret,
+    )
 
-    hosts = load_hosts(args)
-    results = {}
-    for host in hosts:
-        neighbors = collect(host, args.username, password,
-                            args.device_type, args.protocol, args.enable_secret)
-        results[host] = neighbors if neighbors is not None else []
-        if args.output == "table":
-            if neighbors is not None:
-                render_table(host, neighbors, args.protocol)
-            else:
-                print(f"\n[FAILED] {host}")
-
-    if args.output == "json":
-        print(json.dumps(results, indent=2))
-
-    failed = [h for h, n in results.items() if n is None]
-    if failed:
-        log.warning("%d host(s) unreachable: %s", len(failed), ", ".join(failed))
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+    print(result.summary())
+    sys.exit(0 if result.ready else 1)
+```
