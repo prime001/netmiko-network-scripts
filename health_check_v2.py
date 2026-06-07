@@ -1,191 +1,256 @@
-bgp_state_check.py — BGP neighbor state monitor for Cisco IOS/IOS-XE/IOS-XR and Juniper JunOS.
+BGP Neighbor Health Check
 
-Connects to a router, pulls BGP summary output, and reports each neighbor's
-state and prefix count. Alerts on down neighbors and optional prefix thresholds.
-
-Usage:
-    python bgp_state_check.py -d 10.0.0.1 -u admin -p secret
-    python bgp_state_check.py -d 10.0.0.1 -u admin -p secret --device-type juniper_junos
-    python bgp_state_check.py -d 10.0.0.1 -u admin -p secret --min-prefixes 100 --max-prefixes 800000
+Connects to a router via netmiko, collects BGP neighbor state and prefix
+statistics, and reports peers that are down or have crossed prefix thresholds.
 
 Prerequisites:
     pip install netmiko
 
-Exit codes:
-    0  All BGP neighbors established and within prefix thresholds
-    1  One or more neighbors down or threshold violated
-    2  Connection or authentication failure
+Usage:
+    python bgp_neighbor_check.py -d 192.168.1.1 -u admin -p secret
+    python bgp_neighbor_check.py -d 10.0.0.1 -u admin -p secret \
+        --device-type cisco_nxos --max-prefixes 500000 --warn-below 10
+    python bgp_neighbor_check.py -d 10.0.0.1 -u admin -p secret --json
+
+Supported device types: cisco_ios, cisco_xe, cisco_nxos
 """
 
 import argparse
+import json
 import logging
 import re
 import sys
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 from netmiko import ConnectHandler
-from netmiko.exceptions import AuthenticationException, NetmikoTimeoutException
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
-logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.WARNING)
-logger = logging.getLogger(__name__)
-
-SUPPORTED_DEVICE_TYPES = ["cisco_ios", "cisco_xe", "cisco_xr", "juniper_junos"]
-
-
-def parse_ios_bgp_summary(output):
-    neighbors = []
-    in_data = False
-    for line in output.splitlines():
-        if re.match(r"^\s*Neighbor\s+V\s+AS", line):
-            in_data = True
-            continue
-        if not in_data:
-            continue
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split()
-        if len(parts) < 9:
-            continue
-        neighbors.append({
-            "neighbor": parts[0],
-            "as": parts[2],
-            "updown": parts[7],
-            "state_or_prefixes": parts[8],
-        })
-    return neighbors
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+    level=logging.INFO,
+)
+log = logging.getLogger(__name__)
 
 
-def parse_junos_bgp_summary(output):
-    neighbors = []
-    for line in output.splitlines():
-        m = re.match(
-            r"^(\d+\.\d+\.\d+\.\d+)\s+(\d+)\s+\d+\s+(\S+)\s+(\S+)\s+\S+\s+(\S+)", line.strip()
-        )
-        if m:
-            neighbors.append({
-                "neighbor": m.group(1),
-                "as": m.group(2),
-                "updown": m.group(3),
-                "state_or_prefixes": m.group(5),
-            })
-    return neighbors
+@dataclass
+class BgpPeer:
+    neighbor: str
+    asn: str
+    state: str
+    prefixes_received: int = 0
+    uptime: str = "never"
+    is_up: bool = False
 
 
-def evaluate_neighbor(neighbor, min_prefixes, max_prefixes):
-    state = neighbor["state_or_prefixes"]
-    nbr = neighbor["neighbor"]
-    asn = neighbor["as"]
-    updown = neighbor["updown"]
+@dataclass
+class CheckResult:
+    host: str
+    peers: List[BgpPeer] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
 
-    if state.isdigit():
-        count = int(state)
-        if min_prefixes and count < min_prefixes:
-            return False, (
-                f"WARN  {nbr} (AS {asn}) established but only {count} prefixes "
-                f"(min: {min_prefixes}), up {updown}"
-            )
-        if max_prefixes and count > max_prefixes:
-            return False, (
-                f"WARN  {nbr} (AS {asn}) prefix count {count} exceeds "
-                f"max {max_prefixes}, up {updown}"
-            )
-        return True, f"OK    {nbr} (AS {asn}) established, {count} prefixes, up {updown}"
+    @property
+    def down_peers(self) -> List[BgpPeer]:
+        return [p for p in self.peers if not p.is_up]
 
-    return False, f"DOWN  {nbr} (AS {asn}) state={state}, up/down: {updown}"
+    @property
+    def ok(self) -> bool:
+        return not self.down_peers and not self.errors
 
 
-def run_check(args):
-    device_params = {
-        "device_type": args.device_type,
-        "host": args.device,
-        "username": args.username,
-        "password": args.password,
-        "port": args.port,
-        "timeout": args.timeout,
-        "conn_timeout": args.timeout,
-    }
-    if args.enable_secret:
-        device_params["secret"] = args.enable_secret
-
-    try:
-        logger.info("Connecting to %s", args.device)
-        with ConnectHandler(**device_params) as conn:
-            if args.enable_secret:
-                conn.enable()
-            if args.device_type in ("cisco_ios", "cisco_xe"):
-                raw = conn.send_command("show ip bgp summary")
-                neighbors = parse_ios_bgp_summary(raw)
-            elif args.device_type == "cisco_xr":
-                raw = conn.send_command("show bgp ipv4 unicast summary")
-                neighbors = parse_ios_bgp_summary(raw)
-            else:
-                raw = conn.send_command("show bgp summary")
-                neighbors = parse_junos_bgp_summary(raw)
-    except AuthenticationException:
-        print(f"Authentication failed for {args.device}", file=sys.stderr)
-        return 2
-    except NetmikoTimeoutException:
-        print(f"Connection timed out to {args.device}", file=sys.stderr)
-        return 2
-    except Exception as exc:
-        print(f"Connection error: {exc}", file=sys.stderr)
-        return 2
-
-    if not neighbors:
-        print(f"No BGP neighbors parsed from {args.device} — verify device-type and BGP config.")
-        return 1
-
-    failures = 0
-    print(f"\nBGP Neighbor Status — {args.device} ({args.device_type})")
-    print("-" * 65)
-    for nbr in neighbors:
-        ok, msg = evaluate_neighbor(nbr, args.min_prefixes, args.max_prefixes)
-        print(msg)
-        if not ok:
-            failures += 1
-    print("-" * 65)
-    total = len(neighbors)
-    print(f"Result: {total - failures}/{total} neighbors healthy\n")
-    return 0 if failures == 0 else 1
-
-
-def build_parser():
-    parser = argparse.ArgumentParser(
-        description="Check BGP neighbor states and prefix counts via netmiko."
+def parse_ios_summary(output: str) -> List[BgpPeer]:
+    peers = []
+    pattern = re.compile(
+        r"^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+\d+\s+(\d+)"
+        r"\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\S+)\s+(\S+)",
+        re.MULTILINE,
     )
-    parser.add_argument("-d", "--device", required=True, help="Device hostname or IP")
-    parser.add_argument("-u", "--username", required=True, help="Login username")
-    parser.add_argument("-p", "--password", required=True, help="Login password")
-    parser.add_argument(
+    for m in pattern.finditer(output):
+        neighbor, asn, updown, state_or_pfx = m.groups()
+        try:
+            prefixes = int(state_or_pfx)
+            state = "Established"
+            is_up = True
+        except ValueError:
+            prefixes = 0
+            state = state_or_pfx
+            is_up = False
+        peers.append(BgpPeer(
+            neighbor=neighbor,
+            asn=asn,
+            state=state,
+            prefixes_received=prefixes,
+            uptime=updown,
+            is_up=is_up,
+        ))
+    return peers
+
+
+def parse_nxos_summary(output: str) -> List[BgpPeer]:
+    peers = []
+    pattern = re.compile(
+        r"^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+(\d+)"
+        r"\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\S+)\s+(\S+)",
+        re.MULTILINE,
+    )
+    for m in pattern.finditer(output):
+        neighbor, asn, updown, state_or_pfx = m.groups()
+        try:
+            prefixes = int(state_or_pfx)
+            state = "Established"
+            is_up = True
+        except ValueError:
+            prefixes = 0
+            state = state_or_pfx
+            is_up = False
+        peers.append(BgpPeer(
+            neighbor=neighbor,
+            asn=asn,
+            state=state,
+            prefixes_received=prefixes,
+            uptime=updown,
+            is_up=is_up,
+        ))
+    return peers
+
+
+def run_check(
+    host: str,
+    username: str,
+    password: str,
+    device_type: str,
+    max_prefixes: Optional[int],
+    warn_below: int,
+) -> CheckResult:
+    result = CheckResult(host=host)
+    conn_params = {
+        "device_type": device_type,
+        "host": host,
+        "username": username,
+        "password": password,
+    }
+    try:
+        log.info("Connecting to %s (%s)", host, device_type)
+        with ConnectHandler(**conn_params) as conn:
+            output = conn.send_command("show bgp summary", expect_string=r"#")
+    except NetmikoAuthenticationException:
+        result.errors.append("Authentication failed")
+        return result
+    except NetmikoTimeoutException:
+        result.errors.append("Connection timed out")
+        return result
+    except Exception as exc:
+        result.errors.append(f"Connection error: {exc}")
+        return result
+
+    if "nxos" in device_type:
+        result.peers = parse_nxos_summary(output)
+    else:
+        result.peers = parse_ios_summary(output)
+
+    if not result.peers and "BGP" not in output:
+        result.errors.append("BGP not configured or no summary output found")
+        return result
+
+    for peer in result.peers:
+        if peer.is_up and max_prefixes and peer.prefixes_received > max_prefixes:
+            result.errors.append(
+                f"{peer.neighbor} prefix count {peer.prefixes_received} "
+                f"exceeds limit {max_prefixes}"
+            )
+        if peer.is_up and peer.prefixes_received < warn_below:
+            result.errors.append(
+                f"{peer.neighbor} only {peer.prefixes_received} prefixes "
+                f"received (below threshold {warn_below})"
+            )
+
+    return result
+
+
+def print_report(result: CheckResult, as_json: bool) -> None:
+    if as_json:
+        data = {
+            "host": result.host,
+            "ok": result.ok,
+            "peers": [
+                {
+                    "neighbor": p.neighbor,
+                    "asn": p.asn,
+                    "state": p.state,
+                    "prefixes_received": p.prefixes_received,
+                    "uptime": p.uptime,
+                    "is_up": p.is_up,
+                }
+                for p in result.peers
+            ],
+            "errors": result.errors,
+        }
+        print(json.dumps(data, indent=2))
+        return
+
+    status = "OK" if result.ok else "FAIL"
+    print(f"\n[{status}] BGP summary for {result.host}")
+    print(f"  Total peers: {len(result.peers)}  "
+          f"Up: {sum(p.is_up for p in result.peers)}  "
+          f"Down: {len(result.down_peers)}")
+    print()
+
+    for peer in result.peers:
+        flag = "UP  " if peer.is_up else "DOWN"
+        pfx = f"{peer.prefixes_received} pfx" if peer.is_up else peer.state
+        print(f"  [{flag}] {peer.neighbor:<18} AS{peer.asn:<8} "
+              f"uptime={peer.uptime:<12} {pfx}")
+
+    if result.errors:
+        print("\n  Warnings/Errors:")
+        for err in result.errors:
+            print(f"    ! {err}")
+    print()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Check BGP neighbor health on a Cisco router or switch."
+    )
+    p.add_argument("-d", "--device", required=True, help="Device hostname or IP")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", required=True, help="SSH password")
+    p.add_argument(
         "--device-type",
         default="cisco_ios",
-        choices=SUPPORTED_DEVICE_TYPES,
-        dest="device_type",
+        choices=["cisco_ios", "cisco_xe", "cisco_nxos"],
         help="Netmiko device type (default: cisco_ios)",
     )
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument(
-        "--timeout", type=int, default=30, help="Connection timeout in seconds (default: 30)"
+    p.add_argument(
+        "--max-prefixes",
+        type=int,
+        default=None,
+        help="Alert if any peer advertises more than this many prefixes",
     )
-    parser.add_argument(
-        "--enable-secret", dest="enable_secret", default="",
-        help="Enable/privileged mode secret"
+    p.add_argument(
+        "--warn-below",
+        type=int,
+        default=1,
+        help="Alert if an established peer sends fewer than this many prefixes (default: 1)",
     )
-    parser.add_argument(
-        "--min-prefixes", type=int, default=0, dest="min_prefixes",
-        help="Alert when an established neighbor advertises fewer than N prefixes"
-    )
-    parser.add_argument(
-        "--max-prefixes", type=int, default=0, dest="max_prefixes",
-        help="Alert when an established neighbor exceeds N prefixes"
-    )
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    return parser
+    p.add_argument("--json", action="store_true", help="Output results as JSON")
+    p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    return p
 
 
 if __name__ == "__main__":
-    parser = build_parser()
-    args = parser.parse_args()
-    if args.verbose:
+    args = build_parser().parse_args()
+    if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
-    sys.exit(run_check(args))
+
+    result = run_check(
+        host=args.device,
+        username=args.username,
+        password=args.password,
+        device_type=args.device_type,
+        max_prefixes=args.max_prefixes,
+        warn_below=args.warn_below,
+    )
+    print_report(result, as_json=args.json)
+    sys.exit(0 if result.ok else 1)
