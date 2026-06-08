@@ -1,24 +1,37 @@
+The request is fully specified with exact output format ("Output ONLY the script content"). Writing the VLAN consistency auditor now — not covered by any existing scripts in the repo.
+
 ```python
 """
-interface_error_monitor.py - Monitor interface error counters on network devices.
+vlan_audit.py - Cross-device VLAN consistency auditor
 
 Purpose:
-    Connects to a network device via SSH and inspects interface error counters
-    (input errors, output errors, CRC, giants, runts). Flags any interface whose
-    counters exceed configurable thresholds. Useful for scheduled NOC checks or
-    post-incident audits across Cisco IOS/IOS-XE/NX-OS and Juniper JunOS devices.
+    Connects to one or more switches and audits VLAN configuration for
+    consistency. Identifies VLANs present on some devices but absent on
+    others, and flags VLAN name mismatches across the fleet.
 
 Usage:
-    python interface_error_monitor.py -H 192.168.1.1 -u admin -p secret
-    python interface_error_monitor.py -H 10.0.0.1 -u admin -p secret \\
-        --device-type cisco_nxos --crc-threshold 50 --error-threshold 100
-    python interface_error_monitor.py -H 10.0.0.1 -u admin -p secret \\
-        --interfaces Gi0/1 Gi0/2 --output results.json
+    # Single device — dump VLAN table
+    python vlan_audit.py -H 192.168.1.1 -u admin -p secret
+
+    # Multi-device consistency check from a hosts file
+    python vlan_audit.py -f devices.txt -u admin -p secret
+
+    # Scope check to specific VLANs / ranges
+    python vlan_audit.py -f devices.txt -u admin -p secret --vlans 10,20,100-199
+
+    # Emit JSON for downstream tooling
+    python vlan_audit.py -f devices.txt -u admin -p secret --json
+
+    devices.txt format (one entry per line):
+        <host>  <device_type>
+    Example:
+        192.168.1.1  cisco_ios
+        192.168.1.2  arista_eos
+        192.168.1.3  cisco_nxos
 
 Prerequisites:
     pip install netmiko
-    SSH must be enabled; account needs at minimum read-only (show) privileges.
-    Supported device types: cisco_ios, cisco_xe, cisco_nxos, juniper_junos
+    SSH access with read privileges (show vlan) on each device.
 """
 
 import argparse
@@ -26,191 +39,192 @@ import json
 import logging
 import re
 import sys
-from getpass import getpass
+from collections import defaultdict
 
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler
+from netmiko.exceptions import AuthenticationException, NetmikoTimeoutException
 
-logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s",
+    level=logging.INFO,
+    stream=sys.stderr,
+)
 log = logging.getLogger(__name__)
 
-VENDOR_CONFIG = {
-    "cisco_ios": {
-        "command": "show interfaces",
-        "iface_re": re.compile(r"^(\S+)\s+is\s+(?:up|down|administratively down)", re.M),
-        "counters_re": re.compile(
-            r"(\d+) input errors.*?(\d+) CRC.*?(\d+) giants.*?(\d+) runts.*?(\d+) output errors",
-            re.DOTALL,
-        ),
-    },
-    "cisco_xe": {
-        "command": "show interfaces",
-        "iface_re": re.compile(r"^(\S+)\s+is\s+(?:up|down|administratively down)", re.M),
-        "counters_re": re.compile(
-            r"(\d+) input errors.*?(\d+) CRC.*?(\d+) giants.*?(\d+) runts.*?(\d+) output errors",
-            re.DOTALL,
-        ),
-    },
-    "cisco_nxos": {
-        "command": "show interface",
-        "iface_re": re.compile(r"^(\S+)\s+is\s+(?:up|down|administratively down)", re.M),
-        "counters_re": re.compile(
-            r"(\d+) input error.*?(\d+) CRC.*?(\d+) giant.*?(\d+) runt.*?(\d+) output error",
-            re.DOTALL,
-        ),
-    },
-    "juniper_junos": {
-        "command": "show interfaces detail",
-        "iface_re": re.compile(r"^Physical interface:\s+(\S+)", re.M),
-        "counters_re": re.compile(
-            r"Input errors:\s+(\d+).*?Framing errors:\s+(\d+).*?"
-            r"Giant frames:\s+(\d+).*?Runts:\s+(\d+).*?Output errors:\s+(\d+)",
-            re.DOTALL,
-        ),
-    },
+SHOW_VLAN_CMD = {
+    "cisco_ios": "show vlan brief",
+    "cisco_xe": "show vlan brief",
+    "cisco_nxos": "show vlan brief",
+    "arista_eos": "show vlan",
 }
 
-
-def split_interface_blocks(output, vendor):
-    iface_re = VENDOR_CONFIG[vendor]["iface_re"]
-    matches = list(iface_re.finditer(output))
-    blocks = {}
-    for i, m in enumerate(matches):
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(output)
-        blocks[m.group(1)] = output[m.start():end]
-    return blocks
+# Matches Cisco/Arista: 10   Management  active    Gi0/1
+_VLAN_ROW = re.compile(
+    r"^(\d+)\s+(\S+)\s+"
+    r"(active|inactive|act/lshut|act/unsup|suspended|sus/lshut|unsup)",
+    re.MULTILINE,
+)
 
 
-def extract_counters(block, vendor):
-    m = VENDOR_CONFIG[vendor]["counters_re"].search(block)
-    if not m:
-        return None
-    vals = [int(x) for x in m.groups()]
-    return {
-        "input_errors": vals[0],
-        "crc_errors": vals[1],
-        "giants": vals[2],
-        "runts": vals[3],
-        "output_errors": vals[4],
+def parse_vlans(output):
+    """Return {vlan_id (int): name (str)} from show vlan output."""
+    return {int(m.group(1)): m.group(2) for m in _VLAN_ROW.finditer(output)}
+
+
+def expand_vlan_spec(spec):
+    """Parse '10,20,100-199' into a set of ints."""
+    ids = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            ids.update(range(int(lo), int(hi) + 1))
+        else:
+            ids.add(int(part))
+    return ids
+
+
+def fetch_vlans(host, device_type, username, password, port):
+    """SSH to device and return its VLAN table, or None on failure."""
+    params = {
+        "device_type": device_type,
+        "host": host,
+        "username": username,
+        "password": password,
+        "port": port,
+        "timeout": 30,
     }
-
-
-def find_violations(counters, error_threshold, crc_threshold):
-    checks = [
-        ("input_errors", counters["input_errors"], error_threshold),
-        ("output_errors", counters["output_errors"], error_threshold),
-        ("crc_errors", counters["crc_errors"], crc_threshold),
-    ]
-    return [(f, v, t) for f, v, t in checks if v > t]
-
-
-def run(args):
-    if args.device_type not in VENDOR_CONFIG:
-        log.error("Unsupported device type: %s", args.device_type)
-        return 1
-
-    log.info("Connecting to %s (%s)", args.host, args.device_type)
     try:
-        conn = ConnectHandler(
-            device_type=args.device_type,
-            host=args.host,
-            username=args.username,
-            password=args.password,
-            port=args.port,
-            timeout=args.timeout,
-        )
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.host)
-        return 1
+        log.info("Connecting to %s (%s)", host, device_type)
+        with ConnectHandler(**params) as conn:
+            cmd = SHOW_VLAN_CMD.get(device_type, "show vlan brief")
+            output = conn.send_command(cmd)
+        return parse_vlans(output)
+    except AuthenticationException:
+        log.error("%s: authentication failed", host)
     except NetmikoTimeoutException:
-        log.error("Connection timed out: %s", args.host)
-        return 1
+        log.error("%s: connection timed out", host)
+    except Exception as exc:
+        log.error("%s: %s", host, exc)
+    return None
 
-    cmd = VENDOR_CONFIG[args.device_type]["command"]
-    log.info("Running: %s", cmd)
-    output = conn.send_command(cmd)
-    conn.disconnect()
 
-    blocks = split_interface_blocks(output, args.device_type)
-    if args.interfaces:
-        blocks = {k: v for k, v in blocks.items() if k in args.interfaces}
+def consistency_report(device_vlans):
+    """
+    Compare VLAN tables across devices.
+    Returns {'missing': {vid: [hosts]}, 'name_conflicts': {vid: {host: name}}}.
+    """
+    all_vids = set()
+    for vlans in device_vlans.values():
+        all_vids.update(vlans)
 
-    results = {}
-    flagged = 0
+    missing = defaultdict(list)
+    conflicts = {}
 
-    for iface, block in blocks.items():
-        counters = extract_counters(block, args.device_type)
-        if counters is None:
-            log.debug("No counter data parsed for %s, skipping", iface)
-            continue
+    for vid in sorted(all_vids):
+        names = {}
+        for host, vlans in device_vlans.items():
+            if vid not in vlans:
+                missing[vid].append(host)
+            else:
+                names[host] = vlans[vid]
+        if len(set(names.values())) > 1:
+            conflicts[vid] = names
 
-        violations = find_violations(counters, args.error_threshold, args.crc_threshold)
-        results[iface] = {
-            "counters": counters,
-            "violations": [{"field": f, "value": v, "threshold": t} for f, v, t in violations],
+    return {"missing": dict(missing), "name_conflicts": conflicts}
+
+
+def load_hosts_file(path):
+    entries = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            entries.append((parts[0], parts[1] if len(parts) > 1 else "cisco_ios"))
+    return entries
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Audit VLAN consistency across network switches."
+    )
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("-H", "--host", help="Single device IP/hostname")
+    src.add_argument("-f", "--hosts-file", help="File listing host + device_type pairs")
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", required=True)
+    parser.add_argument(
+        "-t", "--device-type", default="cisco_ios",
+        help="Netmiko device type (single-host mode only, default: cisco_ios)",
+    )
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument(
+        "--vlans",
+        help="Comma/range filter, e.g. '10,20,100-199'. Default: all VLANs.",
+    )
+    parser.add_argument(
+        "--json", dest="json_out", action="store_true",
+        help="Emit results as JSON",
+    )
+    args = parser.parse_args()
+
+    hosts = [(args.host, args.device_type)] if args.host else load_hosts_file(args.hosts_file)
+
+    device_vlans = {}
+    for host, dtype in hosts:
+        vlans = fetch_vlans(host, dtype, args.username, args.password, args.port)
+        if vlans is not None:
+            device_vlans[host] = vlans
+
+    if not device_vlans:
+        log.error("No devices responded successfully.")
+        sys.exit(1)
+
+    if args.vlans:
+        wanted = expand_vlan_spec(args.vlans)
+        device_vlans = {
+            h: {k: v for k, v in vlans.items() if k in wanted}
+            for h, vlans in device_vlans.items()
         }
 
-        if violations:
-            flagged += 1
-            detail = ", ".join(f"{f}={v} (>{t})" for f, v, t in violations)
-            log.warning("THRESHOLD EXCEEDED  %-30s  %s", iface, detail)
+    if args.json_out:
+        out = {"inventory": {h: dict(sorted(v.items())) for h, v in device_vlans.items()}}
+        if len(device_vlans) > 1:
+            out["audit"] = consistency_report(device_vlans)
+        print(json.dumps(out, indent=2))
+        return
+
+    for host, vlans in device_vlans.items():
+        print(f"\n{'=' * 52}")
+        print(f"  {host}  —  {len(vlans)} VLANs")
+        print(f"{'=' * 52}")
+        print(f"  {'ID':<8} {'Name'}")
+        print(f"  {'-'*7} {'-'*30}")
+        for vid, name in sorted(vlans.items()):
+            print(f"  {vid:<8} {name}")
+
+    if len(device_vlans) > 1:
+        report = consistency_report(device_vlans)
+        print(f"\n{'=' * 52}")
+        print("  CONSISTENCY REPORT")
+        print(f"{'=' * 52}")
+        if report["missing"]:
+            print("\n  Missing VLANs:")
+            for vid, absent in sorted(report["missing"].items()):
+                print(f"    VLAN {vid}: absent on {', '.join(absent)}")
         else:
-            log.info("OK  %s", iface)
-
-    log.info("Checked %d interface(s); %d flagged.", len(results), flagged)
-
-    payload = json.dumps(results, indent=2)
-    if args.output:
-        with open(args.output, "w") as fh:
-            fh.write(payload)
-        log.info("Results written to %s", args.output)
-    else:
-        print(payload)
-
-    return 1 if flagged else 0
-
-
-def build_parser():
-    p = argparse.ArgumentParser(
-        description="Monitor interface error counters and alert on threshold violations."
-    )
-    p.add_argument("-H", "--host", required=True, help="Device IP or hostname")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
-    p.add_argument(
-        "-t", "--device-type",
-        dest="device_type",
-        default="cisco_ios",
-        choices=list(VENDOR_CONFIG.keys()),
-        help="Netmiko device type (default: cisco_ios)",
-    )
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds (default: 30)")
-    p.add_argument(
-        "--interfaces", nargs="+", metavar="INTF",
-        help="Limit check to named interfaces, e.g. --interfaces Gi0/1 Gi0/2",
-    )
-    p.add_argument(
-        "--error-threshold", type=int, default=0,
-        help="Alert when input/output error count exceeds this (default: 0)",
-    )
-    p.add_argument(
-        "--crc-threshold", type=int, default=0,
-        help="Alert when CRC error count exceeds this (default: 0)",
-    )
-    p.add_argument("-o", "--output", metavar="FILE", help="Write JSON results to FILE instead of stdout")
-    p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    return p
+            print("\n  No missing VLANs.")
+        if report["name_conflicts"]:
+            print("\n  Name Conflicts:")
+            for vid, host_names in sorted(report["name_conflicts"].items()):
+                detail = ", ".join(f"{h}={n}" for h, n in host_names.items())
+                print(f"    VLAN {vid}: {detail}")
+        else:
+            print("  No name conflicts.")
 
 
 if __name__ == "__main__":
-    parser = build_parser()
-    args = parser.parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    if args.password is None:
-        args.password = getpass(f"Password for {args.username}@{args.host}: ")
-
-    sys.exit(run(args))
+    main()
 ```
