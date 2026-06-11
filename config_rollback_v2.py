@@ -1,230 +1,182 @@
-#!/usr/bin/env python3
+```python
 """
-checkpoint_rollback.py - Commit-confirmed config change with auto-revert timer.
+config_rollback_v3.py - Archive diff and selective rollback for Cisco IOS devices.
 
-Saves the running config as a local checkpoint before pushing any changes.
-After applying the config, the script waits for explicit operator confirmation
-within a configurable deadline.  If the deadline expires or the operator
-declines, the pre-change checkpoint is automatically restored.
-
-This mirrors the 'commit confirmed' workflow native to Junos/EOS, extended to
-any netmiko-supported platform (Cisco IOS, NX-OS, Arista EOS, etc.).
+Purpose:
+    Retrieves the running configuration from a device, compares it against a locally
+    stored baseline archive using unified diff, and optionally applies the archive as
+    a rollback. Supports section-level filtering (e.g., only diff 'interface' blocks)
+    to avoid noisy full-config comparisons.
 
 Usage:
-    python checkpoint_rollback.py -d 192.168.1.1 -u admin -p secret \
-        --config changes.txt --timeout 120
-
-    # Apply and keep without interactive prompt:
-    python checkpoint_rollback.py -d 192.168.1.1 -u admin -p secret \
-        --config changes.txt --yes
+    python config_rollback_v3.py --host 192.168.1.1 --username admin --password secret \\
+        --archive baseline.cfg [--section interface] [--dry-run] [--apply]
 
 Prerequisites:
     pip install netmiko
+    A saved baseline config file on disk.
+    SSH access to target device with sufficient privilege level.
 """
 
 import argparse
+import difflib
 import logging
-import select
 import sys
-import time
-from datetime import datetime, timezone
 from pathlib import Path
 
-from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
     level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger(__name__)
 
-STRIP_PREFIXES = (
-    "Building configuration",
-    "Current configuration",
-    "Last configuration change",
-    "! Last",
-    "!",
-)
+
+def get_running_config(conn):
+    log.info("Fetching running configuration")
+    return conn.send_command("show running-config", read_timeout=60).splitlines()
 
 
-def capture_running_config(conn, device_type: str) -> str:
-    log.info("Capturing pre-change running config...")
-    if "junos" in device_type:
-        output = conn.send_command("show configuration | display set")
-    else:
-        output = conn.send_command("show running-config")
-    log.info("Checkpoint captured: %d bytes.", len(output))
+def load_archive(path):
+    p = Path(path)
+    if not p.exists():
+        log.error("Archive file not found: %s", path)
+        sys.exit(1)
+    return p.read_text().splitlines()
+
+
+def filter_section(lines, keyword):
+    """Return lines belonging to config blocks that start with keyword."""
+    result = []
+    in_block = False
+    for line in lines:
+        if line.lower().startswith(keyword.lower()) and not line.startswith(" "):
+            in_block = True
+        elif in_block and line and not line.startswith(" ") and not line.startswith("!"):
+            in_block = False
+        if in_block:
+            result.append(line)
+    return result
+
+
+def compute_diff(archive_lines, running_lines):
+    return list(difflib.unified_diff(
+        archive_lines,
+        running_lines,
+        fromfile="archive",
+        tofile="running",
+        lineterm="",
+    ))
+
+
+def apply_rollback(conn, lines):
+    commands = [l for l in lines if l.strip() and not l.startswith("!")]
+    log.info("Pushing %d config lines to device", len(commands))
+    output = conn.send_config_set(commands, read_timeout=120)
+    conn.save_config()
+    log.info("Configuration saved to NVRAM")
     return output
 
 
-def save_checkpoint(text: str, device: str, out_dir: Path) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    safe = device.replace(".", "_").replace(":", "_")
-    path = out_dir / f"checkpoint_{safe}_{ts}.txt"
-    path.write_text(text)
-    log.info("Checkpoint written to %s", path)
-    return path
+def print_diff_summary(diff):
+    added = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
+    removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
+    print("\n".join(diff))
+    print(f"\nSummary: +{added} lines, -{removed} lines vs archive")
 
 
-def apply_config(conn, lines: list) -> str:
-    log.info("Applying %d config line(s)...", len(lines))
-    output = conn.send_config_set(lines)
-    return output
-
-
-def restore_checkpoint(conn, checkpoint: str) -> None:
-    log.warning("Restoring pre-change config...")
-    restore_lines = []
-    for line in checkpoint.splitlines():
-        stripped = line.rstrip()
-        if not stripped:
-            continue
-        if any(stripped.startswith(p) for p in STRIP_PREFIXES):
-            continue
-        restore_lines.append(stripped)
-    if not restore_lines:
-        log.error("Checkpoint was empty — cannot restore.")
-        return
-    conn.send_config_set(restore_lines)
-    log.info("Restore complete: sent %d lines.", len(restore_lines))
-
-
-def wait_for_confirmation(timeout: int) -> bool:
-    bar = "=" * 62
-    print(f"\n{bar}")
-    print("  CONFIG APPLIED — confirm to commit or wait to auto-revert")
-    print(f"  You have {timeout}s. Type 'yes' + Enter to keep, anything else reverts.")
-    print(f"{bar}\n")
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        remaining = int(deadline - time.monotonic())
-        sys.stdout.write(f"\r  Confirm? ({remaining:>3}s) [yes/no]: ")
-        sys.stdout.flush()
-        ready, _, _ = select.select([sys.stdin], [], [], 1.0)
-        if ready:
-            answer = sys.stdin.readline().strip().lower()
-            print()
-            if answer == "yes":
-                return True
-            if answer:
-                log.info("Operator entered '%s' — treating as decline.", answer)
-                return False
-
-    print()
-    log.warning("Confirmation deadline reached — auto-reverting.")
-    return False
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Commit-confirmed config change with automatic rollback on timeout.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+def main():
+    parser = argparse.ArgumentParser(
+        description="Diff running config against a saved archive and optionally roll back"
     )
-    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
-    p.add_argument("-u", "--username", required=True, help="SSH username")
-    p.add_argument("-p", "--password", required=True, help="SSH password")
-    p.add_argument(
-        "-t", "--device-type", default="cisco_ios", help="Netmiko device_type string"
+    parser.add_argument("--host", required=True, help="Device IP or hostname")
+    parser.add_argument("--username", required=True, help="SSH username")
+    parser.add_argument("--password", required=True, help="SSH password")
+    parser.add_argument("--archive", required=True, help="Path to baseline config file")
+    parser.add_argument(
+        "--section",
+        metavar="KEYWORD",
+        help="Limit diff/rollback to config blocks starting with KEYWORD (e.g. 'interface')",
     )
-    p.add_argument(
-        "--config", required=True, type=Path, help="File of config lines to apply"
-    )
-    p.add_argument(
-        "--timeout",
-        type=int,
-        default=60,
-        metavar="SECS",
-        help="Seconds before auto-revert if unconfirmed",
-    )
-    p.add_argument(
-        "--checkpoint-dir",
-        type=Path,
-        default=Path("checkpoints"),
-        help="Directory for checkpoint files",
-    )
-    p.add_argument("--port", type=int, default=22, help="SSH port")
-    p.add_argument(
-        "--yes",
+    parser.add_argument(
+        "--dry-run",
         action="store_true",
-        help="Skip interactive prompt and keep changes automatically",
+        help="Show diff only; do not apply changes",
     )
-    return p.parse_args()
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply archive config as rollback after confirming diff",
+    )
+    parser.add_argument("--device-type", default="cisco_ios", help="Netmiko device type")
+    parser.add_argument("--port", type=int, default=22)
+    args = parser.parse_args()
 
+    if args.dry_run and args.apply:
+        parser.error("--dry-run and --apply are mutually exclusive")
 
-def load_config_lines(path: Path) -> list:
-    if not path.exists():
-        log.error("Config file not found: %s", path)
-        sys.exit(1)
-    lines = [
-        ln.rstrip()
-        for ln in path.read_text().splitlines()
-        if ln.strip() and not ln.lstrip().startswith("#")
-    ]
-    if not lines:
-        log.error("Config file is empty or contains only comments.")
-        sys.exit(1)
-    return lines
+    archive_lines = load_archive(args.archive)
 
-
-def main() -> int:
-    args = parse_args()
-    config_lines = load_config_lines(args.config)
-
-    device_params = {
+    device = {
         "device_type": args.device_type,
-        "host": args.device,
+        "host": args.host,
         "username": args.username,
         "password": args.password,
         "port": args.port,
-        "timeout": 30,
-        "session_log": f"session_{args.device.replace('.', '_')}.log",
     }
 
     try:
-        log.info("Connecting to %s (%s)...", args.device, args.device_type)
-        with ConnectHandler(**device_params) as conn:
-            checkpoint = capture_running_config(conn, args.device_type)
-            save_checkpoint(checkpoint, args.device, args.checkpoint_dir)
+        log.info("Connecting to %s", args.host)
+        with ConnectHandler(**device) as conn:
+            running_lines = get_running_config(conn)
 
-            output = apply_config(conn, config_lines)
-            log.info("Apply output:\n%s", output.strip())
+            if args.section:
+                archive_cmp = filter_section(archive_lines, args.section)
+                running_cmp = filter_section(running_lines, args.section)
+                if not archive_cmp:
+                    log.warning("Section '%s' not found in archive", args.section)
+                if not running_cmp:
+                    log.warning("Section '%s' not found in running config", args.section)
+            else:
+                archive_cmp = archive_lines
+                running_cmp = running_lines
 
-            if args.yes:
-                log.info("--yes flag set; keeping changes.")
-                conn.save_config()
-                log.info("Configuration saved successfully.")
-                return 0
+            diff = compute_diff(archive_cmp, running_cmp)
 
-            confirmed = wait_for_confirmation(args.timeout)
+            if not diff:
+                print("No differences found — running config matches archive.")
+                return
 
-            if confirmed:
-                log.info("Operator confirmed — saving config.")
-                conn.save_config()
-                log.info("Changes committed and saved.")
-                return 0
+            print(f"\nDiff for {args.host}" + (f" [section: {args.section}]" if args.section else "") + ":")
+            print_diff_summary(diff)
 
-            restore_checkpoint(conn, checkpoint)
-            conn.save_config()
-            log.info("Device restored to pre-change checkpoint.")
-            return 1
+            if args.dry_run:
+                log.info("Dry-run complete; no changes applied")
+                return
+
+            if args.apply:
+                confirm = input("\nApply archive as rollback? [yes/no]: ").strip().lower()
+                if confirm != "yes":
+                    log.info("Rollback cancelled")
+                    return
+                rollback_lines = archive_cmp if args.section else archive_lines
+                apply_rollback(conn, rollback_lines)
+                log.info("Rollback applied successfully")
+            else:
+                log.info("Pass --apply to push the archive, or --dry-run to suppress this hint")
 
     except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.device)
-        return 2
+        log.error("Authentication failed for %s@%s", args.username, args.host)
+        sys.exit(1)
     except NetmikoTimeoutException:
-        log.error("Connection timed out to %s:%s", args.device, args.port)
-        return 2
+        log.error("Connection timed out to %s", args.host)
+        sys.exit(1)
     except KeyboardInterrupt:
-        log.warning("Interrupted — changes may be partially applied. Check the device.")
-        return 3
-    except Exception as exc:
-        log.exception("Unexpected error: %s", exc)
-        return 3
+        log.warning("Interrupted")
+        sys.exit(130)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
+```
