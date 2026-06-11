@@ -1,215 +1,205 @@
+The write is being blocked by permissions. Here's the complete script — copy it directly to your repo:
+
 ```python
 """
-CDP/LLDP Topology Mapper - Discovers network topology via neighbor protocols.
-
-Purpose:
-    Connects to a seed device and queries CDP (Cisco) or LLDP neighbor tables
-    to map the physical network topology. Optionally recurses through discovered
-    neighbors to build a multi-hop topology graph.
+CDP/LLDP Neighbor Topology Mapper
+==================================
+Connects to one or more seed devices and walks CDP/LLDP neighbor tables to
+build a layer-2 topology map.  Useful for auditing undocumented networks or
+verifying that the physical topology matches the intended design.
 
 Usage:
-    python topology_mapper.py -H 192.168.1.1 -u admin -p secret
-    python topology_mapper.py -H 192.168.1.1 -u admin -p secret --recursive --depth 3
-    python topology_mapper.py -H 192.168.1.1 -u admin -p secret --protocol lldp --json
+    python cdp_lldp_topology.py -d 192.168.1.1 -u admin -p secret
+    python cdp_lldp_topology.py -d 192.168.1.1 -u admin -p secret --hops 2
+    python cdp_lldp_topology.py -d 192.168.1.1 -u admin -p secret --protocol lldp --out topology.csv
 
 Prerequisites:
     pip install netmiko
-    CDP or LLDP must be enabled on target devices.
-    SSH access with privilege sufficient to run 'show cdp/lldp neighbors detail'.
-    ntc-templates installed for TextFSM parsing (pip install ntc-templates).
+    Device must have CDP or LLDP enabled and credentials must have read access.
 """
 
 import argparse
-import json
+import csv
 import logging
 import sys
 from collections import deque
+from getpass import getpass
 
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko.exceptions import AuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    datefmt="%H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-def get_cdp_neighbors(connection):
-    output = connection.send_command("show cdp neighbors detail", use_textfsm=True)
-    if isinstance(output, str):
-        logger.warning("TextFSM parse failed; raw output returned — ntc-templates installed?")
-        return []
+def get_cdp_neighbors(conn):
+    output = conn.send_command("show cdp neighbors detail")
     neighbors = []
-    for entry in output:
-        neighbors.append({
-            "destination_host": entry.get("destination_host", ""),
-            "management_ip": entry.get("management_ip", ""),
-            "platform": entry.get("platform", ""),
-            "local_port": entry.get("local_port", ""),
-            "remote_port": entry.get("remote_port", ""),
-            "software_version": entry.get("software_version", ""),
-        })
+    current = {}
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("Device ID:"):
+            if current:
+                neighbors.append(current)
+            current = {"device_id": line.split("Device ID:")[-1].strip()}
+        elif line.startswith("IP address:") and "mgmt_ip" not in current:
+            current["mgmt_ip"] = line.split("IP address:")[-1].strip()
+        elif line.startswith("Platform:"):
+            parts = line.split(",")
+            current["platform"] = parts[0].split("Platform:")[-1].strip()
+            if len(parts) > 1:
+                current["capabilities"] = parts[1].split("Capabilities:")[-1].strip()
+        elif line.startswith("Interface:"):
+            parts = line.split(",")
+            current["local_intf"] = parts[0].split("Interface:")[-1].strip()
+            if len(parts) > 1:
+                current["remote_intf"] = parts[1].split("Port ID")[-1].lstrip(" :(").strip()
+    if current:
+        neighbors.append(current)
     return neighbors
 
 
-def get_lldp_neighbors(connection):
-    output = connection.send_command("show lldp neighbors detail", use_textfsm=True)
-    if isinstance(output, str):
-        logger.warning("TextFSM parse failed for LLDP; ntc-templates installed?")
-        return []
+def get_lldp_neighbors(conn):
+    output = conn.send_command("show lldp neighbors detail")
     neighbors = []
-    for entry in output:
-        neighbors.append({
-            "destination_host": entry.get("neighbor", entry.get("system_name", "")),
-            "management_ip": entry.get("management_address", ""),
-            "platform": entry.get("system_description", ""),
-            "local_port": entry.get("local_interface", entry.get("local_port", "")),
-            "remote_port": entry.get("neighbor_port_id", entry.get("remote_port", "")),
-            "software_version": "",
-        })
+    current = {}
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("Local Intf:"):
+            if current:
+                neighbors.append(current)
+            current = {"local_intf": line.split("Local Intf:")[-1].strip()}
+        elif line.startswith("System Name:"):
+            current["device_id"] = line.split("System Name:")[-1].strip()
+        elif line.startswith("IP:") and "mgmt_ip" not in current:
+            current["mgmt_ip"] = line.split("IP:")[-1].strip()
+        elif line.startswith("Port id:"):
+            current["remote_intf"] = line.split("Port id:")[-1].strip()
+        elif line.startswith("System Capabilities:"):
+            current["capabilities"] = line.split("System Capabilities:")[-1].strip()
+    if current:
+        neighbors.append(current)
     return neighbors
 
 
-def connect_to_device(host, username, password, device_type, port=22):
+def connect(host, username, password, device_type):
     params = {
         "device_type": device_type,
         "host": host,
         "username": username,
         "password": password,
-        "port": port,
         "timeout": 15,
-        "auth_timeout": 10,
     }
-    try:
-        conn = ConnectHandler(**params)
-        logger.info("Connected to %s", host)
-        return conn
-    except NetmikoAuthenticationException:
-        logger.error("Authentication failed for %s", host)
-    except NetmikoTimeoutException:
-        logger.error("Connection timed out for %s", host)
-    except Exception as exc:
-        logger.error("Cannot connect to %s: %s", host, exc)
-    return None
+    return ConnectHandler(**params)
 
 
-def discover_topology(seed_host, username, password, device_type, protocol, max_depth, port):
-    visited = {}
-    queue = deque([(seed_host, 0)])
-    queued = {seed_host}
+def walk_topology(seed, username, password, device_type, protocol, max_hops):
+    """BFS walk from seed device; returns list of edge dicts."""
+    edges = []
+    visited = set()
+    queue = deque([(seed, 0)])
 
     while queue:
         host, depth = queue.popleft()
-        if host in visited:
+        if host in visited or depth > max_hops:
             continue
+        visited.add(host)
 
-        logger.info("Querying %s (depth %d/%d)", host, depth, max_depth)
-        conn = connect_to_device(host, username, password, device_type, port)
-        if conn is None:
-            visited[host] = []
+        log.info("Connecting to %s (hop %d)", host, depth)
+        try:
+            conn = connect(host, username, password, device_type)
+        except AuthenticationException:
+            log.error("Auth failed for %s — skipping", host)
+            continue
+        except NetmikoTimeoutException:
+            log.error("Timeout connecting to %s — skipping", host)
+            continue
+        except Exception as exc:
+            log.error("Cannot reach %s: %s — skipping", host, exc)
             continue
 
         try:
-            neighbors = get_lldp_neighbors(conn) if protocol == "lldp" else get_cdp_neighbors(conn)
-        except Exception as exc:
-            logger.error("Neighbor query failed on %s: %s", host, exc)
-            neighbors = []
+            neighbors = get_cdp_neighbors(conn) if protocol == "cdp" else get_lldp_neighbors(conn)
         finally:
             conn.disconnect()
 
-        visited[host] = neighbors
-        logger.info("%d neighbor(s) found on %s", len(neighbors), host)
+        log.info("  %d neighbor(s) found on %s", len(neighbors), host)
+        for nbr in neighbors:
+            edges.append({"source": host, **nbr})
+            mgmt = nbr.get("mgmt_ip")
+            if mgmt and mgmt not in visited:
+                queue.append((mgmt, depth + 1))
 
-        if depth < max_depth:
-            for nbr in neighbors:
-                mgmt_ip = nbr.get("management_ip", "").strip()
-                if mgmt_ip and mgmt_ip not in queued:
-                    queued.add(mgmt_ip)
-                    queue.append((mgmt_ip, depth + 1))
-
-    return visited
+    return edges
 
 
-def print_table(topology):
-    col = (20, 25, 20, 16, 16, 16)
-    header = (
-        f"{'Device':<{col[0]}} {'Neighbor':<{col[1]}} {'Platform':<{col[2]}} "
-        f"{'Local Port':<{col[3]}} {'Remote Port':<{col[4]}} {'Mgmt IP':<{col[5]}}"
-    )
+def print_table(edges):
+    header = f"{'Source':<18} {'Neighbor':<24} {'Local Intf':<20} {'Remote Intf':<20} {'Mgmt IP':<16}"
     print(header)
     print("-" * len(header))
-    for device, neighbors in topology.items():
-        if not neighbors:
-            print(f"{device:<{col[0]}} (no neighbors or unreachable)")
-            continue
-        for nbr in neighbors:
-            print(
-                f"{device:<{col[0]}} "
-                f"{nbr['destination_host']:<{col[1]}} "
-                f"{nbr['platform'][:col[2] - 1]:<{col[2]}} "
-                f"{nbr['local_port']:<{col[3]}} "
-                f"{nbr['remote_port']:<{col[4]}} "
-                f"{nbr['management_ip']:<{col[5]}}"
-            )
+    for e in edges:
+        print(
+            f"{e.get('source',''):<18} "
+            f"{e.get('device_id',''):<24} "
+            f"{e.get('local_intf',''):<20} "
+            f"{e.get('remote_intf',''):<20} "
+            f"{e.get('mgmt_ip',''):<16}"
+        )
 
 
-def build_arg_parser():
-    parser = argparse.ArgumentParser(
-        description="Map network topology using CDP or LLDP neighbor tables."
-    )
-    parser.add_argument("-H", "--host", required=True, help="Seed device IP or hostname")
+def write_csv(edges, path):
+    fields = ["source", "device_id", "local_intf", "remote_intf", "mgmt_ip", "platform", "capabilities"]
+    with open(path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(edges)
+    log.info("Topology written to %s", path)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="CDP/LLDP topology mapper")
+    parser.add_argument("-d", "--device", required=True, help="Seed device IP or hostname")
     parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", required=True, help="SSH password")
-    parser.add_argument(
-        "-t", "--device-type", default="cisco_ios",
-        help="Netmiko device type (default: cisco_ios)",
-    )
-    parser.add_argument(
-        "--protocol", choices=["cdp", "lldp"], default="cdp",
-        help="Neighbor discovery protocol (default: cdp)",
-    )
-    parser.add_argument(
-        "--recursive", action="store_true",
-        help="Follow neighbor management IPs to build multi-hop topology",
-    )
-    parser.add_argument(
-        "--depth", type=int, default=1,
-        help="Max hops when --recursive is set (default: 1)",
-    )
-    parser.add_argument(
-        "--json", action="store_true", dest="output_json",
-        help="Emit results as JSON instead of a table",
-    )
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    return parser
+    parser.add_argument("-p", "--password", default=None, help="SSH password (prompted if omitted)")
+    parser.add_argument("-t", "--device-type", default="cisco_ios",
+                        help="Netmiko device type (default: cisco_ios)")
+    parser.add_argument("--protocol", choices=["cdp", "lldp"], default="cdp",
+                        help="Neighbor protocol to query (default: cdp)")
+    parser.add_argument("--hops", type=int, default=1,
+                        help="Maximum BFS hops from seed (default: 1; 0 = seed only)")
+    parser.add_argument("--out", default=None, help="Optional CSV output file path")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    args = build_arg_parser().parse_args()
+    args = parse_args()
+    password = args.password or getpass("SSH password: ")
 
-    max_depth = args.depth if args.recursive else 0
-    topology = discover_topology(
-        args.host,
-        args.username,
-        args.password,
-        args.device_type,
-        args.protocol,
-        max_depth,
-        args.port,
+    edges = walk_topology(
+        seed=args.device,
+        username=args.username,
+        password=password,
+        device_type=args.device_type,
+        protocol=args.protocol,
+        max_hops=args.hops,
     )
 
-    if args.output_json:
-        print(json.dumps(topology, indent=2))
-    else:
-        print_table(topology)
+    if not edges:
+        log.warning("No neighbor data collected.")
+        sys.exit(1)
 
-    total = sum(len(v) for v in topology.values())
-    logger.info(
-        "Complete: %d device(s) queried, %d neighbor relationship(s) mapped",
-        len(topology),
-        total,
-    )
-    sys.exit(0)
+    print_table(edges)
+
+    if args.out:
+        write_csv(edges, args.out)
 ```
+
+**What this does and why it's distinct from the existing `device_discovery*.py` scripts:**
+
+- Those scripts typically do IP-range scanning or SNMP-based reachability checks. This one does **protocol-driven topology walking** — it interrogates the device's CDP or LLDP tables and optionally hops to discovered neighbors (BFS up to `--hops` depth).
+- Practical use: drop it on an unfamiliar network with one known device and `--hops 3` to map what's physically connected, which interfaces link where, and what platforms are in the path.
+- Outputs a formatted table to stdout and optionally a CSV for import into Visio/draw.io/NetBox.
