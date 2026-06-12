@@ -1,202 +1,232 @@
 ```python
 """
-ntp_sync_checker.py - NTP synchronization health checker for network devices.
+interface_health.py - Interface error counter auditor
 
-Connects to a Cisco IOS/IOS-XE/NX-OS device via SSH and validates NTP
-synchronization status: checks whether the clock is synchronized, validates
-stratum level and clock offset against configurable thresholds, and reports
-peer association count.
+Purpose:
+    Connects to a network device and audits all interfaces for error counters
+    (input errors, output errors, CRC, interface resets). Flags any interface
+    exceeding a configurable threshold and exits non-zero if issues are found,
+    making it suitable for use in monitoring pipelines or cron jobs.
 
 Usage:
-    python ntp_sync_checker.py -d 192.168.1.1 -u admin
-    python ntp_sync_checker.py -d 10.0.0.1 -u admin -p secret --device-type cisco_nxos
-    python ntp_sync_checker.py -d 10.0.0.1 -u admin --max-stratum 3 --max-offset 50
+    python interface_health.py -d 192.168.1.1 -u admin -p secret
+    python interface_health.py -d 10.0.0.1 -u admin -p secret --error-threshold 50
+    python interface_health.py -d 10.0.0.1 -u admin -p secret --show-all --output report.txt
 
 Prerequisites:
     pip install netmiko
-
-Exit codes:
-    0 - All checks passed
-    1 - Connection or authentication error
-    2 - One or more NTP checks failed
+    Tested against: Cisco IOS, IOS-XE. Other platforms may require parser adjustments.
 """
 
 import argparse
 import logging
 import re
 import sys
-from getpass import getpass
+from dataclasses import dataclass, field
+from typing import List
 
 from netmiko import ConnectHandler
-from netmiko.exceptions import AuthenticationException, NetmikoTimeoutException
+from netmiko.exceptions import NetMikoAuthenticationException, NetMikoTimeoutException
 
-logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.WARNING)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 logger = logging.getLogger(__name__)
 
 
-def parse_ntp_status(output):
-    """Extract sync state, stratum, offset, and reference from 'show ntp status'."""
-    result = {"synchronized": False, "stratum": None, "offset": None, "reference": None}
-
-    if re.search(r"Clock is synchronized", output, re.IGNORECASE):
-        result["synchronized"] = True
-
-    m = re.search(r"stratum\s+(\d+)", output, re.IGNORECASE)
-    if m:
-        result["stratum"] = int(m.group(1))
-
-    m = re.search(r"offset\s+(?:is\s+)?([-\d.]+)", output, re.IGNORECASE)
-    if m:
-        result["offset"] = float(m.group(1))
-
-    m = re.search(r"reference is\s+(\S+)", output, re.IGNORECASE)
-    if m:
-        result["reference"] = m.group(1)
-
-    return result
+@dataclass
+class InterfaceStats:
+    name: str
+    status: str = "unknown"
+    input_errors: int = 0
+    output_errors: int = 0
+    crc_errors: int = 0
+    resets: int = 0
+    flagged: bool = False
+    reasons: List[str] = field(default_factory=list)
 
 
-def parse_ntp_peer_count(output):
-    """Count configured NTP peers from 'show ntp associations'."""
-    count = 0
-    for line in output.splitlines():
-        # Association lines begin with optional sync marker then an IP address
-        if re.match(r"[\s~*#+]\s*\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", line):
-            count += 1
-    return count
+def parse_interfaces(output: str, error_threshold: int) -> List[InterfaceStats]:
+    interfaces = []
+    blocks = re.split(r'\n(?=\S)', output)
 
+    for block in blocks:
+        if not block.strip():
+            continue
 
-def run_ntp_checks(connection, max_stratum, max_offset_ms):
-    """Gather NTP data and evaluate against thresholds. Returns results dict."""
-    results = {
-        "synchronized": False,
-        "stratum": None,
-        "offset_ms": None,
-        "reference": None,
-        "peer_count": 0,
-        "issues": [],
-    }
+        header = re.match(
+            r'^(\S+)\s+is\s+(up|down|administratively down)',
+            block, re.IGNORECASE
+        )
+        if not header:
+            continue
 
-    try:
-        status_out = connection.send_command("show ntp status")
-        assoc_out = connection.send_command("show ntp associations")
-    except Exception as exc:
-        results["issues"].append(f"Command execution failed: {exc}")
-        return results
-
-    status = parse_ntp_status(status_out)
-    results.update({
-        "synchronized": status["synchronized"],
-        "stratum": status["stratum"],
-        "offset_ms": status["offset"],
-        "reference": status["reference"],
-        "peer_count": parse_ntp_peer_count(assoc_out),
-    })
-
-    if not status["synchronized"]:
-        results["issues"].append("NTP clock is NOT synchronized")
-
-    if status["stratum"] is not None and status["stratum"] > max_stratum:
-        results["issues"].append(
-            f"Stratum {status['stratum']} exceeds threshold of {max_stratum}"
+        stats = InterfaceStats(
+            name=header.group(1),
+            status=header.group(2).lower(),
         )
 
-    if status["offset"] is not None and abs(status["offset"]) > max_offset_ms:
-        results["issues"].append(
-            f"Clock offset {status['offset']} ms exceeds ±{max_offset_ms} ms threshold"
-        )
+        m = re.search(r'(\d+)\s+input errors', block)
+        if m:
+            stats.input_errors = int(m.group(1))
 
-    if results["peer_count"] == 0:
-        results["issues"].append("No NTP peer associations found")
+        m = re.search(r'(\d+)\s+CRC', block)
+        if m:
+            stats.crc_errors = int(m.group(1))
 
-    return results
+        m = re.search(r'(\d+)\s+output errors', block)
+        if m:
+            stats.output_errors = int(m.group(1))
+
+        m = re.search(r'(\d+)\s+interface resets', block)
+        if m:
+            stats.resets = int(m.group(1))
+
+        if stats.input_errors > error_threshold:
+            stats.flagged = True
+            stats.reasons.append(f"input_errors={stats.input_errors}")
+        if stats.output_errors > error_threshold:
+            stats.flagged = True
+            stats.reasons.append(f"output_errors={stats.output_errors}")
+        if stats.crc_errors > error_threshold:
+            stats.flagged = True
+            stats.reasons.append(f"crc={stats.crc_errors}")
+        if stats.resets > 0:
+            stats.flagged = True
+            stats.reasons.append(f"resets={stats.resets}")
+
+        interfaces.append(stats)
+
+    return interfaces
 
 
-def print_report(host, results):
-    sep = "-" * 52
-    print(sep)
-    print(f"NTP Sync Report: {host}")
-    print(sep)
-    print(f"  Synchronized : {'YES' if results['synchronized'] else 'NO'}")
-    print(f"  Stratum      : {results['stratum'] if results['stratum'] is not None else 'unknown'}")
-    print(f"  Offset (ms)  : {results['offset_ms'] if results['offset_ms'] is not None else 'unknown'}")
-    print(f"  Reference    : {results['reference'] or 'unknown'}")
-    print(f"  Peer count   : {results['peer_count']}")
+def format_report(device: str, interfaces: List[InterfaceStats], show_all: bool) -> str:
+    lines = [
+        f"Interface Error Report — {device}",
+        "=" * 60,
+    ]
 
-    if results["issues"]:
-        print(f"\n  ISSUES ({len(results['issues'])}):")
-        for issue in results["issues"]:
-            print(f"    [!] {issue}")
-        print("\nResult: FAIL")
+    flagged = [i for i in interfaces if i.flagged]
+
+    if flagged:
+        lines.append(f"\n[FLAGGED] {len(flagged)} interface(s) with errors:")
+        lines.append(f"  {'Interface':<32} {'Status':<10} Reasons")
+        lines.append(f"  {'-'*30} {'-'*8} {'-'*30}")
+        for iface in flagged:
+            lines.append(
+                f"  {iface.name:<32} {iface.status:<10} {', '.join(iface.reasons)}"
+            )
     else:
-        print("\nResult: PASS")
-    print(sep)
+        lines.append("\n[OK] No interfaces exceeded error thresholds.")
 
+    if show_all:
+        lines.append(f"\n[ALL INTERFACES]")
+        lines.append(
+            f"  {'Interface':<32} {'Status':<10} "
+            f"{'InErr':>7} {'OutErr':>7} {'CRC':>6} {'Resets':>7}"
+        )
+        lines.append(f"  {'-'*30} {'-'*8} {'-'*7} {'-'*7} {'-'*6} {'-'*7}")
+        for iface in interfaces:
+            lines.append(
+                f"  {iface.name:<32} {iface.status:<10} "
+                f"{iface.input_errors:>7} {iface.output_errors:>7} "
+                f"{iface.crc_errors:>6} {iface.resets:>7}"
+            )
 
-def build_parser():
-    parser = argparse.ArgumentParser(
-        description="Validate NTP synchronization health on a network device"
+    clean_count = len(interfaces) - len(flagged)
+    lines.append(
+        f"\nSummary: {len(flagged)} flagged / {clean_count} clean / {len(interfaces)} total"
     )
-    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", default=None,
-                        help="SSH password (prompted if omitted)")
-    parser.add_argument(
-        "--device-type",
-        default="cisco_ios",
-        choices=["cisco_ios", "cisco_xe", "cisco_nxos"],
-        help="Netmiko device type (default: cisco_ios)",
-    )
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument(
-        "--max-stratum", type=int, default=5,
-        help="Maximum acceptable NTP stratum level (default: 5)",
-    )
-    parser.add_argument(
-        "--max-offset", type=float, default=100.0,
-        help="Maximum acceptable clock offset in milliseconds (default: 100.0)",
-    )
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    return parser
+    return "\n".join(lines)
 
 
-def main():
-    args = build_parser().parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    password = args.password or getpass(f"Password for {args.username}@{args.device}: ")
-
+def run_check(args: argparse.Namespace) -> int:
     device_params = {
         "device_type": args.device_type,
         "host": args.device,
         "username": args.username,
-        "password": password,
+        "password": args.password,
         "port": args.port,
-        "timeout": 30,
+        "timeout": args.timeout,
     }
+    if args.enable_secret:
+        device_params["secret"] = args.enable_secret
 
-    logger.info("Connecting to %s", args.device)
-
+    logger.info("Connecting to %s (%s)", args.device, args.device_type)
     try:
         with ConnectHandler(**device_params) as conn:
-            logger.info("Connected; running NTP checks")
-            results = run_ntp_checks(conn, args.max_stratum, args.max_offset)
-    except AuthenticationException:
-        print(f"ERROR: Authentication failed for {args.username}@{args.device}", file=sys.stderr)
-        sys.exit(1)
-    except NetmikoTimeoutException:
-        print(f"ERROR: Connection timed out to {args.device}", file=sys.stderr)
-        sys.exit(1)
+            if args.enable_secret:
+                conn.enable()
+            logger.info("Collecting interface statistics...")
+            output = conn.send_command("show interfaces", read_timeout=60)
+    except NetMikoAuthenticationException:
+        logger.error("Authentication failed for %s", args.device)
+        return 1
+    except NetMikoTimeoutException:
+        logger.error("Connection timed out for %s", args.device)
+        return 1
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        sys.exit(1)
+        logger.error("Unexpected connection error: %s", exc)
+        return 1
 
-    print_report(args.device, results)
-    sys.exit(2 if results["issues"] else 0)
+    interfaces = parse_interfaces(output, args.error_threshold)
+    if not interfaces:
+        logger.warning("No interfaces parsed — verify device type or output format.")
+        return 1
+
+    report = format_report(args.device, interfaces, args.show_all)
+    print(report)
+
+    if args.output:
+        try:
+            with open(args.output, "w") as fh:
+                fh.write(report + "\n")
+            logger.info("Report written to %s", args.output)
+        except OSError as exc:
+            logger.error("Could not write report file: %s", exc)
+
+    return 1 if any(i.flagged for i in interfaces) else 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Audit interface error counters on a network device.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("-d", "--device", required=True, help="Device hostname or IP")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
+    parser.add_argument(
+        "-t", "--device-type", default="cisco_ios", dest="device_type",
+        help="Netmiko device type (cisco_ios, cisco_xe, cisco_nxos, etc.)",
+    )
+    parser.add_argument("--port", type=int, default=22, help="SSH port")
+    parser.add_argument("--timeout", type=int, default=30, help="Connection timeout in seconds")
+    parser.add_argument(
+        "--enable-secret", dest="enable_secret", default=None,
+        help="Enable secret for privilege escalation",
+    )
+    parser.add_argument(
+        "--error-threshold", type=int, default=0, dest="error_threshold",
+        help="Flag interfaces with error counters strictly above this value",
+    )
+    parser.add_argument(
+        "--show-all", action="store_true", dest="show_all",
+        help="Print all interfaces, not just flagged ones",
+    )
+    parser.add_argument("--output", default=None, help="Save report to this file")
+    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    return parser
 
 
 if __name__ == "__main__":
-    main()
+    _parser = build_parser()
+    _args = _parser.parse_args()
+
+    if _args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    sys.exit(run_check(_args))
 ```
