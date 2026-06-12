@@ -1,29 +1,26 @@
 ```python
-#!/usr/bin/env python3
 """
-Device Configuration Compliance Checker - Validates device configurations.
+Interface Statistics Collector
 
-Verifies that network devices meet minimum configuration standards including
-NTP configuration, syslog servers, SSH settings, AAA configuration, and
-logging levels. Generates compliance reports identifying gaps.
+Collects interface performance metrics from network devices using Netmiko.
+Captures bandwidth utilization, packet counts, and error statistics for monitoring
+and capacity planning.
 
 Usage:
-    python3 compliance_checker.py 192.168.1.1 admin password123
+    python interface_stats_collector.py --device 192.168.1.1 --username admin \
+        --password pass123 --device-type cisco_ios
 
-Prerequisites:
-    - netmiko installed (pip install netmiko)
-    - SSH access to network device
-    - User credentials with show privilege
+Requirements:
+    - netmiko
+    - SSH/CLI access to devices
 """
 
 import argparse
-import json
 import logging
 import sys
 from datetime import datetime
 from netmiko import ConnectHandler
-from netmiko.ssh_exception import NetMikoTimeoutException, NetMikoAuthenticationException
-
+from netmiko.exceptions import NetmikoTimeoutException, NetmikoAuthenticationException
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,218 +29,118 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-COMPLIANCE_RULES = {
-    'ntp_configured': {
-        'description': 'NTP server configured',
-        'ios_command': 'show run | include ntp server',
-        'check_pattern': 'ntp server'
-    },
-    'logging_configured': {
-        'description': 'Syslog server configured',
-        'ios_command': 'show run | include logging',
-        'check_pattern': 'logging'
-    },
-    'ssh_enabled': {
-        'description': 'SSH enabled (not Telnet only)',
-        'ios_command': 'show run | include transport input',
-        'check_pattern': 'ssh'
-    },
-    'aaa_configured': {
-        'description': 'AAA authentication configured',
-        'ios_command': 'show run | include aaa',
-        'check_pattern': 'aaa'
-    },
-    'snmp_configured': {
-        'description': 'SNMP configured',
-        'ios_command': 'show run | include snmp',
-        'check_pattern': 'snmp-server'
-    }
-}
-
-
-def connect_device(device_config):
-    """Establish SSH connection to device."""
+def collect_interface_stats(device_dict):
+    """Collect interface statistics from device."""
     try:
-        logger.info(f"Connecting to {device_config['host']}...")
-        conn = ConnectHandler(**device_config)
-        logger.info("Connected successfully")
-        return conn
-    except NetMikoTimeoutException:
-        logger.error("Connection timeout - device unreachable")
-        sys.exit(1)
-    except NetMikoAuthenticationException:
-        logger.error("Authentication failed - invalid credentials")
-        sys.exit(1)
+        logger.info(f"Connecting to {device_dict['host']}...")
+        net_connect = ConnectHandler(**device_dict)
+        
+        if 'cisco' in device_dict['device_type']:
+            output = net_connect.send_command('show interfaces')
+            stats = parse_interface_output(output)
+        else:
+            output = net_connect.send_command('show interfaces')
+            stats = parse_interface_output(output)
+        
+        net_connect.disconnect()
+        logger.info(f"Collected stats from {device_dict['host']}")
+        return stats
+        
+    except NetmikoTimeoutException:
+        logger.error(f"Timeout connecting to {device_dict['host']}")
+        return []
+    except NetmikoAuthenticationException:
+        logger.error(f"Authentication failed for {device_dict['host']}")
+        return []
     except Exception as e:
-        logger.error(f"Connection error: {e}")
-        sys.exit(1)
+        logger.error(f"Error collecting stats: {str(e)}")
+        return []
 
 
-def run_compliance_checks(conn, device_type):
-    """Execute compliance checks against device configuration."""
-    results = {
-        'timestamp': datetime.now().isoformat(),
-        'device_type': device_type,
-        'checks': {},
-        'passed': 0,
-        'failed': 0
-    }
+def parse_interface_output(output):
+    """Parse interface output and extract statistics."""
+    stats = []
+    lines = output.split('\n')
+    current_interface = None
     
-    for check_name, check_config in COMPLIANCE_RULES.items():
-        try:
-            if 'cisco' in device_type.lower():
-                command = check_config['ios_command']
-            else:
-                command = check_config['ios_command']
-            
-            logger.info(f"Running check: {check_name}")
-            output = conn.send_command(command)
-            
-            check_passed = check_config['check_pattern'].lower() in output.lower()
-            
-            results['checks'][check_name] = {
-                'description': check_config['description'],
-                'passed': check_passed,
-                'status': 'PASS' if check_passed else 'FAIL'
-            }
-            
-            if check_passed:
-                results['passed'] += 1
-            else:
-                results['failed'] += 1
-                logger.warning(f"Check failed: {check_name}")
+    for line in lines:
+        if line and not line[0].isspace() and any(c in line for c in ['/', 'Ethernet']):
+            parts = line.split()
+            if parts:
+                current_interface = {
+                    'interface': parts[0],
+                    'status': parts[1] if len(parts) > 1 else 'unknown',
+                    'protocol': parts[2] if len(parts) > 2 else 'unknown',
+                    'timestamp': datetime.now().isoformat()
+                }
+                stats.append(current_interface)
         
-        except Exception as e:
-            logger.error(f"Error running check {check_name}: {e}")
-            results['checks'][check_name] = {
-                'description': check_config['description'],
-                'passed': False,
-                'status': 'ERROR',
-                'error': str(e)
-            }
-            results['failed'] += 1
+        if current_interface and 'packets input' in line.lower():
+            try:
+                current_interface['packets_in'] = line.split()[0]
+            except (IndexError, ValueError):
+                pass
+        
+        if current_interface and 'packets output' in line.lower():
+            try:
+                current_interface['packets_out'] = line.split()[0]
+            except (IndexError, ValueError):
+                pass
     
-    return results
+    return stats
 
 
-def get_device_facts(conn):
-    """Retrieve basic device information."""
-    try:
-        version_output = conn.send_command('show version', use_textfsm=False)
-        lines = version_output.split('\n')
-        
-        facts = {'model': 'Unknown', 'serial': 'Unknown'}
-        for line in lines:
-            if 'model' in line.lower():
-                facts['model'] = line.split(':')[-1].strip() if ':' in line else 'Unknown'
-            elif 'serial' in line.lower():
-                facts['serial'] = line.split(':')[-1].strip() if ':' in line else 'Unknown'
-        
-        return facts
-    except Exception:
-        return {'model': 'Unknown', 'serial': 'Unknown'}
-
-
-def print_compliance_report(host, facts, results):
-    """Print formatted compliance report."""
+def display_stats(stats, device_name):
+    """Display interface statistics."""
     print(f"\n{'='*70}")
-    print(f"Configuration Compliance Report")
+    print(f"Interface Statistics - {device_name}")
+    print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*70}")
-    print(f"Host:              {host}")
-    print(f"Model:             {facts.get('model', 'Unknown')}")
-    print(f"Serial:            {facts.get('serial', 'Unknown')}")
-    print(f"Device Type:       {results.get('device_type', 'Unknown')}")
-    print(f"Timestamp:         {results.get('timestamp', 'Unknown')}")
-    print(f"\nCompliance Summary")
-    print(f"-" * 70)
-    print(f"Passed:            {results['passed']}/{len(results['checks'])}")
-    print(f"Failed:            {results['failed']}/{len(results['checks'])}")
-    compliance_percentage = (results['passed'] / len(results['checks']) * 100) if results['checks'] else 0
-    print(f"Compliance:        {compliance_percentage:.0f}%")
-    
-    print(f"\nDetailed Results")
-    print(f"-" * 70)
-    print(f"{'Check':<30} {'Status':<10} {'Description':<30}")
+    print(f"{'Interface':<15} {'Status':<10} {'Protocol':<10}")
     print("-" * 70)
     
-    for check_name, check_result in results['checks'].items():
-        status = check_result['status']
-        description = check_result['description']
-        print(f"{check_name:<30} {status:<10} {description:<30}")
+    for stat in stats:
+        intf = stat.get('interface', 'N/A')[:14]
+        status = stat.get('status', 'N/A')[:9]
+        protocol = stat.get('protocol', 'N/A')[:9]
+        print(f"{intf:<15} {status:<10} {protocol:<10}")
     
-    print(f"{'='*70}\n")
+    print(f"\nTotal interfaces: {len(stats)}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Check network device configuration compliance',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='Example: python3 compliance_checker.py 192.168.1.1 admin password123'
+        description='Collect interface statistics from network devices'
     )
-    
-    parser.add_argument('host', help='Device IP address or hostname')
-    parser.add_argument('username', help='SSH username')
-    parser.add_argument('password', help='SSH password')
-    parser.add_argument(
-        '--device-type',
-        default='cisco_ios',
-        choices=['cisco_ios', 'cisco_xe', 'cisco_xr', 'arista_eos', 'juniper_junos'],
-        help='Device type (default: cisco_ios)'
-    )
-    parser.add_argument(
-        '--port',
-        type=int,
-        default=22,
-        help='SSH port (default: 22)'
-    )
-    parser.add_argument(
-        '--timeout',
-        type=int,
-        default=30,
-        help='Connection timeout in seconds (default: 30)'
-    )
-    parser.add_argument(
-        '--json',
-        action='store_true',
-        help='Output results as JSON'
-    )
+    parser.add_argument('--device', required=True, help='Device IP or hostname')
+    parser.add_argument('--username', required=True, help='SSH username')
+    parser.add_argument('--password', required=True, help='SSH password')
+    parser.add_argument('--device-type', default='cisco_ios',
+                        help='Device type (cisco_ios, juniper_junos, arista_eos)')
+    parser.add_argument('--port', type=int, default=22, help='SSH port')
+    parser.add_argument('--timeout', type=int, default=30, help='Timeout in seconds')
     
     args = parser.parse_args()
     
-    device_config = {
+    device_dict = {
         'device_type': args.device_type,
-        'host': args.host,
+        'host': args.device,
         'username': args.username,
         'password': args.password,
         'port': args.port,
         'timeout': args.timeout,
     }
     
-    logger.info(f"Starting compliance check for {args.host}")
+    stats = collect_interface_stats(device_dict)
     
-    conn = connect_device(device_config)
-    
-    try:
-        facts = get_device_facts(conn)
-        results = run_compliance_checks(conn, args.device_type)
-    finally:
-        conn.disconnect()
-        logger.info("Disconnected from device")
-    
-    if args.json:
-        results['facts'] = facts
-        print(json.dumps(results, indent=2))
+    if stats:
+        display_stats(stats, args.device)
+        return 0
     else:
-        print_compliance_report(args.host, facts, results)
-    
-    if results['failed'] > 0:
-        logger.warning(f"Compliance check complete: {results['failed']} checks failed")
-        sys.exit(1)
-    else:
-        logger.info("Device is fully compliant")
-        sys.exit(0)
+        logger.error("No interface statistics collected")
+        return 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
 ```
