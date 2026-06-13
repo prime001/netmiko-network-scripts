@@ -1,202 +1,176 @@
-bgp_state_validator.py - BGP neighbor state validator for pre/post change verification.
+acl_validator.py - Post-change ACL compliance checker for Cisco IOS/IOS-XE.
 
 Purpose:
-    Captures BGP neighbor state and received prefix counts, saves a baseline snapshot
-    before a maintenance window, then compares post-change state to detect session
-    loss or significant prefix-count degradation introduced by the change.
+    Connects to a network device via SSH and verifies that specified ACL entries
+    are present in the named access list. Designed for post-change validation
+    during change windows to confirm ACL edits were applied correctly.
 
 Usage:
-    # Save a pre-change baseline
-    python bgp_state_validator.py --host 10.0.0.1 -u admin -p secret --save-baseline /tmp/bgp_pre.json
+    python acl_validator.py --host 192.168.1.1 -u admin -p secret \
+        --acl MGMT-ACCESS --rules rules.json
 
-    # Validate post-change state against the baseline
-    python bgp_state_validator.py --host 10.0.0.1 -u admin -p secret --compare /tmp/bgp_pre.json
-
-    # Print current BGP summary without saving or comparing
-    python bgp_state_validator.py --host 10.0.0.1 -u admin -p secret
+    python acl_validator.py --host 10.0.0.1 -u netops \
+        --acl WAN-FILTER \
+        --check-entry "permit tcp 10.0.0.0 0.0.0.255 any eq 443" \
+        --check-entry "deny ip any any log" \
+        --output results.json
 
 Prerequisites:
     pip install netmiko
-    SSH access to the device with privilege level sufficient to run 'show ip bgp summary'.
-    Supported platforms: Cisco IOS, IOS-XE, NX-OS, Arista EOS.
+    Cisco IOS / IOS-XE device reachable via SSH
+
+Rules file format (rules.json):
+    ["permit tcp 10.1.0.0 0.0.0.255 any eq 443", "deny ip any any log"]
+
+    Each string is matched as a case-insensitive substring against ACL output.
+    Exit code 0 = all entries present; 1 = one or more missing.
 """
 
 import argparse
 import json
 import logging
-import re
 import sys
-from datetime import datetime, timezone
-from pathlib import Path
+from getpass import getpass
 
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
-
-DEVICE_TYPE_MAP = {
-    "ios": "cisco_ios",
-    "iosxe": "cisco_xe",
-    "nxos": "cisco_nxos",
-    "eos": "arista_eos",
-}
-
-PREFIX_DROP_THRESHOLD = 20.0
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger(__name__)
 
 
-def _parse_bgp_summary_tabular(output: str) -> dict:
-    """Parse IOS/IOS-XE/EOS/NX-OS 'show [ip] bgp summary' neighbor table rows."""
-    neighbors = {}
-    pattern = re.compile(
-        r"^(\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\S+\s+(\S+)",
-        re.MULTILINE,
-    )
-    for match in pattern.finditer(output):
-        ip, remote_as, state_field = match.groups()
-        try:
-            prefixes = int(state_field)
-            state = "Established"
-        except ValueError:
-            prefixes = 0
-            state = state_field
-        neighbors[ip] = {"remote_as": remote_as, "state": state, "prefixes_received": prefixes}
-    return neighbors
+def fetch_acl(connection, acl_name):
+    output = connection.send_command(f"show ip access-lists {acl_name}")
+    if "does not exist" in output or "Invalid input" in output:
+        return None, output.strip()
+    return output, None
 
 
-def fetch_bgp_neighbors(conn, netmiko_type: str) -> dict:
-    """Run the appropriate show command and return parsed neighbor dict."""
-    if netmiko_type in ("cisco_ios", "cisco_xe"):
-        raw = conn.send_command("show ip bgp summary")
-    else:
-        raw = conn.send_command("show bgp summary")
-    return _parse_bgp_summary_tabular(raw)
+def validate_entries(acl_output, expected_entries):
+    lines = [line.strip().lower() for line in acl_output.splitlines() if line.strip()]
+    results = []
+    for entry in expected_entries:
+        matched = any(entry.lower().strip() in line for line in lines)
+        results.append({
+            "entry": entry,
+            "present": matched,
+            "status": "PASS" if matched else "FAIL",
+        })
+    return results
 
 
-def build_snapshot(host: str, neighbors: dict) -> dict:
-    return {
-        "host": host,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "neighbors": neighbors,
-    }
-
-
-def compare_snapshots(baseline: dict, current: dict) -> tuple:
-    """Return (passed: bool, issues: list[str]) comparing current to baseline."""
-    issues = []
-    passed = True
-    base_neighbors = baseline.get("neighbors", {})
-    curr_neighbors = current.get("neighbors", {})
-
-    for ip, base in base_neighbors.items():
-        if base["state"] != "Established":
-            continue
-        if ip not in curr_neighbors:
-            issues.append(f"MISSING  {ip} AS{base['remote_as']} — no longer in BGP table")
-            passed = False
-            continue
-        curr = curr_neighbors[ip]
-        if curr["state"] != "Established":
-            issues.append(
-                f"DOWN     {ip} AS{base['remote_as']} — state: Established -> {curr['state']}"
-            )
-            passed = False
-        elif base["prefixes_received"] > 0:
-            drop_pct = (base["prefixes_received"] - curr["prefixes_received"]) / base["prefixes_received"] * 100
-            if drop_pct > PREFIX_DROP_THRESHOLD:
-                issues.append(
-                    f"PREFIXES {ip} AS{base['remote_as']} — "
-                    f"{base['prefixes_received']} -> {curr['prefixes_received']} "
-                    f"({drop_pct:.1f}% drop)"
-                )
-                passed = False
-
-    for ip in set(curr_neighbors) - set(base_neighbors):
-        issues.append(f"NEW      {ip} AS{curr_neighbors[ip]['remote_as']} — appeared since baseline")
-
-    return passed, issues
-
-
-def print_summary_table(neighbors: dict) -> None:
-    print(f"\n{'Neighbor':<18} {'Remote AS':<12} {'State':<14} {'Pfx Rcvd':>8}")
-    print("-" * 56)
-    for ip in sorted(neighbors):
-        d = neighbors[ip]
-        print(f"{ip:<18} {d['remote_as']:<12} {d['state']:<14} {d['prefixes_received']:>8}")
-    print()
-
-
-def main() -> None:
+def build_parser():
     parser = argparse.ArgumentParser(
-        description="BGP neighbor state validator for pre/post change windows"
+        description="Validate ACL entries on a Cisco IOS/IOS-XE device."
     )
     parser.add_argument("--host", required=True, help="Device IP or hostname")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", required=True, help="SSH password")
+    parser.add_argument("--username", "-u", required=True, help="SSH username")
     parser.add_argument(
-        "--device-type", default="ios", choices=list(DEVICE_TYPE_MAP),
-        help="Device OS (default: ios)"
+        "--password", "-p", default=None, help="SSH password (prompted if omitted)"
     )
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--save-baseline", metavar="FILE", help="Save snapshot to FILE (pre-change)")
-    parser.add_argument("--compare", metavar="FILE", help="Compare current state against FILE")
-    parser.add_argument("--verbose", action="store_true", help="Always print neighbor table")
+    parser.add_argument(
+        "--device-type", default="cisco_ios",
+        help="Netmiko device type (default: cisco_ios)"
+    )
+    parser.add_argument("--acl", required=True, help="ACL name to inspect")
+    parser.add_argument(
+        "--rules", metavar="FILE",
+        help="JSON file with list of expected ACL entry substrings"
+    )
+    parser.add_argument(
+        "--check-entry", metavar="ENTRY", action="append", dest="inline_entries",
+        help="Expected ACL entry substring (repeatable; combined with --rules)"
+    )
+    parser.add_argument(
+        "--output", metavar="FILE", help="Write JSON results to this file"
+    )
+    parser.add_argument("--verbose", "-v", action="store_true")
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
-    netmiko_type = DEVICE_TYPE_MAP[args.device_type]
-    device_params = {
-        "device_type": netmiko_type,
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    password = args.password or getpass(f"Password for {args.username}@{args.host}: ")
+
+    expected = list(args.inline_entries or [])
+    if args.rules:
+        try:
+            with open(args.rules) as fh:
+                file_rules = json.load(fh)
+            if not isinstance(file_rules, list):
+                log.error("Rules file must contain a JSON array of strings.")
+                sys.exit(1)
+            expected.extend(file_rules)
+        except (OSError, json.JSONDecodeError) as exc:
+            log.error("Failed to load rules file: %s", exc)
+            sys.exit(1)
+
+    if not expected:
+        log.error("No entries to validate. Use --rules or --check-entry.")
+        sys.exit(1)
+
+    device = {
+        "device_type": args.device_type,
         "host": args.host,
         "username": args.username,
-        "password": args.password,
-        "port": args.port,
+        "password": password,
     }
 
-    logger.info("Connecting to %s as %s", args.host, args.username)
+    log.info("Connecting to %s ...", args.host)
     try:
-        with ConnectHandler(**device_params) as conn:
-            logger.info("Fetching BGP summary")
-            neighbors = fetch_bgp_neighbors(conn, netmiko_type)
+        with ConnectHandler(**device) as conn:
+            log.info("Fetching ACL '%s' ...", args.acl)
+            acl_output, error = fetch_acl(conn, args.acl)
     except NetmikoAuthenticationException:
-        logger.error("Authentication failed — check username/password")
+        log.error("Authentication failed for %s@%s", args.username, args.host)
         sys.exit(1)
     except NetmikoTimeoutException:
-        logger.error("Connection timed out to %s:%d", args.host, args.port)
+        log.error("Connection to %s timed out.", args.host)
         sys.exit(1)
 
-    established = sum(1 for n in neighbors.values() if n["state"] == "Established")
-    logger.info("BGP peers: %d established / %d total", established, len(neighbors))
+    if error:
+        log.error("ACL '%s' not found on %s:\n%s", args.acl, args.host, error)
+        sys.exit(1)
 
-    if args.verbose or not (args.save_baseline or args.compare):
-        print_summary_table(neighbors)
+    if args.verbose:
+        log.debug("Raw ACL output:\n%s", acl_output)
 
-    snapshot = build_snapshot(args.host, neighbors)
+    results = validate_entries(acl_output, expected)
+    passed = sum(1 for r in results if r["present"])
+    failed = len(results) - passed
 
-    if args.save_baseline:
-        Path(args.save_baseline).write_text(json.dumps(snapshot, indent=2))
-        logger.info("Baseline saved to %s", args.save_baseline)
+    print(f"\nACL Validation: {args.acl}  |  Host: {args.host}")
+    print("-" * 62)
+    for r in results:
+        symbol = "+" if r["present"] else "-"
+        print(f"  [{symbol}] {r['status']:4s}  {r['entry']}")
+    print("-" * 62)
+    print(f"  Total: {len(results)}   Passed: {passed}   Failed: {failed}\n")
 
-    if args.compare:
-        baseline_path = Path(args.compare)
-        if not baseline_path.exists():
-            logger.error("Baseline file not found: %s", args.compare)
-            sys.exit(1)
-        baseline = json.loads(baseline_path.read_text())
-        logger.info(
-            "Comparing against baseline captured %s from %s",
-            baseline.get("timestamp", "unknown"),
-            baseline.get("host", "unknown"),
-        )
-        passed, issues = compare_snapshots(baseline, snapshot)
-        for issue in issues:
-            if issue.startswith("NEW"):
-                logger.info(issue)
-            else:
-                logger.error(issue)
-        if passed:
-            logger.info("RESULT: PASS — BGP state matches baseline")
-        else:
-            logger.error("RESULT: FAIL — BGP degradation detected post-change")
-            sys.exit(2)
+    if args.output:
+        payload = {
+            "host": args.host,
+            "acl": args.acl,
+            "passed": passed,
+            "failed": failed,
+            "results": results,
+        }
+        try:
+            with open(args.output, "w") as fh:
+                json.dump(payload, fh, indent=2)
+            log.info("Results saved to %s", args.output)
+        except OSError as exc:
+            log.warning("Could not write output file: %s", exc)
+
+    sys.exit(0 if failed == 0 else 1)
 
 
 if __name__ == "__main__":
