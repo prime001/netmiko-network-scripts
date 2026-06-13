@@ -1,182 +1,209 @@
 ```python
+#!/usr/bin/env python3
 """
-config_rollback_v3.py - Archive diff and selective rollback for Cisco IOS devices.
+config_compliance_audit.py - Network device configuration compliance auditor.
 
-Purpose:
-    Retrieves the running configuration from a device, compares it against a locally
-    stored baseline archive using unified diff, and optionally applies the archive as
-    a rollback. Supports section-level filtering (e.g., only diff 'interface' blocks)
-    to avoid noisy full-config comparisons.
+Connects to a network device, retrieves the running configuration, and validates
+it against compliance rules defined in a JSON file. Produces a scored pass/fail
+report useful for audits, change controls, and security baselines.
 
 Usage:
-    python config_rollback_v3.py --host 192.168.1.1 --username admin --password secret \\
-        --archive baseline.cfg [--section interface] [--dry-run] [--apply]
+    python config_compliance_audit.py --host 192.168.1.1 --username admin \
+        --password secret --device-type cisco_ios --rules rules.json
+
+    python config_compliance_audit.py --host 10.0.0.1 --username admin \
+        --password secret --rules rules.json --output report.txt --verbose
 
 Prerequisites:
     pip install netmiko
-    A saved baseline config file on disk.
-    SSH access to target device with sufficient privilege level.
+
+Rules file format (JSON):
+    {
+        "rules": [
+            {
+                "name": "NTP server configured",
+                "required": ["ntp server 10.0.0.1"],
+                "severity": "high"
+            },
+            {
+                "name": "SSH version 2 enforced",
+                "required": ["ip ssh version 2"],
+                "severity": "critical"
+            },
+            {
+                "name": "Telnet transport disabled",
+                "forbidden": ["transport input telnet"],
+                "severity": "critical"
+            }
+        ]
+    }
 """
 
 import argparse
-import difflib
+import json
 import logging
 import sys
-from pathlib import Path
+from dataclasses import dataclass, field
 
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler
+from netmiko.exceptions import AuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
+
+SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
 
-def get_running_config(conn):
-    log.info("Fetching running configuration")
-    return conn.send_command("show running-config", read_timeout=60).splitlines()
+@dataclass
+class RuleResult:
+    name: str
+    severity: str
+    passed: bool
+    findings: list = field(default_factory=list)
 
 
-def load_archive(path):
-    p = Path(path)
-    if not p.exists():
-        log.error("Archive file not found: %s", path)
+def load_rules(rules_file):
+    try:
+        with open(rules_file) as f:
+            data = json.load(f)
+        rules = data.get("rules", [])
+        if not rules:
+            logger.error("No rules found in %s", rules_file)
+            sys.exit(1)
+        return rules
+    except FileNotFoundError:
+        logger.error("Rules file not found: %s", rules_file)
         sys.exit(1)
-    return p.read_text().splitlines()
+    except json.JSONDecodeError as e:
+        logger.error("Invalid JSON in rules file: %s", e)
+        sys.exit(1)
 
 
-def filter_section(lines, keyword):
-    """Return lines belonging to config blocks that start with keyword."""
-    result = []
-    in_block = False
-    for line in lines:
-        if line.lower().startswith(keyword.lower()) and not line.startswith(" "):
-            in_block = True
-        elif in_block and line and not line.startswith(" ") and not line.startswith("!"):
-            in_block = False
-        if in_block:
-            result.append(line)
-    return result
+def fetch_config(conn, enable_secret):
+    if enable_secret:
+        conn.enable()
+    logger.info("Fetching running configuration...")
+    return conn.send_command("show running-config", read_timeout=60)
 
 
-def compute_diff(archive_lines, running_lines):
-    return list(difflib.unified_diff(
-        archive_lines,
-        running_lines,
-        fromfile="archive",
-        tofile="running",
-        lineterm="",
-    ))
+def evaluate_rule(rule, config_lower):
+    name = rule.get("name", "Unnamed")
+    severity = rule.get("severity", "medium")
+    findings = []
+
+    for pattern in rule.get("required", []):
+        if pattern.lower() not in config_lower:
+            findings.append(f"MISSING required: '{pattern}'")
+
+    for pattern in rule.get("forbidden", []):
+        if pattern.lower() in config_lower:
+            findings.append(f"FOUND forbidden: '{pattern}'")
+
+    return RuleResult(name=name, severity=severity, passed=not findings, findings=findings)
 
 
-def apply_rollback(conn, lines):
-    commands = [l for l in lines if l.strip() and not l.startswith("!")]
-    log.info("Pushing %d config lines to device", len(commands))
-    output = conn.send_config_set(commands, read_timeout=120)
-    conn.save_config()
-    log.info("Configuration saved to NVRAM")
-    return output
+def print_report(results, host, output_file=None):
+    total = len(results)
+    passed_count = sum(1 for r in results if r.passed)
+    failed_count = total - passed_count
+    score = int((passed_count / total) * 100) if total else 0
+
+    lines = [
+        "",
+        "=" * 64,
+        f"Compliance Report — {host}",
+        "=" * 64,
+        f"Rules: {total}   Passed: {passed_count}   Failed: {failed_count}   Score: {score}%",
+        "=" * 64,
+        "",
+    ]
+
+    sorted_results = sorted(
+        results, key=lambda r: (r.passed, SEVERITY_ORDER.get(r.severity, 9))
+    )
+    for result in sorted_results:
+        status = "PASS" if result.passed else "FAIL"
+        sev = result.severity.upper().ljust(8)
+        lines.append(f"[{status}] [{sev}] {result.name}")
+        for finding in result.findings:
+            lines.append(f"         {finding}")
+
+    lines += ["", "=" * 64, ""]
+    report = "\n".join(lines)
+    print(report)
+
+    if output_file:
+        try:
+            with open(output_file, "w") as f:
+                f.write(report)
+            logger.info("Report saved to %s", output_file)
+        except OSError as e:
+            logger.warning("Could not write output file: %s", e)
+
+    return 0 if failed_count == 0 else 1
 
 
-def print_diff_summary(diff):
-    added = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
-    removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
-    print("\n".join(diff))
-    print(f"\nSummary: +{added} lines, -{removed} lines vs archive")
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Audit device running-config against JSON compliance rules"
+    )
+    parser.add_argument("--host", required=True, help="Device hostname or IP address")
+    parser.add_argument("--username", required=True, help="SSH username")
+    parser.add_argument("--password", required=True, help="SSH password")
+    parser.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    parser.add_argument("--rules", required=True, help="Path to JSON compliance rules file")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--secret", default="", help="Enable mode secret")
+    parser.add_argument("--output", help="Write report to this file in addition to stdout")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
+    return parser.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Diff running config against a saved archive and optionally roll back"
-    )
-    parser.add_argument("--host", required=True, help="Device IP or hostname")
-    parser.add_argument("--username", required=True, help="SSH username")
-    parser.add_argument("--password", required=True, help="SSH password")
-    parser.add_argument("--archive", required=True, help="Path to baseline config file")
-    parser.add_argument(
-        "--section",
-        metavar="KEYWORD",
-        help="Limit diff/rollback to config blocks starting with KEYWORD (e.g. 'interface')",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show diff only; do not apply changes",
-    )
-    parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Apply archive config as rollback after confirming diff",
-    )
-    parser.add_argument("--device-type", default="cisco_ios", help="Netmiko device type")
-    parser.add_argument("--port", type=int, default=22)
-    args = parser.parse_args()
+    args = parse_args()
 
-    if args.dry_run and args.apply:
-        parser.error("--dry-run and --apply are mutually exclusive")
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    archive_lines = load_archive(args.archive)
+    rules = load_rules(args.rules)
+    logger.info("Loaded %d compliance rules from %s", len(rules), args.rules)
 
-    device = {
+    device_params = {
         "device_type": args.device_type,
         "host": args.host,
         "username": args.username,
         "password": args.password,
         "port": args.port,
+        "secret": args.secret,
     }
 
     try:
-        log.info("Connecting to %s", args.host)
-        with ConnectHandler(**device) as conn:
-            running_lines = get_running_config(conn)
-
-            if args.section:
-                archive_cmp = filter_section(archive_lines, args.section)
-                running_cmp = filter_section(running_lines, args.section)
-                if not archive_cmp:
-                    log.warning("Section '%s' not found in archive", args.section)
-                if not running_cmp:
-                    log.warning("Section '%s' not found in running config", args.section)
-            else:
-                archive_cmp = archive_lines
-                running_cmp = running_lines
-
-            diff = compute_diff(archive_cmp, running_cmp)
-
-            if not diff:
-                print("No differences found — running config matches archive.")
-                return
-
-            print(f"\nDiff for {args.host}" + (f" [section: {args.section}]" if args.section else "") + ":")
-            print_diff_summary(diff)
-
-            if args.dry_run:
-                log.info("Dry-run complete; no changes applied")
-                return
-
-            if args.apply:
-                confirm = input("\nApply archive as rollback? [yes/no]: ").strip().lower()
-                if confirm != "yes":
-                    log.info("Rollback cancelled")
-                    return
-                rollback_lines = archive_cmp if args.section else archive_lines
-                apply_rollback(conn, rollback_lines)
-                log.info("Rollback applied successfully")
-            else:
-                log.info("Pass --apply to push the archive, or --dry-run to suppress this hint")
-
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.host)
-        sys.exit(1)
+        logger.info("Connecting to %s (%s)...", args.host, args.device_type)
+        with ConnectHandler(**device_params) as conn:
+            config = fetch_config(conn, args.secret)
+    except AuthenticationException:
+        logger.error("Authentication failed for %s@%s", args.username, args.host)
+        return 1
     except NetmikoTimeoutException:
-        log.error("Connection timed out to %s", args.host)
-        sys.exit(1)
-    except KeyboardInterrupt:
-        log.warning("Interrupted")
-        sys.exit(130)
+        logger.error("Connection timed out for %s", args.host)
+        return 1
+    except Exception as e:
+        logger.error("Connection error: %s", e)
+        return 1
+
+    config_lower = config.lower()
+    results = [evaluate_rule(rule, config_lower) for rule in rules]
+    return print_report(results, args.host, output_file=args.output)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 ```
