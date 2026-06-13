@@ -1,218 +1,213 @@
-The task says to output only script content — here it is:
-
-```
-"""
-vlan_provisioner.py - Bulk VLAN provisioning via Netmiko
-...
-```
-
-Wait — re-reading the instructions: **"Output ONLY the script content, no markdown fences, no explanation."** That means raw text output only. Here is the script:
-
----
-
-"""
-vlan_provisioner.py - Bulk VLAN provisioning via Netmiko
+BGP Session Monitor — netmiko network automation script.
 
 Purpose:
-    Creates, renames, or removes VLANs on Cisco IOS/IOS-XE/NX-OS switches
-    from a YAML definition file. Verifies each VLAN after apply and prints
-    a pass/fail summary. Designed for batch switch provisioning workflows
-    where VLANs are defined in version-controlled YAML.
+    Connect to a router and audit BGP neighbor sessions. Reports session
+    state, uptime, and received prefix counts. Flags any neighbor not in
+    Established state and optionally alerts when prefix counts fall below
+    a configurable threshold.
 
 Usage:
-    python vlan_provisioner.py --host 10.0.0.1 --username admin --vlan-file vlans.yaml
-    python vlan_provisioner.py --host 10.0.0.1 --username admin --vlan-file vlans.yaml --remove
-    python vlan_provisioner.py --host 10.0.0.1 --username admin --vlan-file vlans.yaml --dry-run
+    python bgp_monitor.py -d 192.168.1.1 -u admin -p secret
+    python bgp_monitor.py -d 10.0.0.1 -u admin --device-type cisco_ios_xe
+    python bgp_monitor.py -d 10.0.0.1 -u admin --prefix-threshold 100 --json
 
 Prerequisites:
-    pip install netmiko pyyaml
-
-VLAN definition file format (YAML):
-    vlans:
-      - id: 100
-        name: CORP_USERS
-      - id: 200
-        name: GUEST_WIFI
-      - id: 300
-        name: SERVERS
+    pip install netmiko
+    SSH access to a router with BGP configured.
+    Supported device types: cisco_ios, cisco_ios_xe, cisco_xr, cisco_nxos
 """
 
 import argparse
 import getpass
+import json
 import logging
+import re
 import sys
+from dataclasses import asdict, dataclass
+from typing import List, Optional
 
-import yaml
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-def load_vlan_file(path):
-    with open(path) as f:
-        data = yaml.safe_load(f)
-    vlans = data.get("vlans", [])
-    if not vlans:
-        raise ValueError(f"No VLANs found in {path}")
-    for v in vlans:
-        if not isinstance(v.get("id"), int) or not (1 <= v["id"] <= 4094):
-            raise ValueError(f"Invalid VLAN ID: {v.get('id')!r}")
-        if not v.get("name"):
-            raise ValueError(f"VLAN {v['id']} missing 'name'")
-    return vlans
+@dataclass
+class BgpNeighbor:
+    neighbor: str
+    as_number: str
+    state: str
+    uptime: str
+    prefixes_received: int
+    msg_received: int
+    msg_sent: int
 
 
-def build_add_commands(vlans):
-    cmds = []
-    for v in vlans:
-        cmds.append(f"vlan {v['id']}")
-        cmds.append(f" name {v['name']}")
-    return cmds
-
-
-def build_remove_commands(vlans):
-    ids = ",".join(str(v["id"]) for v in vlans)
-    return [f"no vlan {ids}"]
-
-
-def get_existing_vlans(conn):
-    output = conn.send_command("show vlan brief")
-    existing = {}
-    for line in output.splitlines():
-        parts = line.split()
-        if parts and parts[0].isdigit():
-            vid = int(parts[0])
-            existing[vid] = parts[1] if len(parts) > 1 else ""
-    return existing
-
-
-def verify_vlans(conn, vlans, remove=False):
-    existing = get_existing_vlans(conn)
-    results = []
-    all_ok = True
-    for v in vlans:
-        vid = v["id"]
-        if remove:
-            ok = vid not in existing
-            status = "removed" if ok else "STILL PRESENT"
-        else:
-            present = vid in existing
-            name_match = present and existing[vid] == v["name"]
-            ok = name_match
-            if not present:
-                status = "MISSING"
-            elif not name_match:
-                status = f"name mismatch: got {existing[vid]!r}, expected {v['name']!r}"
-            else:
-                status = "present"
-        results.append((vid, v["name"], ok, status))
-        if not ok:
-            all_ok = False
-    return results, all_ok
-
-
-def provision_vlans(args):
-    try:
-        vlans = load_vlan_file(args.vlan_file)
-    except (OSError, ValueError, KeyError) as exc:
-        log.error("Failed to load VLAN file: %s", exc)
-        return 1
-
-    log.info("Loaded %d VLAN(s) from %s", len(vlans), args.vlan_file)
-
-    if args.remove:
-        cmds = build_remove_commands(vlans)
-        action = "remove"
-    else:
-        cmds = build_add_commands(vlans)
-        action = "add"
-
-    if args.dry_run:
-        log.info("Dry-run — commands that would be sent:")
-        for c in cmds:
-            print(f"  {c}")
-        return 0
-
-    device = {
-        "device_type": args.device_type,
-        "host": args.host,
-        "port": args.port,
-        "username": args.username,
-        "password": args.password,
-    }
-
-    try:
-        log.info("Connecting to %s:%d", args.host, args.port)
-        with ConnectHandler(**device) as conn:
-            log.info("Connected — applying %s commands", action)
-            output = conn.send_config_set(cmds)
-            log.debug("Config output:\n%s", output)
-
-            if not args.no_save:
-                conn.save_config()
-                log.info("Running config saved")
-
-            results, all_ok = verify_vlans(conn, vlans, remove=args.remove)
-
-        print(f"\n{'VLAN':>6}  {'Name':<24}  Result")
-        print("-" * 55)
-        for vid, name, ok, status in results:
-            marker = "OK  " if ok else "FAIL"
-            print(f"{vid:>6}  {name:<24}  [{marker}] {status}")
-        print()
-
-        if all_ok:
-            log.info("All %d VLAN(s) verified successfully", len(vlans))
-            return 0
-        else:
-            failed = sum(1 for _, _, ok, _ in results if not ok)
-            log.error("Verification failed for %d VLAN(s)", failed)
-            return 1
-
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.host)
-        return 2
-    except NetmikoTimeoutException:
-        log.error("Connection timed out to %s:%d", args.host, args.port)
-        return 2
-    except Exception as exc:
-        log.error("Unexpected error: %s", exc)
-        return 2
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Bulk VLAN provisioner for Cisco IOS/IOS-XE/NX-OS switches",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+def parse_bgp_summary(output: str) -> List[BgpNeighbor]:
+    """Parse IOS/IOS-XE/NX-OS 'show bgp summary' neighbor table lines."""
+    neighbors = []
+    # Matches: neighbor, version, AS, MsgRcvd, MsgSent, TblVer, InQ, OutQ, Up/Down, State/PfxRcd
+    pattern = re.compile(
+        r'^(\d+\.\d+\.\d+\.\d+|[0-9a-fA-F:]+)\s+'
+        r'\d+\s+'
+        r'(\d+)\s+'
+        r'(\d+)\s+'
+        r'(\d+)\s+'
+        r'\d+\s+\d+\s+\d+\s+'
+        r'(\S+)\s+'
+        r'(\S+)',
+        re.MULTILINE,
     )
-    parser.add_argument("--host", required=True, help="Device IP or hostname")
-    parser.add_argument("--username", required=True, help="SSH username")
-    parser.add_argument("--password", help="SSH password (prompted if omitted)")
-    parser.add_argument("--port", type=int, default=22, help="SSH port")
+    for m in pattern.finditer(output):
+        neighbor_ip, asn, msg_rcvd, msg_sent, uptime, state_or_pfx = m.groups()
+        try:
+            pfx = int(state_or_pfx)
+            state = "Established"
+        except ValueError:
+            pfx = 0
+            state = state_or_pfx
+
+        neighbors.append(
+            BgpNeighbor(
+                neighbor=neighbor_ip,
+                as_number=asn,
+                state=state,
+                uptime=uptime,
+                prefixes_received=pfx,
+                msg_received=int(msg_rcvd),
+                msg_sent=int(msg_sent),
+            )
+        )
+    return neighbors
+
+
+def collect_bgp_output(connection, device_type: str) -> str:
+    commands = {
+        "cisco_xr": "show bgp summary",
+        "cisco_ios": "show bgp ipv4 unicast summary",
+        "cisco_ios_xe": "show bgp ipv4 unicast summary",
+        "cisco_nxos": "show bgp ipv4 unicast summary",
+    }
+    cmd = commands.get(device_type, "show bgp summary")
+    logger.info("Running: %s", cmd)
+    return connection.send_command(cmd)
+
+
+def print_report(neighbors: List[BgpNeighbor], threshold: Optional[int]) -> None:
+    header = (
+        f"{'Neighbor':<22} {'AS':<8} {'State':<14} {'Uptime':<12}"
+        f" {'Pfx Rcvd':>9} {'Msg Rcvd':>9} {'Msg Sent':>9}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    alerts = []
+    for n in neighbors:
+        flag = ""
+        if n.state != "Established":
+            flag = " (!)"
+            alerts.append(f"Session DOWN: {n.neighbor} AS{n.as_number} state={n.state}")
+        elif threshold is not None and n.prefixes_received < threshold:
+            flag = " (!)"
+            alerts.append(
+                f"Low prefixes: {n.neighbor} AS{n.as_number}"
+                f" received={n.prefixes_received} threshold={threshold}"
+            )
+        print(
+            f"{n.neighbor:<22} {n.as_number:<8} {n.state:<14} {n.uptime:<12}"
+            f" {n.prefixes_received:>9} {n.msg_received:>9} {n.msg_sent:>9}{flag}"
+        )
+
+    if alerts:
+        print("\nALERTS:")
+        for alert in alerts:
+            print(f"  * {alert}")
+    else:
+        print("\nAll BGP sessions OK.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Audit BGP neighbor sessions on a router via SSH."
+    )
+    parser.add_argument("-d", "--device", required=True, help="Device hostname or IP")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
     parser.add_argument(
         "--device-type",
         default="cisco_ios",
-        choices=["cisco_ios", "cisco_xe", "cisco_nxos"],
-        help="Netmiko device type",
+        choices=["cisco_ios", "cisco_ios_xe", "cisco_xr", "cisco_nxos"],
+        help="Netmiko device type (default: cisco_ios)",
     )
-    parser.add_argument("--vlan-file", required=True, metavar="FILE",
-                        help="YAML file defining VLANs to provision")
-    parser.add_argument("--remove", action="store_true",
-                        help="Remove listed VLANs instead of adding them")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Print commands without connecting to device")
-    parser.add_argument("--no-save", action="store_true",
-                        help="Skip 'write mem' after applying changes")
-    return parser.parse_args()
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument(
+        "--prefix-threshold",
+        type=int,
+        metavar="N",
+        help="Alert when received prefix count falls below N",
+    )
+    parser.add_argument(
+        "--json", action="store_true", dest="json_output", help="Output results as JSON"
+    )
+    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    password = args.password or getpass.getpass(
+        f"Password for {args.username}@{args.device}: "
+    )
+
+    device_params = {
+        "device_type": args.device_type,
+        "host": args.device,
+        "username": args.username,
+        "password": password,
+        "port": args.port,
+    }
+
+    try:
+        logger.info("Connecting to %s", args.device)
+        with ConnectHandler(**device_params) as conn:
+            raw_output = collect_bgp_output(conn, args.device_type)
+    except NetmikoAuthenticationException:
+        print(f"ERROR: Authentication failed for {args.username}@{args.device}", file=sys.stderr)
+        sys.exit(1)
+    except NetmikoTimeoutException:
+        print(f"ERROR: Connection timed out to {args.device}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    neighbors = parse_bgp_summary(raw_output)
+
+    if not neighbors:
+        print("No BGP neighbors found or output could not be parsed.", file=sys.stderr)
+        print("Raw output:\n", raw_output, file=sys.stderr)
+        sys.exit(2)
+
+    if args.json_output:
+        result = {
+            "device": args.device,
+            "neighbor_count": len(neighbors),
+            "neighbors": [asdict(n) for n in neighbors],
+        }
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"\nBGP Summary — {args.device}\n")
+        print_report(neighbors, args.prefix_threshold)
+
+    # Exit 3 signals monitoring systems that actionable sessions were found
+    non_established = [n for n in neighbors if n.state != "Established"]
+    if non_established:
+        sys.exit(3)
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    if not args.password and not args.dry_run:
-        args.password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
-    sys.exit(provision_vlans(args))
+    main()
