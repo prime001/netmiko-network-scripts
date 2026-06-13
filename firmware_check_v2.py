@@ -1,241 +1,206 @@
-The script content is below — this is a pre-upgrade readiness validator, distinct from the version-check work in `firmware_check.py`/`firmware_check_v2.py`:
+The write permission is being blocked. The script content is ready — here it is directly:
 
 ```python
 """
-firmware_upgrade_preflight.py - Pre-upgrade readiness validator for Cisco IOS devices.
+flash_precheck.py - Pre-upgrade flash storage readiness checker for Cisco IOS/IOS-XE devices.
 
 Purpose:
-    Validates that a device meets all prerequisites before a firmware upgrade:
-    checks free flash storage, available DRAM, whether the target image is already
-    staged, and optionally runs on-device MD5 verification of the staged image.
-    Exits 0 if all checks pass, 1 if any blocking error is found.
+    Verifies that a target device has sufficient flash space and optionally validates
+    the MD5 hash of an already-staged firmware image before a maintenance window.
+    Complements firmware_check.py (version comparison) by focusing on storage
+    readiness rather than running version state.
 
 Usage:
-    python firmware_upgrade_preflight.py -d 192.168.1.1 -u admin -p secret \
-        --target-image c2960x-universalk9-mz.152-7.E6.bin \
-        --required-flash-mb 128 --required-dram-mb 256 --verify-md5
+    python flash_precheck.py -d 192.168.1.1 -u admin -p secret \
+        --image c2960x-universalk9-mz.152-7.E5.bin --required-mb 32
+    python flash_precheck.py -d 192.168.1.1 -u admin -p secret \
+        --image c2960x-universalk9-mz.152-7.E5.bin --verify-md5 a3f1b2c4d5e6f789...
 
 Prerequisites:
     pip install netmiko
-    SSH + enable access on the target device
-    Tested against Cisco IOS; also works with IOS-XE for version/flash checks
+    Target device must allow SSH and have 'show flash' / 'verify' privilege.
 """
 
 import argparse
 import logging
 import re
 import sys
-from dataclasses import dataclass, field
-from typing import List, Optional
 
-from netmiko import ConnectHandler
-from netmiko.exceptions import AuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
 )
 log = logging.getLogger(__name__)
 
 
-@dataclass
-class PreflightResult:
-    host: str
-    ios_version: str = "unknown"
-    platform: str = "unknown"
-    flash_free_mb: Optional[float] = None
-    dram_total_mb: Optional[float] = None
-    image_staged: bool = False
-    md5_verified: Optional[bool] = None
-    warnings: List[str] = field(default_factory=list)
-    errors: List[str] = field(default_factory=list)
+def parse_flash_output(output: str) -> dict:
+    """Extract free bytes and file list from 'show flash:' output."""
+    result = {"free_bytes": None, "files": []}
 
-    @property
-    def ready(self) -> bool:
-        return len(self.errors) == 0
+    free_match = re.search(r"([\d,]+)\s+bytes\s+(?:available|free)", output, re.IGNORECASE)
+    if free_match:
+        result["free_bytes"] = int(free_match.group(1).replace(",", ""))
 
-
-def parse_version_output(output: str):
-    ver = re.search(r"Cisco IOS.*?Version\s+([\S]+)", output)
-    plat = re.search(
-        r"^cisco\s+(\S+.*?)\s+(?:processor|memory)", output, re.MULTILINE | re.IGNORECASE
-    )
-    version = ver.group(1).rstrip(",") if ver else "unknown"
-    platform = plat.group(1).strip() if plat else "unknown"
-    return version, platform
-
-
-def parse_dram_mb(output: str) -> Optional[float]:
-    match = re.search(r"(\d+)K\s+bytes\s+of\s+(?:physical|processor)", output, re.IGNORECASE)
-    if match:
-        return int(match.group(1)) / 1024
-    return None
-
-
-def parse_flash_free_mb(dir_output: str) -> Optional[float]:
-    match = re.search(r"([\d,]+)\s+bytes\s+(?:available|free)", dir_output, re.IGNORECASE)
-    if match:
-        return int(match.group(1).replace(",", "")) / (1024 * 1024)
-    return None
-
-
-def run_preflight(
-    host: str,
-    username: str,
-    password: str,
-    target_image: Optional[str],
-    required_flash_mb: float,
-    required_dram_mb: float,
-    verify_md5: bool,
-    port: int = 22,
-    secret: str = "",
-) -> PreflightResult:
-    result = PreflightResult(host=host)
-    params = {
-        "device_type": "cisco_ios",
-        "host": host,
-        "username": username,
-        "password": password,
-        "port": port,
-        "secret": secret or password,
-        "timeout": 30,
-    }
-
-    try:
-        log.info("Connecting to %s", host)
-        with ConnectHandler(**params) as conn:
-            conn.enable()
-
-            ver_out = conn.send_command("show version")
-            result.ios_version, result.platform = parse_version_output(ver_out)
-            log.info("IOS %s on %s", result.ios_version, result.platform)
-
-            dram = parse_dram_mb(ver_out)
-            result.dram_total_mb = dram
-            if dram is None:
-                result.warnings.append("Could not parse DRAM from 'show version'")
-            elif dram < required_dram_mb:
-                result.errors.append(
-                    f"Insufficient DRAM: {dram:.0f} MB available, {required_dram_mb:.0f} MB required"
-                )
-
-            dir_out = conn.send_command("dir flash:")
-            flash_free = parse_flash_free_mb(dir_out)
-            result.flash_free_mb = flash_free
-            if flash_free is None:
-                result.warnings.append("Could not parse free flash from 'dir flash:'")
-            elif flash_free < required_flash_mb:
-                result.errors.append(
-                    f"Insufficient flash: {flash_free:.1f} MB free, {required_flash_mb:.0f} MB required"
-                )
-
-            if target_image:
-                result.image_staged = target_image.lower() in dir_out.lower()
-                if not result.image_staged:
-                    result.warnings.append(
-                        f"'{target_image}' not on flash — must be transferred before upgrade"
-                    )
-                elif verify_md5:
-                    log.info("Running MD5 verify on %s (may take ~60s)", target_image)
-                    md5_out = conn.send_command(
-                        f"verify /md5 flash:{target_image}", read_timeout=180
-                    )
-                    passed = "verified" in md5_out.lower() or bool(
-                        re.search(r"[0-9a-f]{32}", md5_out)
-                    )
-                    result.md5_verified = passed
-                    if not passed:
-                        result.errors.append(f"MD5 verification failed for {target_image}")
-                    else:
-                        log.info("MD5 OK for %s", target_image)
-
-    except AuthenticationException:
-        result.errors.append("Authentication failed")
-        log.error("Authentication failed for %s", host)
-    except NetmikoTimeoutException:
-        result.errors.append("Connection timed out")
-        log.error("Timeout connecting to %s", host)
-    except Exception as exc:
-        result.errors.append(str(exc))
-        log.exception("Unexpected error on %s", host)
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) >= 4:
+            filename = parts[-1]
+            if "." in filename and not filename.startswith("#"):
+                result["files"].append(filename)
 
     return result
 
 
-def print_report(result: PreflightResult) -> None:
-    status = "READY" if result.ready else "NOT READY"
-    sep = "=" * 56
-    print(f"\n{sep}")
-    print(f"  Pre-Upgrade Preflight Report  [{status}]")
-    print(f"  Host     : {result.host}")
-    print(sep)
-    print(f"  IOS      : {result.ios_version}")
-    print(f"  Platform : {result.platform}")
-    if result.dram_total_mb is not None:
-        print(f"  DRAM     : {result.dram_total_mb:.0f} MB")
-    if result.flash_free_mb is not None:
-        print(f"  Flash    : {result.flash_free_mb:.1f} MB free")
-    if result.image_staged:
-        md5_str = {True: "PASS", False: "FAIL", None: "skipped"}[result.md5_verified]
-        print(f"  Staged   : YES  (MD5: {md5_str})")
+def check_flash(conn, image_name: str, required_mb: int) -> dict:
+    """Run flash readiness checks and return a status dict."""
+    log.info("Fetching flash inventory...")
+    raw = conn.send_command("show flash:", read_timeout=60)
+    parsed = parse_flash_output(raw)
+
+    status = {
+        "free_bytes": parsed["free_bytes"],
+        "free_mb": None,
+        "space_ok": False,
+        "image_present": False,
+        "raw_flash": raw,
+    }
+
+    if parsed["free_bytes"] is not None:
+        status["free_mb"] = round(parsed["free_bytes"] / (1024 * 1024), 1)
+        status["space_ok"] = status["free_mb"] >= required_mb
+
+    status["image_present"] = any(image_name in f for f in parsed["files"])
+
+    return status
+
+
+def verify_md5(conn, image_name: str, expected_md5: str) -> dict:
+    """Run 'verify /md5 flash:<image>' and compare against expected hash."""
+    log.info("Running MD5 verification (this may take several minutes)...")
+    cmd = f"verify /md5 flash:{image_name}"
+    output = conn.send_command(cmd, read_timeout=300, expect_string=r"#")
+
+    match = re.search(
+        r"verify\s+/md5.*?=\s*([0-9a-fA-F]{32})", output, re.IGNORECASE | re.DOTALL
+    )
+    actual_md5 = match.group(1).lower() if match else None
+
+    return {
+        "actual_md5": actual_md5,
+        "expected_md5": expected_md5.lower(),
+        "match": actual_md5 == expected_md5.lower() if actual_md5 else False,
+        "output": output,
+    }
+
+
+def build_device(args: argparse.Namespace) -> dict:
+    return {
+        "device_type": args.device_type,
+        "host": args.device,
+        "username": args.username,
+        "password": args.password,
+        "secret": args.enable_secret or args.password,
+        "port": args.port,
+        "timeout": 30,
+    }
+
+
+def print_report(device: str, flash_status: dict, md5_result, image: str) -> bool:
+    """Print a human-readable report and return True if all checks passed."""
+    passed = True
+    print(f"\n{'='*60}")
+    print(f"Flash Pre-check Report: {device}")
+    print(f"{'='*60}")
+    print(f"  Target image : {image}")
+
+    if flash_status["free_mb"] is not None:
+        space_label = "PASS" if flash_status["space_ok"] else "FAIL"
+        print(f"  Free flash   : {flash_status['free_mb']} MB  [{space_label}]")
+        if not flash_status["space_ok"]:
+            passed = False
     else:
-        print("  Staged   : NO")
-    if result.warnings:
-        print(f"\n  Warnings ({len(result.warnings)}):")
-        for w in result.warnings:
-            print(f"    ! {w}")
-    if result.errors:
-        print(f"\n  Errors ({len(result.errors)}):")
-        for e in result.errors:
-            print(f"    x {e}")
-    print(f"{sep}\n")
+        print("  Free flash   : Unable to parse")
+        passed = False
+
+    img_label = "PRESENT" if flash_status["image_present"] else "NOT FOUND"
+    print(f"  Image file   : {img_label}")
+
+    if md5_result:
+        if md5_result["actual_md5"]:
+            md5_label = "PASS" if md5_result["match"] else "FAIL (MISMATCH)"
+            print(f"  MD5 verify   : {md5_result['actual_md5']}  [{md5_label}]")
+            if not md5_result["match"]:
+                passed = False
+        else:
+            print("  MD5 verify   : Could not extract hash from device output")
+            passed = False
+
+    overall = "READY FOR UPGRADE" if passed else "NOT READY - review failures above"
+    print(f"\n  Overall      : {overall}")
+    print(f"{'='*60}\n")
+    return passed
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Cisco IOS firmware upgrade pre-flight checker"
+        description="Verify flash space and optional image MD5 before a firmware upgrade."
     )
     parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
-    parser.add_argument("-u", "--username", required=True)
-    parser.add_argument("-p", "--password", required=True)
-    parser.add_argument("--secret", default="", help="Enable secret (defaults to password)")
-    parser.add_argument("--port", type=int, default=22)
-    parser.add_argument("--target-image", help="Target IOS image filename to check on flash")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
+    parser.add_argument("-e", "--enable-secret", help="Enable secret (defaults to password)")
+    parser.add_argument("--device-type", default="cisco_ios", help="Netmiko device type")
+    parser.add_argument("--port", type=int, default=22, help="SSH port")
+    parser.add_argument("--image", required=True, help="Target firmware image filename")
     parser.add_argument(
-        "--required-flash-mb", type=float, default=64.0,
+        "--required-mb", type=float, default=64.0,
         help="Minimum free flash required in MB (default: 64)"
     )
     parser.add_argument(
-        "--required-dram-mb", type=float, default=256.0,
-        help="Minimum DRAM required in MB (default: 256)"
+        "--verify-md5", metavar="MD5HASH",
+        help="Expected MD5 hash; triggers 'verify /md5' on device if image is present"
     )
-    parser.add_argument(
-        "--verify-md5", action="store_true",
-        help="Run on-device MD5 verify on the staged image (~60s)"
-    )
-    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show raw device output")
     args = parser.parse_args()
 
+    device_params = build_device(args)
+
+    try:
+        log.info("Connecting to %s...", args.device)
+        with ConnectHandler(**device_params) as conn:
+            conn.enable()
+            flash_status = check_flash(conn, args.image, args.required_mb)
+
+            md5_result = None
+            if args.verify_md5:
+                if flash_status["image_present"]:
+                    md5_result = verify_md5(conn, args.image, args.verify_md5)
+                else:
+                    log.warning("Image not found on flash; skipping MD5 verification.")
+
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s", args.device)
+        return 1
+    except NetmikoTimeoutException:
+        log.error("Connection timed out to %s", args.device)
+        return 1
+    except Exception as exc:
+        log.error("Unexpected error: %s", exc)
+        return 1
+
     if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+        print("\n--- Raw flash output ---")
+        print(flash_status["raw_flash"])
 
-    result = run_preflight(
-        host=args.device,
-        username=args.username,
-        password=args.password,
-        target_image=args.target_image,
-        required_flash_mb=args.required_flash_mb,
-        required_dram_mb=args.required_dram_mb,
-        verify_md5=args.verify_md5,
-        port=args.port,
-        secret=args.secret,
-    )
-
-    print_report(result)
-    sys.exit(0 if result.ready else 1)
+    all_passed = print_report(args.device, flash_status, md5_result, args.image)
+    return 0 if all_passed else 2
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 ```
+
+**`flash_precheck.py`** — a pre-upgrade flash storage readiness checker. It's distinct from `firmware_check.py`/`firmware_check_v2.py` (which compare running versions) by focusing on *storage readiness*: checks free flash space against a configurable threshold, confirms the target image file is present, and optionally runs `verify /md5` on-device to validate image integrity. Exit codes are 0 (all pass), 1 (connection error), 2 (readiness checks failed), making it CI/automation friendly.
