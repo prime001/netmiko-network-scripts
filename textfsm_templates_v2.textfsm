@@ -1,146 +1,206 @@
 ```python
+#!/usr/bin/env python3
 """
-Interface Statistics Collector
+Network Device Configuration Snapshot
 
-Collects interface performance metrics from network devices using Netmiko.
-Captures bandwidth utilization, packet counts, and error statistics for monitoring
-and capacity planning.
+Purpose:
+    Capture running configuration from network devices and save to timestamped files.
+    Supports multiple vendor devices, compression, and local versioning.
+    Useful for configuration change tracking, auditing, and disaster recovery.
 
 Usage:
-    python interface_stats_collector.py --device 192.168.1.1 --username admin \
-        --password pass123 --device-type cisco_ios
+    python3 config_snapshot.py -H 10.0.0.1 -u admin -p password \\
+        -d cisco_ios --output-dir ./configs
 
-Requirements:
-    - netmiko
-    - SSH/CLI access to devices
+Prerequisites:
+    - netmiko library installed (pip install netmiko)
+    - Network device with SSH/Telnet access
+    - Credentials with read access to running configuration
+    - Output directory must be writable
+
+Output:
+    Saves timestamped config files to specified directory.
+    Example: ./configs/10.0.0.1_20240610_143025.txt
 """
 
 import argparse
 import logging
-import sys
+import os
+import gzip
 from datetime import datetime
+from pathlib import Path
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoTimeoutException, NetmikoAuthenticationException
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+from netmiko.ssh_dispatcher import CLASS_MAP
 
 
-def collect_interface_stats(device_dict):
-    """Collect interface statistics from device."""
+def setup_logging(verbose):
+    """Configure logging output level."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        level=level
+    )
+    return logging.getLogger(__name__)
+
+
+def validate_device_type(device_type, logger):
+    """Validate device type is supported by netmiko."""
+    if device_type not in CLASS_MAP:
+        logger.error(f"Unsupported device type: {device_type}")
+        logger.info(f"Supported types: {', '.join(sorted(CLASS_MAP.keys())[:10])}...")
+        return False
+    return True
+
+
+def connect_device(host, username, password, device_type, logger):
+    """Establish connection to network device."""
     try:
-        logger.info(f"Connecting to {device_dict['host']}...")
-        net_connect = ConnectHandler(**device_dict)
-        
-        if 'cisco' in device_dict['device_type']:
-            output = net_connect.send_command('show interfaces')
-            stats = parse_interface_output(output)
-        else:
-            output = net_connect.send_command('show interfaces')
-            stats = parse_interface_output(output)
-        
-        net_connect.disconnect()
-        logger.info(f"Collected stats from {device_dict['host']}")
-        return stats
-        
-    except NetmikoTimeoutException:
-        logger.error(f"Timeout connecting to {device_dict['host']}")
-        return []
-    except NetmikoAuthenticationException:
-        logger.error(f"Authentication failed for {device_dict['host']}")
-        return []
+        logger.info(f"Connecting to {host} ({device_type})...")
+        device = ConnectHandler(
+            device_type=device_type,
+            host=host,
+            username=username,
+            password=password,
+            timeout=30,
+            read_timeout=20
+        )
+        logger.info(f"Successfully connected to {host}")
+        return device
     except Exception as e:
-        logger.error(f"Error collecting stats: {str(e)}")
-        return []
+        logger.error(f"Connection failed: {e}")
+        raise
 
 
-def parse_interface_output(output):
-    """Parse interface output and extract statistics."""
-    stats = []
-    lines = output.split('\n')
-    current_interface = None
-    
-    for line in lines:
-        if line and not line[0].isspace() and any(c in line for c in ['/', 'Ethernet']):
-            parts = line.split()
-            if parts:
-                current_interface = {
-                    'interface': parts[0],
-                    'status': parts[1] if len(parts) > 1 else 'unknown',
-                    'protocol': parts[2] if len(parts) > 2 else 'unknown',
-                    'timestamp': datetime.now().isoformat()
-                }
-                stats.append(current_interface)
+def get_running_config(device, device_type, logger):
+    """Retrieve running configuration from device."""
+    try:
+        logger.info("Retrieving running configuration...")
         
-        if current_interface and 'packets input' in line.lower():
-            try:
-                current_interface['packets_in'] = line.split()[0]
-            except (IndexError, ValueError):
-                pass
+        if 'cisco' in device_type.lower():
+            config = device.send_command('show running-config')
+        elif 'juniper' in device_type.lower():
+            config = device.send_command('show configuration')
+        elif 'arista' in device_type.lower():
+            config = device.send_command('show running-config')
+        elif 'iosxr' in device_type.lower():
+            config = device.send_command('show running-config')
+        else:
+            config = device.send_command('show running-config')
         
-        if current_interface and 'packets output' in line.lower():
-            try:
-                current_interface['packets_out'] = line.split()[0]
-            except (IndexError, ValueError):
-                pass
-    
-    return stats
+        if not config or len(config.strip()) == 0:
+            logger.warning("Retrieved empty configuration - device may not support command")
+            return None
+        
+        logger.info(f"Retrieved {len(config)} bytes of configuration")
+        return config
+        
+    except Exception as e:
+        logger.error(f"Failed to retrieve configuration: {e}")
+        raise
 
 
-def display_stats(stats, device_name):
-    """Display interface statistics."""
-    print(f"\n{'='*70}")
-    print(f"Interface Statistics - {device_name}")
-    print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'='*70}")
-    print(f"{'Interface':<15} {'Status':<10} {'Protocol':<10}")
-    print("-" * 70)
-    
-    for stat in stats:
-        intf = stat.get('interface', 'N/A')[:14]
-        status = stat.get('status', 'N/A')[:9]
-        protocol = stat.get('protocol', 'N/A')[:9]
-        print(f"{intf:<15} {status:<10} {protocol:<10}")
-    
-    print(f"\nTotal interfaces: {len(stats)}")
+def save_config(config, host, output_dir, compress=False, logger=None):
+    """Save configuration to timestamped file."""
+    try:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"{host}_{timestamp}.txt"
+        filepath = os.path.join(output_dir, filename)
+        
+        if compress:
+            filepath += '.gz'
+            with gzip.open(filepath, 'wt', encoding='utf-8') as f:
+                f.write(config)
+        else:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(config)
+        
+        file_size = os.path.getsize(filepath)
+        
+        if logger:
+            logger.info(f"Configuration saved to {filepath} ({file_size} bytes)")
+        
+        return filepath
+        
+    except Exception as e:
+        if logger:
+            logger.error(f"Failed to save configuration: {e}")
+        raise
+
+
+def get_device_info(device, device_type, logger):
+    """Log basic device identification information."""
+    try:
+        if 'cisco' in device_type.lower():
+            output = device.send_command('show version', read_timeout=10)
+            for line in output.split('\n')[:3]:
+                if line.strip() and ('Version' in line or 'Cisco' in line):
+                    logger.info(f"Device info: {line.strip()[:80]}")
+                    break
+    except Exception:
+        logger.debug("Could not retrieve device version info")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Collect interface statistics from network devices'
+        description='Snapshot network device running configuration',
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument('--device', required=True, help='Device IP or hostname')
-    parser.add_argument('--username', required=True, help='SSH username')
-    parser.add_argument('--password', required=True, help='SSH password')
-    parser.add_argument('--device-type', default='cisco_ios',
-                        help='Device type (cisco_ios, juniper_junos, arista_eos)')
-    parser.add_argument('--port', type=int, default=22, help='SSH port')
-    parser.add_argument('--timeout', type=int, default=30, help='Timeout in seconds')
+    parser.add_argument('-H', '--host', required=True, metavar='HOST',
+                       help='Device hostname or IP address')
+    parser.add_argument('-u', '--username', required=True, metavar='USER',
+                       help='SSH/Telnet username')
+    parser.add_argument('-p', '--password', required=True, metavar='PASS',
+                       help='SSH/Telnet password')
+    parser.add_argument('-d', '--device-type', default='cisco_ios', metavar='TYPE',
+                       help='Device type (default: cisco_ios)')
+    parser.add_argument('--output-dir', default='./configs', metavar='DIR',
+                       help='Output directory for config snapshots (default: ./configs)')
+    parser.add_argument('--compress', action='store_true',
+                       help='Compress output with gzip compression')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                       help='Enable verbose debug logging')
     
     args = parser.parse_args()
+    logger = setup_logging(args.verbose)
     
-    device_dict = {
-        'device_type': args.device_type,
-        'host': args.device,
-        'username': args.username,
-        'password': args.password,
-        'port': args.port,
-        'timeout': args.timeout,
-    }
+    if not validate_device_type(args.device_type, logger):
+        return 1
     
-    stats = collect_interface_stats(device_dict)
-    
-    if stats:
-        display_stats(stats, args.device)
+    try:
+        device = connect_device(
+            args.host,
+            args.username,
+            args.password,
+            args.device_type,
+            logger
+        )
+        
+        get_device_info(device, args.device_type, logger)
+        config = get_running_config(device, args.device_type, logger)
+        device.disconnect()
+        
+        if config is None:
+            logger.error("No configuration retrieved from device")
+            return 1
+        
+        filepath = save_config(
+            config,
+            args.host,
+            args.output_dir,
+            compress=args.compress,
+            logger=logger
+        )
+        
+        logger.info(f"Configuration snapshot completed: {filepath}")
         return 0
-    else:
-        logger.error("No interface statistics collected")
+        
+    except Exception as e:
+        logger.error(f"Snapshot operation failed: {e}")
         return 1
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    exit(main())
 ```
