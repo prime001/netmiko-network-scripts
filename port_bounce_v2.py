@@ -1,199 +1,190 @@
-The script is ready. Here's the content (copy/paste it as `mac_table_search.py`):
-
 ```python
 """
-mac_table_search.py - Search MAC address tables to locate a device on the network.
+mac_to_port.py - MAC Address to Switch Port Mapper
 
-Purpose:
-    Connects to one or more Cisco IOS/IOS-XE switches and searches the MAC address
-    table for a specific MAC address, or dumps the full table for auditing. Useful
-    for quickly pinpointing which port and VLAN a device is connected to during
-    troubleshooting, moves/adds/changes, or security investigations.
+Queries the MAC address table on a Cisco switch to identify which port(s)
+a given MAC address is learned on. Useful for locating rogue devices,
+troubleshooting connectivity, and documenting endpoint locations.
 
 Usage:
-    # Search a single switch for a specific MAC
-    python mac_table_search.py --host 10.0.0.1 --username admin --mac 00:1a:2b:3c:4d:5e
-
-    # Search multiple switches listed in a file
-    python mac_table_search.py --hosts-file switches.txt --username admin --mac aabb.cc00.1122
-
-    # Dump the full MAC table from a switch
-    python mac_table_search.py --host 10.0.0.1 --username admin --all
+    python mac_to_port.py -d 192.168.1.1 -u admin -p secret -m aa:bb:cc:dd:ee:ff
+    python mac_to_port.py -d 192.168.1.1 -u admin -p secret -m aabb.ccdd.eeff 0011.2233.4455
+    python mac_to_port.py -d 192.168.1.1 -u admin -p secret --all --vlan 100
 
 Prerequisites:
     pip install netmiko
-    Cisco IOS or IOS-XE device with SSH enabled and credentials that can run
-    'show mac address-table'.
+    Device must support: show mac address-table
+    Tested against: Cisco IOS, IOS-XE
 """
 
 import argparse
-import getpass
 import logging
 import re
 import sys
 from typing import Optional
 
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
-
+from netmiko.exceptions import AuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
-    level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
 def normalize_mac(mac: str) -> str:
-    """Return 12-char lowercase hex string for any common MAC delimiter format."""
-    clean = re.sub(r"[:\-\.]", "", mac).lower()
-    if len(clean) != 12 or not re.fullmatch(r"[0-9a-f]{12}", clean):
-        raise ValueError(f"Invalid MAC address: {mac!r}")
-    return clean
+    """Normalize MAC to cisco dotted-quad format (xxxx.xxxx.xxxx)."""
+    cleaned = re.sub(r"[.:\-]", "", mac.lower())
+    if len(cleaned) != 12:
+        raise ValueError(f"Invalid MAC address: {mac}")
+    return f"{cleaned[0:4]}.{cleaned[4:8]}.{cleaned[8:12]}"
 
 
-def to_cisco_mac(mac: str) -> str:
-    """Convert normalized MAC to Cisco dotted-quad notation (aabb.ccdd.eeff)."""
-    n = normalize_mac(mac)
-    return f"{n[0:4]}.{n[4:8]}.{n[8:12]}"
-
-
-def parse_mac_table(output: str) -> list:
-    """
-    Parse 'show mac address-table' output into a list of dicts.
-    Handles both IOS and IOS-XE column formats.
-    """
+def parse_mac_table(output: str) -> list[dict]:
+    """Parse 'show mac address-table' output into a list of entry dicts."""
     entries = []
+    # Matches lines like: 100  aabb.ccdd.eeff  DYNAMIC  Gi1/0/1
     pattern = re.compile(
-        r"^\s*(\d+|-)\s+"
-        r"([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+"
+        r"^\s*(\d+)\s+"
+        r"([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+"
         r"(\S+)\s+"
         r"(\S+)",
-        re.MULTILINE,
+        re.IGNORECASE | re.MULTILINE,
     )
     for match in pattern.finditer(output):
-        vlan, mac, entry_type, interface = match.groups()
-        entries.append({
-            "vlan": vlan,
-            "mac": mac.lower(),
-            "type": entry_type,
-            "interface": interface,
-        })
+        entries.append(
+            {
+                "vlan": match.group(1),
+                "mac": match.group(2).lower(),
+                "type": match.group(3),
+                "interface": match.group(4),
+            }
+        )
     return entries
 
 
-def query_device(
-    host: str,
-    username: str,
-    password: str,
-    target_mac: Optional[str],
-    device_type: str,
-) -> tuple:
-    params = {
-        "device_type": device_type,
-        "host": host,
-        "username": username,
-        "password": password,
-        "timeout": 30,
-    }
-    try:
-        with ConnectHandler(**params) as conn:
-            if target_mac:
-                cmd = f"show mac address-table address {to_cisco_mac(target_mac)}"
-            else:
-                cmd = "show mac address-table"
-            output = conn.send_command(cmd, read_timeout=30)
-    except NetmikoAuthenticationException:
-        logger.error("%s: authentication failed", host)
-        return host, []
-    except NetmikoTimeoutException:
-        logger.error("%s: connection timed out", host)
-        return host, []
-    except Exception as exc:
-        logger.error("%s: %s", host, exc)
-        return host, []
+def lookup_macs(
+    connection,
+    macs: list[str],
+    vlan_filter: Optional[str],
+) -> dict[str, Optional[dict]]:
+    """Return a mapping of normalized MAC -> entry (or None if not found)."""
+    results = {}
+    normalized = {}
+    for raw in macs:
+        try:
+            norm = normalize_mac(raw)
+            normalized[norm] = raw
+            results[norm] = None
+        except ValueError as exc:
+            log.error(exc)
 
+    if not normalized:
+        return results
+
+    log.info("Fetching MAC address table...")
+    output = connection.send_command("show mac address-table")
     entries = parse_mac_table(output)
-    if target_mac:
-        norm = normalize_mac(target_mac)
-        entries = [e for e in entries if normalize_mac(e["mac"]) == norm]
-    return host, entries
+
+    for entry in entries:
+        if entry["mac"] in results:
+            if vlan_filter and entry["vlan"] != vlan_filter:
+                continue
+            results[entry["mac"]] = entry
+
+    return results
 
 
-def load_hosts(path: str) -> list:
-    with open(path) as fh:
-        return [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
+def dump_all_entries(connection, vlan_filter: Optional[str]) -> list[dict]:
+    """Return all MAC table entries, optionally filtered by VLAN."""
+    cmd = f"show mac address-table vlan {vlan_filter}" if vlan_filter else "show mac address-table"
+    log.info("Fetching full MAC address table...")
+    output = connection.send_command(cmd)
+    return parse_mac_table(output)
 
 
-def print_results(host: str, entries: list) -> None:
-    count = len(entries)
-    print(f"\n{'='*64}")
-    print(f"Host: {host}  ({count} entr{'y' if count == 1 else 'ies'})")
-    print(f"{'VLAN':<8}{'MAC':<20}{'Type':<12}Interface")
-    print(f"{'-'*8}{'-'*20}{'-'*12}{'-'*20}")
-    for e in entries:
-        print(f"{e['vlan']:<8}{e['mac']:<20}{e['type']:<12}{e['interface']}")
+def build_device_params(args: argparse.Namespace) -> dict:
+    return {
+        "device_type": args.device_type,
+        "host": args.device,
+        "username": args.username,
+        "password": args.password,
+        "port": args.port,
+        "conn_timeout": args.timeout,
+    }
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Search MAC address tables on Cisco IOS/IOS-XE switches.",
+        description="Map MAC addresses to switch ports via netmiko"
     )
-    target_group = parser.add_mutually_exclusive_group(required=True)
-    target_group.add_argument("--host", help="Single device IP or hostname")
-    target_group.add_argument("--hosts-file", metavar="FILE",
-                              help="Text file with one host per line")
-
-    parser.add_argument("--username", required=True)
-    parser.add_argument("--password", help="SSH password (prompted if omitted)")
-
-    search_group = parser.add_mutually_exclusive_group(required=True)
-    search_group.add_argument("--mac", metavar="MAC",
-                              help="MAC address to locate (any delimiter format)")
-    search_group.add_argument("--all", action="store_true",
-                              help="Dump complete MAC address table")
-
-    parser.add_argument("--device-type", default="cisco_ios",
-                        help="Netmiko device type (default: cisco_ios)")
-    parser.add_argument("--verbose", "-v", action="store_true",
-                        help="Enable debug-level logging")
-
+    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
+    parser.add_argument(
+        "-m", "--macs", nargs="+", metavar="MAC",
+        help="One or more MAC addresses to look up (any common format)"
+    )
+    parser.add_argument("--all", action="store_true", help="Dump entire MAC table")
+    parser.add_argument("--vlan", metavar="VLAN_ID", help="Filter results to this VLAN")
+    parser.add_argument(
+        "--device-type", default="cisco_ios",
+        help="Netmiko device type (default: cisco_ios)"
+    )
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--timeout", type=int, default=15, help="Connection timeout seconds")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
+
+    if not args.macs and not args.all:
+        parser.error("Provide --macs <MAC...> or --all")
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    if args.mac:
-        try:
-            normalize_mac(args.mac)
-        except ValueError as exc:
-            parser.error(str(exc))
+    params = build_device_params(args)
 
-    password = args.password or getpass.getpass(f"Password for {args.username}: ")
-    hosts = [args.host] if args.host else load_hosts(args.hosts_file)
+    try:
+        log.info("Connecting to %s...", args.device)
+        with ConnectHandler(**params) as conn:
+            if args.all:
+                entries = dump_all_entries(conn, args.vlan)
+                if not entries:
+                    log.warning("No entries found%s", f" in VLAN {args.vlan}" if args.vlan else "")
+                    return 0
+                print(f"\n{'VLAN':<6} {'MAC':<18} {'Type':<12} {'Interface'}")
+                print("-" * 56)
+                for e in entries:
+                    print(f"{e['vlan']:<6} {e['mac']:<18} {e['type']:<12} {e['interface']}")
+                print(f"\nTotal entries: {len(entries)}")
+            else:
+                results = lookup_macs(conn, args.macs, args.vlan)
+                print(f"\n{'MAC':<18} {'VLAN':<6} {'Interface':<20} {'Type'}")
+                print("-" * 60)
+                found = 0
+                for mac, entry in results.items():
+                    if entry:
+                        print(f"{mac:<18} {entry['vlan']:<6} {entry['interface']:<20} {entry['type']}")
+                        found += 1
+                    else:
+                        print(f"{mac:<18} {'NOT FOUND'}")
+                print(f"\nFound {found}/{len(results)} MAC(s)")
 
-    found_any = False
-    for host in hosts:
-        host, entries = query_device(
-            host=host,
-            username=args.username,
-            password=password,
-            target_mac=args.mac if not args.all else None,
-            device_type=args.device_type,
-        )
-        if entries:
-            found_any = True
-            print_results(host, entries)
-        else:
-            status = "not found" if args.mac else "no entries returned"
-            print(f"{host}: {status}")
+    except AuthenticationException:
+        log.error("Authentication failed for user '%s' on %s", args.username, args.device)
+        return 1
+    except NetmikoTimeoutException:
+        log.error("Connection to %s timed out after %ds", args.device, args.timeout)
+        return 1
+    except Exception as exc:
+        log.error("Unexpected error: %s", exc)
+        return 1
 
-    if args.mac and not found_any:
-        sys.exit(1)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 ```
-
-**What this does:** Searches MAC address tables on Cisco IOS/IOS-XE switches — either hunting for a specific MAC across one or many devices, or dumping the full table. Common real-world task (finding rogue devices, tracing a workstation to its switchport, auditing VLAN membership). Accepts MACs in any delimiter format (`00:1a:2b`, `aabb.cc00`, `001a2b3c4d5e`) and normalizes before comparing.
