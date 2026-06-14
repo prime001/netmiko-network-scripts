@@ -1,213 +1,210 @@
-BGP Session Monitor — netmiko network automation script.
+```python
+"""
+vlan_audit.py - VLAN configuration audit for Cisco IOS/IOS-XE switches.
 
 Purpose:
-    Connect to a router and audit BGP neighbor sessions. Reports session
-    state, uptime, and received prefix counts. Flags any neighbor not in
-    Established state and optionally alerts when prefix counts fall below
-    a configurable threshold.
+    Connects to a network device and audits VLAN configuration, identifying:
+    - VLANs defined but carrying no access ports and absent from all trunks
+    - VLANs present on access ports but missing from every trunk (isolation risk)
+    - Summary of trunk interfaces and their active VLAN counts
 
 Usage:
-    python bgp_monitor.py -d 192.168.1.1 -u admin -p secret
-    python bgp_monitor.py -d 10.0.0.1 -u admin --device-type cisco_ios_xe
-    python bgp_monitor.py -d 10.0.0.1 -u admin --prefix-threshold 100 --json
+    python vlan_audit.py -d 192.168.1.1 -u admin -p secret
+    python vlan_audit.py -d 192.168.1.1 -u admin -p secret --unused-only
+    python vlan_audit.py -d 192.168.1.1 -u admin -p secret --output report.txt
 
 Prerequisites:
     pip install netmiko
-    SSH access to a router with BGP configured.
-    Supported device types: cisco_ios, cisco_ios_xe, cisco_xr, cisco_nxos
+    Tested against Cisco IOS 15.x and IOS-XE 16.x/17.x.
 """
 
 import argparse
-import getpass
-import json
 import logging
-import re
 import sys
-from dataclasses import asdict, dataclass
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Set
 
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
-logger = logging.getLogger(__name__)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+# IOS internal VLANs that are always present and not meaningful to audit
+_SKIP_VLANS = {"1002", "1003", "1004", "1005"}
 
 
 @dataclass
-class BgpNeighbor:
-    neighbor: str
-    as_number: str
-    state: str
-    uptime: str
-    prefixes_received: int
-    msg_received: int
-    msg_sent: int
+class VlanInfo:
+    vlan_id: str
+    name: str
+    status: str
+    ports: List[str] = field(default_factory=list)
 
 
-def parse_bgp_summary(output: str) -> List[BgpNeighbor]:
-    """Parse IOS/IOS-XE/NX-OS 'show bgp summary' neighbor table lines."""
-    neighbors = []
-    # Matches: neighbor, version, AS, MsgRcvd, MsgSent, TblVer, InQ, OutQ, Up/Down, State/PfxRcd
-    pattern = re.compile(
-        r'^(\d+\.\d+\.\d+\.\d+|[0-9a-fA-F:]+)\s+'
-        r'\d+\s+'
-        r'(\d+)\s+'
-        r'(\d+)\s+'
-        r'(\d+)\s+'
-        r'\d+\s+\d+\s+\d+\s+'
-        r'(\S+)\s+'
-        r'(\S+)',
-        re.MULTILINE,
-    )
-    for m in pattern.finditer(output):
-        neighbor_ip, asn, msg_rcvd, msg_sent, uptime, state_or_pfx = m.groups()
-        try:
-            pfx = int(state_or_pfx)
-            state = "Established"
-        except ValueError:
-            pfx = 0
-            state = state_or_pfx
+def expand_vlan_range(vlan_str: str) -> Set[str]:
+    """Convert '1,10-12,20' -> {'1', '10', '11', '12', '20'}."""
+    result: Set[str] = set()
+    if not vlan_str or vlan_str in ("none", "all"):
+        return result
+    for part in vlan_str.split(","):
+        part = part.strip()
+        if "-" in part:
+            try:
+                lo, hi = part.split("-", 1)
+                result.update(str(v) for v in range(int(lo), int(hi) + 1))
+            except ValueError:
+                pass
+        elif part.isdigit():
+            result.add(part)
+    return result
 
-        neighbors.append(
-            BgpNeighbor(
-                neighbor=neighbor_ip,
-                as_number=asn,
-                state=state,
-                uptime=uptime,
-                prefixes_received=pfx,
-                msg_received=int(msg_rcvd),
-                msg_sent=int(msg_sent),
-            )
+
+def parse_vlan_brief(output: str) -> Dict[str, VlanInfo]:
+    vlans: Dict[str, VlanInfo] = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if not parts or not parts[0].isdigit():
+            continue
+        vlan_id = parts[0]
+        name = parts[1] if len(parts) > 1 else ""
+        status = parts[2] if len(parts) > 2 else ""
+        ports = [p.rstrip(",") for p in parts[3:]]
+        vlans[vlan_id] = VlanInfo(vlan_id=vlan_id, name=name, status=status, ports=ports)
+    return vlans
+
+
+def parse_trunk_active_vlans(output: str) -> Dict[str, Set[str]]:
+    """Parse 'show interfaces trunk', returning {interface: active_vlan_set}."""
+    trunks: Dict[str, Set[str]] = {}
+    in_active = False
+
+    for line in output.splitlines():
+        if "Vlans allowed and active" in line:
+            in_active = True
+            continue
+        if in_active:
+            if line.startswith("Port") and "Vlans" in line:
+                in_active = False
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) >= 2 and not parts[0].startswith("Port"):
+                trunks[parts[0]] = expand_vlan_range(parts[1])
+
+    return trunks
+
+
+def run_audit(conn, unused_only: bool) -> str:
+    log.info("Fetching VLAN brief...")
+    vlans = parse_vlan_brief(conn.send_command("show vlan brief"))
+
+    log.info("Fetching trunk interfaces...")
+    trunks = parse_trunk_active_vlans(conn.send_command("show interfaces trunk"))
+
+    trunk_vlans: Set[str] = set().union(*trunks.values()) if trunks else set()
+
+    lines: List[str] = []
+    lines.append(f"\n{'=' * 60}")
+    lines.append(f"VLAN AUDIT REPORT  —  {conn.host}")
+    lines.append(f"{'=' * 60}")
+    lines.append(f"VLANs defined : {len(vlans)}")
+    lines.append(f"Trunk ports   : {len(trunks)}")
+    lines.append("")
+
+    if not unused_only:
+        lines.append("Trunk Interfaces")
+        lines.append("-" * 40)
+        if trunks:
+            for iface, vids in sorted(trunks.items()):
+                lines.append(f"  {iface:<22} {len(vids):>4} active VLANs")
+        else:
+            lines.append("  No trunks found.")
+        lines.append("")
+
+    fully_unused = [
+        v for vid, v in vlans.items()
+        if not v.ports and vid not in trunk_vlans and vid not in _SKIP_VLANS
+    ]
+    lines.append(f"VLANs with no access ports and absent from all trunks: {len(fully_unused)}")
+    lines.append("-" * 40)
+    for v in sorted(fully_unused, key=lambda x: int(x.vlan_id)):
+        lines.append(f"  VLAN {v.vlan_id:>4}  {v.name:<32}  [{v.status}]")
+    if not fully_unused:
+        lines.append("  None.")
+    lines.append("")
+
+    if not unused_only:
+        access_only = [
+            v for vid, v in vlans.items()
+            if v.ports and vid not in trunk_vlans and vid not in _SKIP_VLANS
+        ]
+        lines.append(
+            f"VLANs with access ports but absent from all trunks: {len(access_only)}"
         )
-    return neighbors
+        lines.append("-" * 40)
+        for v in sorted(access_only, key=lambda x: int(x.vlan_id)):
+            preview = ", ".join(v.ports[:4]) + (" ..." if len(v.ports) > 4 else "")
+            lines.append(f"  VLAN {v.vlan_id:>4}  {v.name:<32}  ports: {preview}")
+        if not access_only:
+            lines.append("  None.")
+        lines.append("")
 
-
-def collect_bgp_output(connection, device_type: str) -> str:
-    commands = {
-        "cisco_xr": "show bgp summary",
-        "cisco_ios": "show bgp ipv4 unicast summary",
-        "cisco_ios_xe": "show bgp ipv4 unicast summary",
-        "cisco_nxos": "show bgp ipv4 unicast summary",
-    }
-    cmd = commands.get(device_type, "show bgp summary")
-    logger.info("Running: %s", cmd)
-    return connection.send_command(cmd)
-
-
-def print_report(neighbors: List[BgpNeighbor], threshold: Optional[int]) -> None:
-    header = (
-        f"{'Neighbor':<22} {'AS':<8} {'State':<14} {'Uptime':<12}"
-        f" {'Pfx Rcvd':>9} {'Msg Rcvd':>9} {'Msg Sent':>9}"
-    )
-    print(header)
-    print("-" * len(header))
-
-    alerts = []
-    for n in neighbors:
-        flag = ""
-        if n.state != "Established":
-            flag = " (!)"
-            alerts.append(f"Session DOWN: {n.neighbor} AS{n.as_number} state={n.state}")
-        elif threshold is not None and n.prefixes_received < threshold:
-            flag = " (!)"
-            alerts.append(
-                f"Low prefixes: {n.neighbor} AS{n.as_number}"
-                f" received={n.prefixes_received} threshold={threshold}"
-            )
-        print(
-            f"{n.neighbor:<22} {n.as_number:<8} {n.state:<14} {n.uptime:<12}"
-            f" {n.prefixes_received:>9} {n.msg_received:>9} {n.msg_sent:>9}{flag}"
-        )
-
-    if alerts:
-        print("\nALERTS:")
-        for alert in alerts:
-            print(f"  * {alert}")
-    else:
-        print("\nAll BGP sessions OK.")
+    return "\n".join(lines)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Audit BGP neighbor sessions on a router via SSH."
+        description="Audit VLAN configuration on a Cisco IOS/IOS-XE switch."
     )
-    parser.add_argument("-d", "--device", required=True, help="Device hostname or IP")
+    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
     parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", help="SSH password (prompted if omitted)")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
     parser.add_argument(
-        "--device-type",
-        default="cisco_ios",
-        choices=["cisco_ios", "cisco_ios_xe", "cisco_xr", "cisco_nxos"],
+        "--device-type", default="cisco_ios",
         help="Netmiko device type (default: cisco_ios)",
     )
     parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
     parser.add_argument(
-        "--prefix-threshold",
-        type=int,
-        metavar="N",
-        help="Alert when received prefix count falls below N",
+        "--unused-only", action="store_true",
+        help="Report only VLANs with no ports and not on any trunk",
     )
-    parser.add_argument(
-        "--json", action="store_true", dest="json_output", help="Output results as JSON"
-    )
-    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument("--output", metavar="FILE", help="Write report to FILE")
     args = parser.parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    password = args.password or getpass.getpass(
-        f"Password for {args.username}@{args.device}: "
-    )
 
     device_params = {
         "device_type": args.device_type,
         "host": args.device,
         "username": args.username,
-        "password": password,
+        "password": args.password,
         "port": args.port,
     }
 
     try:
-        logger.info("Connecting to %s", args.device)
+        log.info(f"Connecting to {args.device}...")
         with ConnectHandler(**device_params) as conn:
-            raw_output = collect_bgp_output(conn, args.device_type)
+            report = run_audit(conn, args.unused_only)
     except NetmikoAuthenticationException:
-        print(f"ERROR: Authentication failed for {args.username}@{args.device}", file=sys.stderr)
+        log.error("Authentication failed — check credentials.")
         sys.exit(1)
     except NetmikoTimeoutException:
-        print(f"ERROR: Connection timed out to {args.device}", file=sys.stderr)
+        log.error(f"Connection timed out to {args.device}.")
         sys.exit(1)
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        log.error(f"Unexpected error: {exc}")
         sys.exit(1)
 
-    neighbors = parse_bgp_summary(raw_output)
+    print(report)
 
-    if not neighbors:
-        print("No BGP neighbors found or output could not be parsed.", file=sys.stderr)
-        print("Raw output:\n", raw_output, file=sys.stderr)
-        sys.exit(2)
-
-    if args.json_output:
-        result = {
-            "device": args.device,
-            "neighbor_count": len(neighbors),
-            "neighbors": [asdict(n) for n in neighbors],
-        }
-        print(json.dumps(result, indent=2))
-    else:
-        print(f"\nBGP Summary — {args.device}\n")
-        print_report(neighbors, args.prefix_threshold)
-
-    # Exit 3 signals monitoring systems that actionable sessions were found
-    non_established = [n for n in neighbors if n.state != "Established"]
-    if non_established:
-        sys.exit(3)
+    if args.output:
+        with open(args.output, "w") as fh:
+            fh.write(report + "\n")
+        log.info(f"Report saved to {args.output}")
 
 
 if __name__ == "__main__":
     main()
+```
