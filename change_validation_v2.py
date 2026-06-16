@@ -1,177 +1,181 @@
-acl_validator.py - Post-change ACL compliance checker for Cisco IOS/IOS-XE.
+```python
+"""
+config_compliance.py — Configuration compliance auditor for network devices.
 
-Purpose:
-    Connects to a network device via SSH and verifies that specified ACL entries
-    are present in the named access list. Designed for post-change validation
-    during change windows to confirm ACL edits were applied correctly.
+Connects to a device via netmiko, pulls the running configuration, and checks
+it against a set of user-defined compliance rules (regex-based). Each rule
+reports PASS or FAIL with optional remediation hints.
 
 Usage:
-    python acl_validator.py --host 192.168.1.1 -u admin -p secret \
-        --acl MGMT-ACCESS --rules rules.json
+    python config_compliance.py -d 192.168.1.1 -u admin -p secret \
+        --device-type cisco_ios --rules-file compliance_rules.json
 
-    python acl_validator.py --host 10.0.0.1 -u netops \
-        --acl WAN-FILTER \
-        --check-entry "permit tcp 10.0.0.0 0.0.0.255 any eq 443" \
-        --check-entry "deny ip any any log" \
-        --output results.json
+    python config_compliance.py -d 192.168.1.1 -u admin -p secret \
+        --device-type cisco_ios --builtin-rules cis_ios
 
 Prerequisites:
     pip install netmiko
-    Cisco IOS / IOS-XE device reachable via SSH
-
-Rules file format (rules.json):
-    ["permit tcp 10.1.0.0 0.0.0.255 any eq 443", "deny ip any any log"]
-
-    Each string is matched as a case-insensitive substring against ACL output.
-    Exit code 0 = all entries present; 1 = one or more missing.
 """
 
 import argparse
 import json
 import logging
+import re
 import sys
-from getpass import getpass
+from dataclasses import dataclass, field
+from typing import Optional
 
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
     level=logging.INFO,
 )
 log = logging.getLogger(__name__)
 
+BUILTIN_RULESETS = {
+    "cis_ios": [
+        {"name": "SSH version 2", "pattern": r"ip ssh version 2", "required": True,
+         "hint": "Add: ip ssh version 2"},
+        {"name": "Password encryption", "pattern": r"service password-encryption", "required": True,
+         "hint": "Add: service password-encryption"},
+        {"name": "No Telnet on VTY", "pattern": r"transport input telnet\b", "required": False,
+         "hint": "Replace 'transport input telnet' with 'transport input ssh'"},
+        {"name": "Login banner", "pattern": r"banner (motd|login)", "required": True,
+         "hint": "Configure a login/motd banner"},
+        {"name": "No default SNMP community", "pattern": r"snmp-server community (public|private)\b",
+         "required": False, "hint": "Remove default SNMP community strings"},
+        {"name": "AAA new-model", "pattern": r"aaa new-model", "required": True,
+         "hint": "Add: aaa new-model"},
+        {"name": "Exec timeout on VTY", "pattern": r"exec-timeout [1-9]", "required": True,
+         "hint": "Set exec-timeout on VTY lines (e.g. exec-timeout 10 0)"},
+        {"name": "No IP source route", "pattern": r"no ip source-route", "required": True,
+         "hint": "Add: no ip source-route"},
+        {"name": "No IP finger", "pattern": r"no ip finger", "required": True,
+         "hint": "Add: no ip finger"},
+    ]
+}
 
-def fetch_acl(connection, acl_name):
-    output = connection.send_command(f"show ip access-lists {acl_name}")
-    if "does not exist" in output or "Invalid input" in output:
-        return None, output.strip()
-    return output, None
+
+@dataclass
+class RuleResult:
+    name: str
+    passed: bool
+    hint: Optional[str] = None
 
 
-def validate_entries(acl_output, expected_entries):
-    lines = [line.strip().lower() for line in acl_output.splitlines() if line.strip()]
+@dataclass
+class AuditReport:
+    device: str
+    results: list[RuleResult] = field(default_factory=list)
+
+    @property
+    def passed(self) -> int:
+        return sum(1 for r in self.results if r.passed)
+
+    @property
+    def failed(self) -> int:
+        return sum(1 for r in self.results if not r.passed)
+
+    def print_summary(self) -> None:
+        total = len(self.results)
+        print(f"\n{'='*60}")
+        print(f"Compliance Report: {self.device}")
+        print(f"{'='*60}")
+        for r in self.results:
+            status = "PASS" if r.passed else "FAIL"
+            indicator = "+" if r.passed else "-"
+            print(f"  [{indicator}] {status:<5}  {r.name}")
+            if not r.passed and r.hint:
+                print(f"          Remediation: {r.hint}")
+        print(f"{'='*60}")
+        print(f"  Result: {self.passed}/{total} checks passed", end="  ")
+        print("COMPLIANT" if self.failed == 0 else f"NON-COMPLIANT ({self.failed} failure(s))")
+        print(f"{'='*60}\n")
+
+
+def load_rules(rules_file: Optional[str], builtin: Optional[str]) -> list[dict]:
+    if rules_file:
+        with open(rules_file) as f:
+            return json.load(f)
+    if builtin:
+        if builtin not in BUILTIN_RULESETS:
+            log.error("Unknown builtin ruleset '%s'. Available: %s", builtin, list(BUILTIN_RULESETS))
+            sys.exit(1)
+        return BUILTIN_RULESETS[builtin]
+    log.error("Provide --rules-file or --builtin-rules")
+    sys.exit(1)
+
+
+def audit_config(config: str, rules: list[dict]) -> list[RuleResult]:
     results = []
-    for entry in expected_entries:
-        matched = any(entry.lower().strip() in line for line in lines)
-        results.append({
-            "entry": entry,
-            "present": matched,
-            "status": "PASS" if matched else "FAIL",
-        })
+    for rule in rules:
+        match = bool(re.search(rule["pattern"], config, re.IGNORECASE | re.MULTILINE))
+        passed = match if rule.get("required", True) else not match
+        results.append(RuleResult(name=rule["name"], passed=passed, hint=rule.get("hint")))
     return results
 
 
-def build_parser():
-    parser = argparse.ArgumentParser(
-        description="Validate ACL entries on a Cisco IOS/IOS-XE device."
-    )
-    parser.add_argument("--host", required=True, help="Device IP or hostname")
-    parser.add_argument("--username", "-u", required=True, help="SSH username")
-    parser.add_argument(
-        "--password", "-p", default=None, help="SSH password (prompted if omitted)"
-    )
-    parser.add_argument(
-        "--device-type", default="cisco_ios",
-        help="Netmiko device type (default: cisco_ios)"
-    )
-    parser.add_argument("--acl", required=True, help="ACL name to inspect")
-    parser.add_argument(
-        "--rules", metavar="FILE",
-        help="JSON file with list of expected ACL entry substrings"
-    )
-    parser.add_argument(
-        "--check-entry", metavar="ENTRY", action="append", dest="inline_entries",
-        help="Expected ACL entry substring (repeatable; combined with --rules)"
-    )
-    parser.add_argument(
-        "--output", metavar="FILE", help="Write JSON results to this file"
-    )
-    parser.add_argument("--verbose", "-v", action="store_true")
-    return parser
-
-
-def main():
-    parser = build_parser()
-    args = parser.parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    password = args.password or getpass(f"Password for {args.username}@{args.host}: ")
-
-    expected = list(args.inline_entries or [])
-    if args.rules:
-        try:
-            with open(args.rules) as fh:
-                file_rules = json.load(fh)
-            if not isinstance(file_rules, list):
-                log.error("Rules file must contain a JSON array of strings.")
-                sys.exit(1)
-            expected.extend(file_rules)
-        except (OSError, json.JSONDecodeError) as exc:
-            log.error("Failed to load rules file: %s", exc)
-            sys.exit(1)
-
-    if not expected:
-        log.error("No entries to validate. Use --rules or --check-entry.")
-        sys.exit(1)
-
-    device = {
+def connect_and_audit(args) -> AuditReport:
+    device_params = {
         "device_type": args.device_type,
-        "host": args.host,
+        "host": args.device,
         "username": args.username,
-        "password": password,
+        "password": args.password,
+        "port": args.port,
+        "timeout": args.timeout,
     }
+    if args.enable_secret:
+        device_params["secret"] = args.enable_secret
 
-    log.info("Connecting to %s ...", args.host)
+    log.info("Connecting to %s (%s)", args.device, args.device_type)
     try:
-        with ConnectHandler(**device) as conn:
-            log.info("Fetching ACL '%s' ...", args.acl)
-            acl_output, error = fetch_acl(conn, args.acl)
+        with ConnectHandler(**device_params) as conn:
+            if args.enable_secret:
+                conn.enable()
+            log.info("Fetching running configuration...")
+            config = conn.send_command("show running-config", read_timeout=60)
     except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.host)
-        sys.exit(1)
+        log.error("Authentication failed for %s", args.device)
+        sys.exit(2)
     except NetmikoTimeoutException:
-        log.error("Connection to %s timed out.", args.host)
-        sys.exit(1)
+        log.error("Connection timed out to %s", args.device)
+        sys.exit(3)
 
-    if error:
-        log.error("ACL '%s' not found on %s:\n%s", args.acl, args.host, error)
-        sys.exit(1)
+    rules = load_rules(args.rules_file, args.builtin_rules)
+    log.info("Evaluating %d compliance rules...", len(rules))
+    results = audit_config(config, rules)
 
-    if args.verbose:
-        log.debug("Raw ACL output:\n%s", acl_output)
+    report = AuditReport(device=args.device, results=results)
+    return report
 
-    results = validate_entries(acl_output, expected)
-    passed = sum(1 for r in results if r["present"])
-    failed = len(results) - passed
 
-    print(f"\nACL Validation: {args.acl}  |  Host: {args.host}")
-    print("-" * 62)
-    for r in results:
-        symbol = "+" if r["present"] else "-"
-        print(f"  [{symbol}] {r['status']:4s}  {r['entry']}")
-    print("-" * 62)
-    print(f"  Total: {len(results)}   Passed: {passed}   Failed: {failed}\n")
-
-    if args.output:
-        payload = {
-            "host": args.host,
-            "acl": args.acl,
-            "passed": passed,
-            "failed": failed,
-            "results": results,
-        }
-        try:
-            with open(args.output, "w") as fh:
-                json.dump(payload, fh, indent=2)
-            log.info("Results saved to %s", args.output)
-        except OSError as exc:
-            log.warning("Could not write output file: %s", exc)
-
-    sys.exit(0 if failed == 0 else 1)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Audit network device configuration against compliance rules."
+    )
+    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
+    parser.add_argument("--device-type", default="cisco_ios",
+                        help="Netmiko device type (default: cisco_ios)")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--timeout", type=int, default=15, help="Connection timeout seconds")
+    parser.add_argument("--enable-secret", help="Enable mode password (if required)")
+    parser.add_argument("--rules-file", help="JSON file containing compliance rules")
+    parser.add_argument("--builtin-rules", choices=list(BUILTIN_RULESETS),
+                        help="Use a built-in ruleset")
+    parser.add_argument("--fail-on-non-compliance", action="store_true",
+                        help="Exit with code 4 if any checks fail")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    report = connect_and_audit(args)
+    report.print_summary()
+    if args.fail_on_non_compliance and report.failed > 0:
+        sys.exit(4)
+```
