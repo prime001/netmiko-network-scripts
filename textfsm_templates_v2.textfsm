@@ -1,206 +1,235 @@
 ```python
-#!/usr/bin/env python3
 """
-Network Device Configuration Snapshot
+mac_table_collector.py - Collect and export MAC address tables from network switches.
 
 Purpose:
-    Capture running configuration from network devices and save to timestamped files.
-    Supports multiple vendor devices, compression, and local versioning.
-    Useful for configuration change tracking, auditing, and disaster recovery.
+    Connects to one or more switches via SSH, retrieves the MAC address table,
+    uses inline TextFSM templates for structured parsing, and exports results
+    as a human-readable table, CSV, or JSON. Useful for network audits, device
+    location tracking, and port security reviews.
 
 Usage:
-    python3 config_snapshot.py -H 10.0.0.1 -u admin -p password \\
-        -d cisco_ios --output-dir ./configs
+    python mac_table_collector.py --host 192.168.1.1 -u admin -p secret
+    python mac_table_collector.py --host 192.168.1.1 -u admin -p secret --vlan 100 --output json
+    python mac_table_collector.py --hosts-file switches.txt -u admin -p secret --output csv --outfile macs.csv
+    python mac_table_collector.py --host 10.0.0.1 -u admin -p secret --mac-prefix 00:1a --device-type cisco_nxos
 
 Prerequisites:
-    - netmiko library installed (pip install netmiko)
-    - Network device with SSH/Telnet access
-    - Credentials with read access to running configuration
-    - Output directory must be writable
-
-Output:
-    Saves timestamped config files to specified directory.
-    Example: ./configs/10.0.0.1_20240610_143025.txt
+    pip install netmiko textfsm
+    SSH access to target devices with read privileges.
+    Supported device types: cisco_ios, cisco_xe, cisco_nxos
 """
 
 import argparse
+import csv
+import io
+import json
 import logging
-import os
-import gzip
-from datetime import datetime
+import sys
 from pathlib import Path
-from netmiko import ConnectHandler
-from netmiko.ssh_dispatcher import CLASS_MAP
+
+import textfsm
+from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+# Inline TextFSM templates keyed by platform family
+_TEMPLATE_IOS = r"""Value VLAN (\d+)
+Value MAC ([0-9a-fA-F.:-]+)
+Value TYPE (DYNAMIC|STATIC|dynamic|static)
+Value PORT (\S+)
+
+Start
+  ^\s*${VLAN}\s+${MAC}\s+${TYPE}\s+${PORT} -> Record
+  ^.*
+"""
+
+_TEMPLATE_NXOS = r"""Value VLAN (\d+)
+Value MAC ([0-9a-fA-F.:-]+)
+Value TYPE (dynamic|static|secured)
+Value PORT (\S+)
+
+Start
+  ^\s*${VLAN}\s+${MAC}\s+${TYPE}\s+\S+\s+${PORT} -> Record
+  ^.*
+"""
+
+TEMPLATES = {
+    "cisco_ios": _TEMPLATE_IOS,
+    "cisco_xe": _TEMPLATE_IOS,
+    "cisco_nxos": _TEMPLATE_NXOS,
+}
+
+SHOW_COMMANDS = {
+    "cisco_ios": "show mac address-table",
+    "cisco_xe": "show mac address-table",
+    "cisco_nxos": "show mac address-table",
+}
 
 
-def setup_logging(verbose):
-    """Configure logging output level."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        level=level
+def get_mac_table(host, username, password, device_type, port=22, vlan_filter=None, mac_prefix=None):
+    """Return a list of dicts representing MAC table entries from a single device."""
+    template_str = TEMPLATES.get(device_type)
+    if not template_str:
+        logger.error("No TextFSM template available for device type: %s", device_type)
+        return []
+
+    show_cmd = SHOW_COMMANDS[device_type]
+    if vlan_filter:
+        show_cmd = f"{show_cmd} vlan {vlan_filter}"
+
+    device_params = {
+        "device_type": device_type,
+        "host": host,
+        "username": username,
+        "password": password,
+        "port": port,
+        "timeout": 30,
+        "banner_timeout": 15,
+    }
+
+    logger.info("Connecting to %s (%s)", host, device_type)
+    try:
+        with ConnectHandler(**device_params) as conn:
+            raw_output = conn.send_command(show_cmd)
+    except NetmikoAuthenticationException:
+        logger.error("Authentication failed for %s", host)
+        return []
+    except NetmikoTimeoutException:
+        logger.error("Connection timed out for %s", host)
+        return []
+    except Exception as exc:
+        logger.error("Unexpected error connecting to %s: %s", host, exc)
+        return []
+
+    fsm = textfsm.TextFSM(io.StringIO(template_str))
+    parsed_rows = fsm.ParseText(raw_output)
+    headers = fsm.header
+
+    entries = []
+    for row in parsed_rows:
+        record = dict(zip(headers, row))
+        record["host"] = host
+        if mac_prefix and not record.get("MAC", "").lower().startswith(mac_prefix.lower()):
+            continue
+        entries.append(record)
+
+    logger.info("Collected %d MAC entries from %s", len(entries), host)
+    return entries
+
+
+def load_hosts_file(path):
+    lines = Path(path).read_text().splitlines()
+    return [ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")]
+
+
+def write_json(entries, outfile):
+    payload = json.dumps(entries, indent=2)
+    if outfile:
+        Path(outfile).write_text(payload)
+        logger.info("JSON written to %s", outfile)
+    else:
+        print(payload)
+
+
+def write_csv(entries, outfile):
+    if not entries:
+        logger.warning("No entries to write")
+        return
+    fieldnames = list(entries[0].keys())
+    dest = open(outfile, "w", newline="") if outfile else sys.stdout
+    try:
+        writer = csv.DictWriter(dest, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(entries)
+    finally:
+        if outfile:
+            dest.close()
+            logger.info("CSV written to %s", outfile)
+
+
+def write_table(entries):
+    if not entries:
+        print("No MAC entries found.")
+        return
+    col_w = {k: len(k) for k in entries[0]}
+    for entry in entries:
+        for k, v in entry.items():
+            col_w[k] = max(col_w[k], len(str(v)))
+    header = "  ".join(k.ljust(col_w[k]) for k in col_w)
+    print(header)
+    print("-" * len(header))
+    for entry in entries:
+        print("  ".join(str(entry[k]).ljust(col_w[k]) for k in col_w))
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Collect and export MAC address tables from network switches using TextFSM."
     )
-    return logging.getLogger(__name__)
-
-
-def validate_device_type(device_type, logger):
-    """Validate device type is supported by netmiko."""
-    if device_type not in CLASS_MAP:
-        logger.error(f"Unsupported device type: {device_type}")
-        logger.info(f"Supported types: {', '.join(sorted(CLASS_MAP.keys())[:10])}...")
-        return False
-    return True
-
-
-def connect_device(host, username, password, device_type, logger):
-    """Establish connection to network device."""
-    try:
-        logger.info(f"Connecting to {host} ({device_type})...")
-        device = ConnectHandler(
-            device_type=device_type,
-            host=host,
-            username=username,
-            password=password,
-            timeout=30,
-            read_timeout=20
-        )
-        logger.info(f"Successfully connected to {host}")
-        return device
-    except Exception as e:
-        logger.error(f"Connection failed: {e}")
-        raise
-
-
-def get_running_config(device, device_type, logger):
-    """Retrieve running configuration from device."""
-    try:
-        logger.info("Retrieving running configuration...")
-        
-        if 'cisco' in device_type.lower():
-            config = device.send_command('show running-config')
-        elif 'juniper' in device_type.lower():
-            config = device.send_command('show configuration')
-        elif 'arista' in device_type.lower():
-            config = device.send_command('show running-config')
-        elif 'iosxr' in device_type.lower():
-            config = device.send_command('show running-config')
-        else:
-            config = device.send_command('show running-config')
-        
-        if not config or len(config.strip()) == 0:
-            logger.warning("Retrieved empty configuration - device may not support command")
-            return None
-        
-        logger.info(f"Retrieved {len(config)} bytes of configuration")
-        return config
-        
-    except Exception as e:
-        logger.error(f"Failed to retrieve configuration: {e}")
-        raise
-
-
-def save_config(config, host, output_dir, compress=False, logger=None):
-    """Save configuration to timestamped file."""
-    try:
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-        
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"{host}_{timestamp}.txt"
-        filepath = os.path.join(output_dir, filename)
-        
-        if compress:
-            filepath += '.gz'
-            with gzip.open(filepath, 'wt', encoding='utf-8') as f:
-                f.write(config)
-        else:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(config)
-        
-        file_size = os.path.getsize(filepath)
-        
-        if logger:
-            logger.info(f"Configuration saved to {filepath} ({file_size} bytes)")
-        
-        return filepath
-        
-    except Exception as e:
-        if logger:
-            logger.error(f"Failed to save configuration: {e}")
-        raise
-
-
-def get_device_info(device, device_type, logger):
-    """Log basic device identification information."""
-    try:
-        if 'cisco' in device_type.lower():
-            output = device.send_command('show version', read_timeout=10)
-            for line in output.split('\n')[:3]:
-                if line.strip() and ('Version' in line or 'Cisco' in line):
-                    logger.info(f"Device info: {line.strip()[:80]}")
-                    break
-    except Exception:
-        logger.debug("Could not retrieve device version info")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--host", help="Single device IP or hostname")
+    group.add_argument("--hosts-file", metavar="FILE", help="File listing one host per line")
+    parser.add_argument("-u", "--username", required=True)
+    parser.add_argument("-p", "--password", required=True)
+    parser.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        choices=list(TEMPLATES.keys()),
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--vlan", help="Restrict query to a specific VLAN ID")
+    parser.add_argument("--mac-prefix", metavar="PREFIX", help="Filter entries by MAC prefix, e.g. 00:1a")
+    parser.add_argument(
+        "--output", choices=["table", "json", "csv"], default="table",
+        help="Output format (default: table)",
+    )
+    parser.add_argument("--outfile", metavar="FILE", help="Write output to file instead of stdout")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    return parser
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Snapshot network device running configuration',
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    parser.add_argument('-H', '--host', required=True, metavar='HOST',
-                       help='Device hostname or IP address')
-    parser.add_argument('-u', '--username', required=True, metavar='USER',
-                       help='SSH/Telnet username')
-    parser.add_argument('-p', '--password', required=True, metavar='PASS',
-                       help='SSH/Telnet password')
-    parser.add_argument('-d', '--device-type', default='cisco_ios', metavar='TYPE',
-                       help='Device type (default: cisco_ios)')
-    parser.add_argument('--output-dir', default='./configs', metavar='DIR',
-                       help='Output directory for config snapshots (default: ./configs)')
-    parser.add_argument('--compress', action='store_true',
-                       help='Compress output with gzip compression')
-    parser.add_argument('-v', '--verbose', action='store_true',
-                       help='Enable verbose debug logging')
-    
-    args = parser.parse_args()
-    logger = setup_logging(args.verbose)
-    
-    if not validate_device_type(args.device_type, logger):
-        return 1
-    
-    try:
-        device = connect_device(
-            args.host,
-            args.username,
-            args.password,
-            args.device_type,
-            logger
+    args = build_parser().parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    hosts = [args.host] if args.host else load_hosts_file(args.hosts_file)
+    if not hosts:
+        logger.error("No hosts specified or hosts file is empty")
+        sys.exit(1)
+
+    all_entries = []
+    for host in hosts:
+        all_entries.extend(
+            get_mac_table(
+                host=host,
+                username=args.username,
+                password=args.password,
+                device_type=args.device_type,
+                port=args.port,
+                vlan_filter=args.vlan,
+                mac_prefix=args.mac_prefix,
+            )
         )
-        
-        get_device_info(device, args.device_type, logger)
-        config = get_running_config(device, args.device_type, logger)
-        device.disconnect()
-        
-        if config is None:
-            logger.error("No configuration retrieved from device")
-            return 1
-        
-        filepath = save_config(
-            config,
-            args.host,
-            args.output_dir,
-            compress=args.compress,
-            logger=logger
-        )
-        
-        logger.info(f"Configuration snapshot completed: {filepath}")
-        return 0
-        
-    except Exception as e:
-        logger.error(f"Snapshot operation failed: {e}")
-        return 1
+
+    logger.info("Total MAC entries collected: %d", len(all_entries))
+
+    if args.output == "json":
+        write_json(all_entries, args.outfile)
+    elif args.output == "csv":
+        write_csv(all_entries, args.outfile)
+    else:
+        write_table(all_entries)
 
 
-if __name__ == '__main__':
-    exit(main())
+if __name__ == "__main__":
+    main()
 ```
