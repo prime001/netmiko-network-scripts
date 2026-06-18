@@ -1,225 +1,193 @@
-The script is ready — here it is printed directly since the write was blocked:
-
 ```python
 """
-config_snapshot.py - Network device configuration snapshot collector and differ.
-...
-"""
-```
+Failsafe Config Deploy with Auto-Rollback
 
-Since I can't write to `/opt/NetAutoCommitter/`, here is the complete script content to copy:
+Pushes a configuration change to a network device and waits for operator
+confirmation within a configurable window. If confirmation is not received
+before the deadline (or is explicitly declined), the device is automatically
+restored to its pre-change running configuration.
 
----
-
-```python
-"""
-config_snapshot.py - Network device configuration snapshot collector and differ.
-
-Captures running configurations from network devices, stores them with timestamps,
-and can diff the current running config against any saved snapshot. Useful as a
-pre/post-change baseline tool or scheduled config archiving.
+This implements the "commit confirmed" pattern common in production change
+management: changes go live immediately, but auto-revert unless an operator
+actively approves them — useful when SSH access itself might be disrupted by
+the change.
 
 Usage:
-    # Snapshot a single device
-    python config_snapshot.py --host 192.168.1.1 --username admin --password secret
+    python config_rollback_v3.py -d 192.168.1.1 -u admin -p secret \\
+        -t cisco_ios --config-file changes.txt --confirm-timeout 90
 
-    # Snapshot multiple devices from a file
-    python config_snapshot.py --host-file devices.txt --username admin --password secret
-
-    # Diff running config against latest snapshot
-    python config_snapshot.py --host 192.168.1.1 --username admin --password secret --diff
-
-    # Diff against a specific snapshot file
-    python config_snapshot.py --host 192.168.1.1 --username admin --password secret \
-        --diff --snapshot-file ./snapshots/192.168.1.1_20240101_120000.txt
+    python config_rollback_v3.py -d 10.0.0.1 -u admin -p secret \\
+        --config-file acl_update.txt --dry-run
 
 Prerequisites:
     pip install netmiko
+    SSH access to target device with sufficient privilege to apply config.
 """
 
 import argparse
-import difflib
 import logging
 import sys
-from datetime import datetime
-from pathlib import Path
+import time
 
-from netmiko import ConnectHandler, NetmikoTimeoutException, NetmikoAuthenticationException
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()],
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-DEVICE_TYPE_MAP = {
-    "ios": "cisco_ios",
-    "iosxe": "cisco_ios",
-    "iosxr": "cisco_xr",
-    "nxos": "cisco_nxos",
-    "eos": "arista_eos",
-    "junos": "juniper_junos",
-}
+
+def capture_running_config(conn):
+    log.info("Capturing pre-change running configuration")
+    output = conn.send_command("show running-config")
+    if not output:
+        raise RuntimeError("Empty response from 'show running-config'")
+    return output
 
 
-def snapshot_device(host, username, password, device_type, snapshot_dir, enable_secret=None):
-    """Connect to device, pull running config, write to timestamped file."""
-    conn_params = {
-        "device_type": DEVICE_TYPE_MAP.get(device_type, device_type),
-        "host": host,
-        "username": username,
-        "password": password,
-    }
-    if enable_secret:
-        conn_params["secret"] = enable_secret
-
-    log.info("Connecting to %s (%s)", host, device_type)
-    try:
-        with ConnectHandler(**conn_params) as conn:
-            if enable_secret:
-                conn.enable()
-            config = conn.send_command("show running-config")
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s", host)
-        return None
-    except NetmikoTimeoutException:
-        log.error("Connection timed out for %s", host)
-        return None
-    except Exception as exc:
-        log.error("Error connecting to %s: %s", host, exc)
-        return None
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_host = host.replace(".", "_").replace(":", "_")
-    filename = f"{safe_host}_{ts}.txt"
-    out_path = Path(snapshot_dir) / filename
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(config)
-    log.info("Snapshot saved: %s (%d bytes)", out_path, len(config))
-    return str(out_path)
+def load_config_lines(config_file):
+    with open(config_file) as fh:
+        lines = [
+            line.rstrip()
+            for line in fh
+            if line.strip() and not line.lstrip().startswith("!")
+        ]
+    if not lines:
+        raise ValueError(f"No config lines found in {config_file}")
+    return lines
 
 
-def latest_snapshot(host, snapshot_dir):
-    """Return path to the most recent snapshot for this host, or None."""
-    safe_host = host.replace(".", "_").replace(":", "_")
-    candidates = sorted(Path(snapshot_dir).glob(f"{safe_host}_*.txt"))
-    return str(candidates[-1]) if candidates else None
+def apply_config(conn, lines):
+    log.info("Applying %d config line(s)", len(lines))
+    return conn.send_config_set(lines)
 
 
-def diff_configs(old_path, new_config_lines, label_old, label_new):
-    """Print unified diff between a saved snapshot and current config lines."""
-    old_lines = Path(old_path).read_text().splitlines(keepends=True)
-    new_lines = [l + "\n" for l in new_config_lines]
+def rollback_to_checkpoint(conn, checkpoint):
+    log.warning("Rolling back to pre-change configuration")
+    lines = [
+        line
+        for line in checkpoint.splitlines()
+        if line.strip()
+        and not line.startswith("!")
+        and not line.startswith("Building configuration")
+        and not line.startswith("Current configuration")
+    ]
+    conn.send_config_set(lines)
+    log.info("Rollback applied")
 
-    diff = list(difflib.unified_diff(old_lines, new_lines, fromfile=label_old, tofile=label_new))
-    if not diff:
-        log.info("No differences found.")
-    else:
-        changed = len([l for l in diff if l.startswith(("+", "-")) and not l.startswith(("---", "+++"))])
-        log.info("Diff (%d lines changed):", changed)
-        for line in diff:
-            print(line, end="")
 
-
-def diff_device(host, username, password, device_type, snapshot_dir, snapshot_file=None, enable_secret=None):
-    """Pull current running config and diff against a saved snapshot."""
-    baseline = snapshot_file or latest_snapshot(host, snapshot_dir)
-    if not baseline:
-        log.error("No snapshot found for %s in %s", host, snapshot_dir)
-        return False
-
-    conn_params = {
-        "device_type": DEVICE_TYPE_MAP.get(device_type, device_type),
-        "host": host,
-        "username": username,
-        "password": password,
-    }
-    if enable_secret:
-        conn_params["secret"] = enable_secret
-
-    log.info("Connecting to %s for diff", host)
-    try:
-        with ConnectHandler(**conn_params) as conn:
-            if enable_secret:
-                conn.enable()
-            current_config = conn.send_command("show running-config")
-    except (NetmikoAuthenticationException, NetmikoTimeoutException, Exception) as exc:
-        log.error("Failed to connect to %s: %s", host, exc)
-        return False
-
-    diff_configs(
-        baseline,
-        current_config.splitlines(),
-        label_old=f"{baseline} (snapshot)",
-        label_new=f"{host} (running)",
-    )
-    return True
+def wait_for_confirmation(timeout_seconds):
+    """Prompt operator to confirm within the window. Returns True if confirmed."""
+    deadline = time.monotonic() + timeout_seconds
+    print(f"\n*** Change is live. Confirm to keep, or it auto-reverts in {timeout_seconds}s ***")
+    while time.monotonic() < deadline:
+        remaining = max(0, int(deadline - time.monotonic()))
+        try:
+            answer = input(f"  [{remaining:3d}s] Confirm change? (yes/no): ").strip().lower()
+        except EOFError:
+            return False
+        if answer in ("yes", "y"):
+            return True
+        if answer in ("no", "n"):
+            log.info("Operator declined — initiating rollback")
+            return False
+        print("  Please enter 'yes' or 'no'.")
+    log.warning("Confirmation window expired — initiating rollback")
+    return False
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Capture and diff network device configuration snapshots."
+        description="Deploy config with automatic rollback if not confirmed"
     )
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("--host", help="Device IP or hostname")
-    target.add_argument("--host-file", help="File with one host per line (host or host:device_type)")
-
-    parser.add_argument("--username", required=True)
-    parser.add_argument("--password", required=True)
-    parser.add_argument("--enable-secret", default=None)
+    parser.add_argument("-d", "--device", required=True, help="Device hostname or IP")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
     parser.add_argument(
-        "--device-type",
-        default="ios",
-        choices=list(DEVICE_TYPE_MAP.keys()) + list(DEVICE_TYPE_MAP.values()),
-        help="Netmiko device type (default: ios)",
+        "-t", "--device-type",
+        default="cisco_ios",
+        help="Netmiko device type (default: cisco_ios)",
     )
-    parser.add_argument("--snapshot-dir", default="./snapshots", help="Directory for snapshot files")
-    parser.add_argument("--diff", action="store_true", help="Diff running config against latest snapshot")
-    parser.add_argument("--snapshot-file", default=None, help="Specific snapshot file to diff against")
-    return parser.parse_args()
+    parser.add_argument("--enable-secret", help="Enable mode secret (if required)")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--config-file", required=True, help="File of config lines to push")
+    parser.add_argument(
+        "--confirm-timeout", type=int, default=60,
+        help="Seconds before auto-rollback (default: 60, min: 10)",
+    )
+    parser.add_argument("--session-log", help="Write raw session transcript to this file")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Print config lines and exit without connecting",
+    )
+    args = parser.parse_args()
+    if args.confirm_timeout < 10:
+        parser.error("--confirm-timeout must be at least 10 seconds")
+    return args
 
 
-def load_hosts(host_file, default_device_type):
-    """Parse host file; lines may be 'host' or 'host:device_type'."""
-    hosts = []
-    with open(host_file) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split(":", 1)
-            hosts.append((parts[0], parts[1] if len(parts) > 1 else default_device_type))
-    return hosts
+def main():
+    args = parse_args()
+
+    if args.dry_run:
+        lines = load_config_lines(args.config_file)
+        print(f"DRY RUN — {len(lines)} line(s) would be applied to {args.device}:")
+        for line in lines:
+            print(f"  {line}")
+        sys.exit(0)
+
+    device_params = {
+        "device_type": args.device_type,
+        "host": args.device,
+        "username": args.username,
+        "password": args.password,
+        "secret": args.enable_secret or args.password,
+        "port": args.port,
+        "timeout": 30,
+        "session_log": args.session_log or None,
+    }
+
+    try:
+        lines = load_config_lines(args.config_file)
+    except (FileNotFoundError, ValueError) as exc:
+        log.error("%s", exc)
+        sys.exit(1)
+
+    try:
+        log.info("Connecting to %s (%s)", args.device, args.device_type)
+        with ConnectHandler(**device_params) as conn:
+            if args.enable_secret:
+                conn.enable()
+
+            checkpoint = capture_running_config(conn)
+            apply_config(conn, lines)
+
+            confirmed = wait_for_confirmation(args.confirm_timeout)
+
+            if confirmed:
+                log.info("Change confirmed — saving configuration on %s", args.device)
+                conn.save_config()
+                log.info("Done")
+            else:
+                rollback_to_checkpoint(conn, checkpoint)
+                conn.save_config()
+                log.info("Device restored to pre-change state on %s", args.device)
+                sys.exit(2)
+
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.device)
+        sys.exit(1)
+    except NetmikoTimeoutException:
+        log.error("Connection timed out to %s", args.device)
+        sys.exit(1)
+    except Exception as exc:
+        log.error("Unexpected error: %s", exc)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    args = parse_args()
-
-    if args.host_file:
-        hosts = load_hosts(args.host_file, args.device_type)
-    else:
-        hosts = [(args.host, args.device_type)]
-
-    exit_code = 0
-    for host, dtype in hosts:
-        if args.diff:
-            ok = diff_device(
-                host, args.username, args.password, dtype,
-                args.snapshot_dir, args.snapshot_file, args.enable_secret,
-            )
-        else:
-            result = snapshot_device(
-                host, args.username, args.password, dtype,
-                args.snapshot_dir, args.enable_secret,
-            )
-            ok = result is not None
-
-        if not ok:
-            exit_code = 1
-
-    sys.exit(exit_code)
+    main()
 ```
-
-**What this does that's distinct from the existing rollback scripts:** it focuses on *snapshot collection and diffing* — the before/after capture layer — rather than the apply-a-previous-config operation. Key features: timestamped per-device snapshot files, `--diff` mode that pulls live config and compares against the latest (or a named) snapshot using standard unified diff, multi-device support via a host file with optional inline device-type overrides, and a `DEVICE_TYPE_MAP` for human-friendly type aliases. 166 lines, PEP 8, full argparse, proper error handling.
