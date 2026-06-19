@@ -1,31 +1,37 @@
-```python
-"""
-port_bounce_v3.py - MAC-tracked port bounce with re-authentication verification
+batch_port_bounce.py - Bounce multiple interfaces with pre/post state capture.
 
-Bounces one or more switchports and verifies that expected MAC addresses
-re-appear on the port after link restoration. Useful for forcing 802.1X
-re-authentication, clearing sticky MAC entries, or confirming endpoint
-reconnection after a maintenance bounce.
+Purpose:
+    Perform a bulk interface shutdown/no-shutdown cycle across one or more
+    Cisco IOS ports, capturing interface status, error counters, and CDP
+    neighbor state before and after each bounce to validate recovery.
+    Results are written as a structured JSON report.
 
 Usage:
-    python port_bounce_v3.py -d 192.168.1.10 -u admin -p secret \
-        -i GigabitEthernet0/1 --verify-mac 00:1A:2B:3C:4D:5E
+    python batch_port_bounce.py \
+        --host 10.0.0.1 --username admin --password secret \
+        --interfaces GigabitEthernet0/1,GigabitEthernet0/2 \
+        --hold-time 5 --recovery-timeout 60 --output report.json
 
-    python port_bounce_v3.py -d 192.168.1.10 -u admin -p secret \
-        -i Gi0/1 Gi0/2 Gi0/3 --wait 45 --device-type cisco_ios
+    # Capture state only (no actual bounce):
+    python batch_port_bounce.py --host 10.0.0.1 -u admin -p secret \
+        --interfaces Gi0/1 --dry-run
 
 Prerequisites:
     pip install netmiko
-    Credentials with privilege level 15 (or equivalent for other vendors).
+    Tested against Cisco IOS/IOS-XE. Commands used:
+        show ip interface brief interface <intf>
+        show interfaces <intf>
+        show cdp neighbors <intf> detail
 """
 
 import argparse
+import json
 import logging
 import sys
 import time
+from datetime import datetime, timezone
 
-from netmiko import ConnectHandler
-from netmiko.exceptions import NetMikoAuthenticationException, NetMikoTimeoutException
+from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,168 +41,201 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def get_mac_table(conn, interface):
-    """Return set of MAC addresses currently learned on the interface."""
-    output = conn.send_command(
-        f"show mac address-table interface {interface}",
-        use_textfsm=False,
-    )
-    macs = set()
-    for line in output.splitlines():
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_link_state(brief_output: str) -> tuple:
+    """Return (status, protocol) from 'show ip interface brief' output."""
+    for line in brief_output.splitlines():
         parts = line.split()
-        for part in parts:
-            if len(part) == 14 and part.count(".") == 2:
-                macs.add(part.lower())
-            elif len(part) == 17 and part.count(":") == 5:
-                macs.add(part.lower())
-    return macs
+        if len(parts) >= 6 and not line.strip().lower().startswith("interface"):
+            return parts[4], parts[5]
+    return "unknown", "unknown"
 
 
-def normalize_mac(mac):
-    raw = mac.replace(":", "").replace("-", "").replace(".", "").lower()
-    if len(raw) != 12:
-        return None
-    return ":".join(raw[i:i+2] for i in range(0, 12, 2))
+def parse_error_counters(intf_output: str) -> dict:
+    """Extract input/output error counts from 'show interfaces' output."""
+    in_errors = out_errors = 0
+    for line in intf_output.splitlines():
+        stripped = line.strip().lower()
+        if "input errors" in stripped:
+            try:
+                in_errors = int(stripped.split()[0])
+            except (ValueError, IndexError):
+                pass
+        elif "output errors" in stripped:
+            try:
+                out_errors = int(stripped.split()[0])
+            except (ValueError, IndexError):
+                pass
+    return {"input_errors": in_errors, "output_errors": out_errors}
 
 
-def bounce_interface(conn, interface, wait_seconds):
-    """Shut then no-shut an interface, return (shutdown_ok, noshut_ok)."""
-    log.info("Shutting down %s", interface)
-    conn.send_config_set([f"interface {interface}", "shutdown"])
+def get_interface_state(conn, interface: str) -> dict:
+    """Collect status, error counters, and CDP neighbor count for one interface."""
+    brief = conn.send_command(f"show ip interface brief interface {interface}")
+    status, protocol = parse_link_state(brief)
 
-    log.info("Waiting %s seconds before restoring %s", wait_seconds, interface)
-    time.sleep(wait_seconds)
+    intf_detail = conn.send_command(f"show interfaces {interface}")
+    errors = parse_error_counters(intf_detail)
 
-    log.info("Restoring %s", interface)
-    conn.send_config_set([f"interface {interface}", "no shutdown"])
-    return True
+    cdp_out = conn.send_command(f"show cdp neighbors {interface} detail")
+    cdp_neighbors = cdp_out.count("Device ID:")
+
+    return {
+        "status": status,
+        "protocol": protocol,
+        "cdp_neighbors": cdp_neighbors,
+        "timestamp": _utcnow(),
+        **errors,
+    }
 
 
-def verify_mac_reappears(conn, interface, target_mac, timeout, poll_interval=5):
-    """Poll MAC table until target MAC re-appears or timeout expires."""
-    normalized = normalize_mac(target_mac)
-    if not normalized:
-        log.warning("Could not normalize MAC %s; skipping verification", target_mac)
-        return None
-
-    deadline = time.time() + timeout
-    log.info("Waiting up to %ss for MAC %s on %s", timeout, normalized, interface)
-    while time.time() < deadline:
-        current = get_mac_table(conn, interface)
-        for entry in current:
-            if normalize_mac(entry) == normalized:
-                log.info("MAC %s confirmed on %s", normalized, interface)
-                return True
-        time.sleep(poll_interval)
-
-    log.warning("MAC %s did NOT re-appear on %s within %ss", normalized, interface, timeout)
+def wait_for_link_up(conn, interface: str, timeout: int) -> bool:
+    """Poll until interface protocol is 'up' or timeout expires."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        brief = conn.send_command(f"show ip interface brief interface {interface}")
+        _, protocol = parse_link_state(brief)
+        if protocol == "up":
+            return True
+        time.sleep(3)
     return False
 
 
-def process_interface(conn, interface, verify_macs, wait_seconds, mac_timeout):
-    result = {"interface": interface, "bounced": False, "mac_results": {}}
+def bounce_interface(conn, interface: str, hold_time: int, recovery_timeout: int) -> dict:
+    """Shut down an interface, pause, re-enable, then wait for recovery."""
+    log.info("  shutdown %s (holding %ds)", interface, hold_time)
+    conn.send_config_set([f"interface {interface}", "shutdown"])
+    time.sleep(hold_time)
 
-    pre_macs = get_mac_table(conn, interface)
-    log.info("Pre-bounce MACs on %s: %s", interface, pre_macs or "(none)")
+    log.info("  no shutdown %s (recovery timeout %ds)", interface, recovery_timeout)
+    conn.send_config_set([f"interface {interface}", "no shutdown"])
 
-    bounce_interface(conn, interface, wait_seconds)
-    result["bounced"] = True
+    recovered = wait_for_link_up(conn, interface, recovery_timeout)
+    if not recovered:
+        log.warning("  %s did not come back up within %ds", interface, recovery_timeout)
 
-    for mac in verify_macs:
-        ok = verify_mac_reappears(conn, interface, mac, mac_timeout)
-        result["mac_results"][mac] = ok
+    return {
+        "hold_time_sec": hold_time,
+        "recovery_timeout_sec": recovery_timeout,
+        "recovered": recovered,
+    }
 
-    return result
 
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Batch port bounce with pre/post state capture and JSON report"
+    )
+    parser.add_argument("--host", required=True, help="Device IP or hostname")
+    parser.add_argument("--username", "-u", required=True)
+    parser.add_argument("--password", "-p", required=True)
+    parser.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    parser.add_argument(
+        "--interfaces",
+        required=True,
+        help="Comma-separated interface names, e.g. Gi0/1,Gi0/2",
+    )
+    parser.add_argument(
+        "--hold-time",
+        type=int,
+        default=5,
+        metavar="SECS",
+        help="Seconds to hold the port down before re-enabling (default: 5)",
+    )
+    parser.add_argument(
+        "--recovery-timeout",
+        type=int,
+        default=60,
+        metavar="SECS",
+        help="Seconds to wait for link to recover after re-enable (default: 60)",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        metavar="FILE",
+        help="Write JSON report to FILE (default: stdout)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Capture interface state only; skip the actual bounce",
+    )
+    args = parser.parse_args()
 
-def build_parser():
-    p = argparse.ArgumentParser(
-        description="Bounce switchports and verify MAC re-appearance"
+    interfaces = [i.strip() for i in args.interfaces.split(",") if i.strip()]
+    if not interfaces:
+        log.error("No interfaces provided via --interfaces")
+        sys.exit(1)
+
+    try:
+        log.info("Connecting to %s", args.host)
+        conn = ConnectHandler(
+            device_type=args.device_type,
+            host=args.host,
+            username=args.username,
+            password=args.password,
+        )
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s", args.host)
+        sys.exit(1)
+    except NetmikoTimeoutException:
+        log.error("Connection timed out to %s", args.host)
+        sys.exit(1)
+
+    results = []
+    try:
+        for intf in interfaces:
+            log.info("Processing %s", intf)
+            entry = {"interface": intf, "pre": get_interface_state(conn, intf)}
+
+            if args.dry_run:
+                log.info("  dry-run: skipping bounce")
+            else:
+                entry["bounce"] = bounce_interface(
+                    conn, intf, args.hold_time, args.recovery_timeout
+                )
+                entry["post"] = get_interface_state(conn, intf)
+                outcome = "recovered" if entry["bounce"]["recovered"] else "FAILED"
+                log.info("  %s: %s", intf, outcome)
+
+            results.append(entry)
+    finally:
+        conn.disconnect()
+
+    bounced = len(results) if not args.dry_run else 0
+    recovered_count = sum(
+        1 for r in results if r.get("bounce", {}).get("recovered", False)
     )
-    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
-    p.add_argument("-u", "--username", required=True)
-    p.add_argument("-p", "--password", required=True)
-    p.add_argument(
-        "-i", "--interfaces", nargs="+", required=True,
-        metavar="INTF", help="Interface(s) to bounce"
-    )
-    p.add_argument(
-        "--verify-mac", nargs="*", default=[],
-        metavar="MAC", help="MAC address(es) expected to re-appear after bounce"
-    )
-    p.add_argument(
-        "--wait", type=int, default=30,
-        help="Seconds to hold interface down (default: 30)"
-    )
-    p.add_argument(
-        "--mac-timeout", type=int, default=120,
-        help="Seconds to wait for MAC re-appearance (default: 120)"
-    )
-    p.add_argument(
-        "--device-type", default="cisco_ios",
-        help="Netmiko device type (default: cisco_ios)"
-    )
-    p.add_argument(
-        "--port", type=int, default=22,
-        help="SSH port (default: 22)"
-    )
-    p.add_argument("--secret", default="", help="Enable secret if required")
-    p.add_argument("--debug", action="store_true")
-    return p
+
+    report = {
+        "host": args.host,
+        "generated_at": _utcnow(),
+        "dry_run": args.dry_run,
+        "summary": {
+            "total_interfaces": len(results),
+            "bounced": bounced,
+            "recovered": recovered_count,
+            "failed_recovery": bounced - recovered_count,
+        },
+        "interfaces": results,
+    }
+
+    payload = json.dumps(report, indent=2)
+    if args.output:
+        with open(args.output, "w") as fh:
+            fh.write(payload)
+        log.info("Report written to %s", args.output)
+    else:
+        print(payload)
+
+    sys.exit(1 if report["summary"]["failed_recovery"] else 0)
 
 
 if __name__ == "__main__":
-    args = build_parser().parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    device_params = {
-        "device_type": args.device_type,
-        "host": args.device,
-        "username": args.username,
-        "password": args.password,
-        "secret": args.secret,
-        "port": args.port,
-    }
-
-    try:
-        log.info("Connecting to %s", args.device)
-        with ConnectHandler(**device_params) as conn:
-            if args.secret:
-                conn.enable()
-
-            all_results = []
-            for intf in args.interfaces:
-                res = process_interface(
-                    conn, intf, args.verify_mac, args.wait, args.mac_timeout
-                )
-                all_results.append(res)
-
-        print("\n--- Summary ---")
-        exit_code = 0
-        for r in all_results:
-            status = "OK" if r["bounced"] else "FAILED"
-            print(f"  {r['interface']}: bounce={status}")
-            for mac, ok in r["mac_results"].items():
-                if ok is None:
-                    tag = "SKIP"
-                elif ok:
-                    tag = "SEEN"
-                else:
-                    tag = "MISSING"
-                    exit_code = 1
-                print(f"    MAC {mac}: {tag}")
-
-        sys.exit(exit_code)
-
-    except NetMikoAuthenticationException:
-        log.error("Authentication failed for %s", args.device)
-        sys.exit(2)
-    except NetMikoTimeoutException:
-        log.error("Connection timed out for %s", args.device)
-        sys.exit(2)
-    except Exception as exc:
-        log.error("Unexpected error: %s", exc)
-        sys.exit(2)
-```
+    main()
