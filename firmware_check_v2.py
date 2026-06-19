@@ -1,35 +1,32 @@
 ```python
 """
-firmware_prestage.py - Firmware upgrade pre-staging readiness checker.
+firmware_upgrade.py - Stage a Cisco IOS firmware image via SCP and set boot variable.
 
 Purpose:
-    Verifies that a target firmware image is present on device flash and that
-    sufficient free space exists before a maintenance window begins. Complements
-    firmware_check.py (which validates running versions) by focusing on whether
-    devices are ready to execute an upgrade, not whether an upgrade is needed.
+    Transfer a new IOS image to a Cisco device's flash, verify the MD5 checksum,
+    update the boot statement, save config, and optionally schedule a reload.
+    Complements firmware_check.py (version auditing) by handling the actual upgrade
+    workflow end-to-end.
 
 Usage:
-    Single device:
-        python firmware_prestage.py -d 192.168.1.1 -u admin -p secret \
-            --target-image c2960x-universalk9-mz.152-7.E2.bin
-
-    Batch from file (one IP or hostname per line, # for comments):
-        python firmware_prestage.py --host-file switches.txt -u admin \
-            --target-image c2960x-universalk9-mz.152-7.E2.bin --min-free-mb 128
-
-    Exit code 0 = all devices READY, 1 = one or more not ready.
+    python firmware_upgrade.py -d 192.168.1.1 -u admin -p secret \
+        --image /tmp/c2960-lanbasek9-mz.150-2.SE11.bin \
+        --flash-dest flash:/c2960-lanbasek9-mz.150-2.SE11.bin \
+        [--md5 <expected_hex>] [--reload] [--reload-in 60]
 
 Prerequisites:
     pip install netmiko
+    Device must have SCP enabled:  ip scp server enable
+    Credentials must have privilege 15 (or provide --secret for enable).
 """
 
 import argparse
+import hashlib
 import logging
-import re
 import sys
-from getpass import getpass
+from pathlib import Path
 
-from netmiko import ConnectHandler
+from netmiko import ConnectHandler, file_transfer
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
@@ -40,155 +37,161 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def parse_dir_output(output):
-    """Return (free_bytes, [filenames]) from 'dir flash:' output."""
-    files = []
-    free_bytes = 0
+def compute_local_md5(path: str) -> str:
+    md5 = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            md5.update(chunk)
+    return md5.hexdigest()
+
+
+def flash_free_bytes(conn) -> int:
+    output = conn.send_command("show flash: | include bytes free")
     for line in output.splitlines():
-        # File entry lines start with whitespace + numeric index
-        if re.match(r"^\s+\d+\s", line):
-            parts = line.split()
-            if parts:
-                files.append(parts[-1])
-        free_match = re.search(r"(\d+)\s+bytes\s+available", line)
-        if free_match:
-            free_bytes = int(free_match.group(1))
-    return free_bytes, files
+        parts = line.split()
+        for i, part in enumerate(parts):
+            if part == "bytes" and i > 0:
+                try:
+                    return int(parts[i - 1].replace(",", ""))
+                except ValueError:
+                    pass
+    return -1
 
 
-def check_device(host, device_type, username, password, target_image, min_free_bytes):
-    """Connect to a single device and return a readiness result dict."""
-    result = {
-        "host": host,
-        "status": "UNKNOWN",
-        "image_present": False,
-        "free_mb": None,
-        "error": None,
-    }
-
-    try:
-        log.info("Connecting to %s", host)
-        with ConnectHandler(
-            device_type=device_type,
-            host=host,
-            username=username,
-            password=password,
-            timeout=30,
-        ) as conn:
-            output = conn.send_command("dir flash:", read_timeout=30)
-            free_bytes, files = parse_dir_output(output)
-
-            result["free_mb"] = round(free_bytes / 1024 / 1024, 1)
-            result["image_present"] = target_image in files
-            space_ok = free_bytes >= min_free_bytes
-
-            if result["image_present"] and space_ok:
-                result["status"] = "READY"
-            elif result["image_present"]:
-                result["status"] = "WARN_LOW_SPACE"
-            elif space_ok:
-                result["status"] = "NEEDS_TRANSFER"
-            else:
-                result["status"] = "NOT_READY"
-
-    except NetmikoAuthenticationException:
-        result["status"] = "AUTH_FAILED"
-        result["error"] = "Authentication failed"
-        log.error("Auth failed: %s", host)
-    except NetmikoTimeoutException:
-        result["status"] = "TIMEOUT"
-        result["error"] = "Connection timed out"
-        log.error("Timeout: %s", host)
-    except Exception as exc:
-        result["status"] = "ERROR"
-        result["error"] = str(exc)
-        log.error("Error on %s: %s", host, exc)
-
-    return result
+def transfer_image(conn, local_path: str, dest: str) -> bool:
+    fs, _, filename = dest.partition(":")
+    filename = filename.lstrip("/")
+    log.info("Transferring %s -> %s:%s via SCP", local_path, fs, filename)
+    result = file_transfer(
+        conn,
+        source_file=local_path,
+        dest_file=filename,
+        file_system=fs + ":",
+        direction="put",
+        overwrite_file=False,
+    )
+    if result.get("file_transferred"):
+        log.info("Transfer complete")
+    elif result.get("file_exists"):
+        log.info("File already present on device, skipping transfer")
+    else:
+        return False
+    return True
 
 
-def print_report(results, target_image, min_free_mb):
-    width = 72
-    print(f"\n{'=' * width}")
-    print("Firmware Pre-staging Readiness Report")
-    print(f"  Target image : {target_image}")
-    print(f"  Min free     : {min_free_mb} MB")
-    print(f"{'=' * width}")
-    print(f"{'Host':<22} {'Status':<18} {'Image':<8} {'Free MB'}")
-    print(f"{'-' * width}")
-
-    counts = {}
-    for r in results:
-        img = "YES" if r["image_present"] else "NO"
-        free = f"{r['free_mb']}" if r["free_mb"] is not None else "N/A"
-        note = f"  [{r['error']}]" if r["error"] else ""
-        print(f"{r['host']:<22} {r['status']:<18} {img:<8} {free}{note}")
-        counts[r["status"]] = counts.get(r["status"], 0) + 1
-
-    print(f"{'=' * width}")
-    for status, n in sorted(counts.items()):
-        print(f"  {status}: {n}")
-    print()
+def verify_remote_md5(conn, dest: str, expected: str) -> bool:
+    log.info("Verifying remote MD5 for %s (may take a minute)", dest)
+    output = conn.send_command(f"verify /md5 {dest}", read_timeout=180)
+    for line in output.splitlines():
+        if "=" in line:
+            remote = line.split("=")[-1].strip().lower()
+            if remote == expected.lower():
+                log.info("MD5 match: %s", remote)
+                return True
+            log.error("MD5 mismatch — local=%s remote=%s", expected, remote)
+            return False
+    log.warning("Could not parse MD5 from:\n%s", output)
+    return False
 
 
-def load_hosts(path):
-    with open(path) as f:
-        return [
-            line.strip()
-            for line in f
-            if line.strip() and not line.startswith("#")
-        ]
+def set_boot_variable(conn, dest: str) -> None:
+    fs, _, filename = dest.partition(":")
+    filename = filename.lstrip("/")
+    boot_path = f"{fs}:{filename}"
+    log.info("Setting boot system to %s", boot_path)
+    conn.send_config_set(["no boot system", f"boot system {boot_path}"])
+    conn.send_command("write memory")
+    log.info("Config saved")
+
+
+def schedule_reload(conn, minutes: int) -> None:
+    log.info("Scheduling reload in %d minutes", minutes)
+    output = conn.send_command(
+        f"reload in {minutes}",
+        expect_string=r"[Pp]roceed|confirm",
+        read_timeout=15,
+    )
+    if any(w in output.lower() for w in ("proceed", "confirm")):
+        conn.send_command("\n", expect_string=r"#", read_timeout=10)
+    log.info("Reload scheduled in %d minutes", minutes)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Stage IOS firmware image and set boot variable")
+    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
+    p.add_argument("-u", "--username", required=True)
+    p.add_argument("-p", "--password", required=True)
+    p.add_argument("--device-type", default="cisco_ios")
+    p.add_argument("--secret", default="", help="Enable secret")
+    p.add_argument("--image", required=True, help="Local path to firmware .bin")
+    p.add_argument("--flash-dest", required=True, help="e.g. flash:/image.bin")
+    p.add_argument("--md5", help="Expected MD5 hex (computed locally if omitted)")
+    p.add_argument("--reload", action="store_true", help="Schedule reload after staging")
+    p.add_argument("--reload-in", type=int, default=60, metavar="MINUTES")
+    p.add_argument("--skip-space-check", action="store_true")
+    return p.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Check firmware pre-staging readiness on network devices"
-    )
-    host_group = parser.add_mutually_exclusive_group(required=True)
-    host_group.add_argument("-d", "--device", help="Single device IP or hostname")
-    host_group.add_argument(
-        "--host-file", help="File containing one device per line"
-    )
-    parser.add_argument("-u", "--username", required=True)
-    parser.add_argument("-p", "--password", help="Prompted if omitted")
-    parser.add_argument(
-        "--device-type", default="cisco_ios",
-        help="Netmiko device type (default: cisco_ios)"
-    )
-    parser.add_argument(
-        "--target-image", required=True,
-        help="Firmware filename to look for (e.g. c2960x-universalk9-mz.152-7.E2.bin)"
-    )
-    parser.add_argument(
-        "--min-free-mb", type=int, default=64,
-        help="Minimum acceptable free flash in MB (default: 64)"
-    )
-    parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args()
+    args = parse_args()
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    password = args.password or getpass(f"Password for {args.username}: ")
-
-    hosts = [args.device] if args.device else load_hosts(args.host_file)
-    if not hosts:
-        log.error("No hosts found")
+    image_path = Path(args.image)
+    if not image_path.exists():
+        log.error("Image not found: %s", args.image)
         sys.exit(1)
 
-    min_free_bytes = args.min_free_mb * 1024 * 1024
-    results = [
-        check_device(
-            h, args.device_type, args.username, password,
-            args.target_image, min_free_bytes
-        )
-        for h in hosts
-    ]
+    image_mb = image_path.stat().st_size / (1024 * 1024)
+    local_md5 = args.md5 or compute_local_md5(args.image)
+    log.info("Image: %s  size=%.1f MB  md5=%s", image_path.name, image_mb, local_md5)
 
-    print_report(results, args.target_image, args.min_free_mb)
+    device_params = {
+        "device_type": args.device_type,
+        "host": args.device,
+        "username": args.username,
+        "password": args.password,
+        "secret": args.secret,
+        "timeout": 30,
+    }
 
-    not_ready = [r for r in results if r["status"] != "READY"]
-    sys.exit(0 if not not_ready else 1)
+    try:
+        log.info("Connecting to %s", args.device)
+        with ConnectHandler(**device_params) as conn:
+            if args.secret:
+                conn.enable()
+
+            if not args.skip_space_check:
+                free = flash_free_bytes(conn)
+                if free > 0:
+                    free_mb = free / (1024 * 1024)
+                    log.info("Flash free: %.1f MB", free_mb)
+                    if free_mb < image_mb * 1.05:
+                        log.error("Insufficient flash: %.1f MB free, need %.1f MB", free_mb, image_mb * 1.05)
+                        sys.exit(1)
+
+            if not transfer_image(conn, args.image, args.flash_dest):
+                log.error("Transfer failed")
+                sys.exit(1)
+
+            if not verify_remote_md5(conn, args.flash_dest, local_md5):
+                log.error("MD5 mismatch — not updating boot variable")
+                sys.exit(1)
+
+            set_boot_variable(conn, args.flash_dest)
+
+            if args.reload:
+                schedule_reload(conn, args.reload_in)
+
+        log.info("Upgrade staging complete on %s", args.device)
+
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s", args.device)
+        sys.exit(1)
+    except NetmikoTimeoutException:
+        log.error("Connection timed out for %s", args.device)
+        sys.exit(1)
+    except Exception as exc:
+        log.error("Unexpected error: %s", exc)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
