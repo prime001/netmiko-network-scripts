@@ -1,29 +1,31 @@
 ```python
 """
-route_validator.py - Post-change routing table validator
+bgp_state_checker.py - BGP Neighbor State Validator
 
-Connects to a network device and verifies that expected routes are present
-with the correct next-hop and/or egress interface. Use after routing changes
-(static routes, OSPF, BGP) to confirm convergence before closing a change window.
+Purpose:
+    Connects to a router and validates BGP neighbor states. Designed as a
+    pre/post change validation tool to confirm all BGP sessions remain
+    established after network maintenance windows.
 
 Usage:
-    python route_validator.py -d 192.168.1.1 -u admin -p secret \
-        --device-type cisco_ios --routes expected_routes.json
+    # Show all current BGP neighbor states
+    python bgp_state_checker.py --host 192.168.1.1 --username admin --password secret
 
-    python route_validator.py -d 192.168.1.1 -u admin -p secret \
-        --device-type cisco_ios --prefix 10.0.0.0/8 --next-hop 192.168.1.254
+    # Save pre-change baseline
+    python bgp_state_checker.py --host 192.168.1.1 --username admin \
+        --password secret --save-baseline /tmp/bgp_pre.json
 
-Routes JSON format:
-    [
-        {"prefix": "10.0.0.0/8", "next_hop": "192.168.1.254"},
-        {"prefix": "172.16.0.0/12", "interface": "GigabitEthernet0/1"},
-        {"prefix": "0.0.0.0/0", "next_hop": "203.0.113.1", "interface": "Gi0/0"}
-    ]
+    # Validate post-change state against baseline
+    python bgp_state_checker.py --host 192.168.1.1 --username admin \
+        --password secret --compare-baseline /tmp/bgp_pre.json
 
-Exit codes: 0 = all passed, 1 = error, 2 = one or more routes failed.
+    # Assert specific neighbors are Established (exits non-zero on failure)
+    python bgp_state_checker.py --host 192.168.1.1 --username admin \
+        --password secret --expected-neighbors peers.txt
 
 Prerequisites:
     pip install netmiko
+    Supported: cisco_ios, cisco_ios_xe, cisco_xr, juniper_junos
 """
 
 import argparse
@@ -31,189 +33,175 @@ import json
 import logging
 import re
 import sys
+from pathlib import Path
 
-from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-
-ROUTE_COMMANDS = {
-    "cisco_ios": "show ip route {network}",
-    "cisco_xe": "show ip route {network}",
-    "cisco_nxos": "show ip route {network}",
-    "juniper_junos": "show route {network}",
-    "arista_eos": "show ip route {network}",
+SHOW_BGP_COMMANDS = {
+    "cisco_ios": "show ip bgp summary",
+    "cisco_ios_xe": "show ip bgp summary",
+    "cisco_xr": "show bgp summary",
+    "juniper_junos": "show bgp summary",
 }
 
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Validate routing table entries after a network change"
-    )
-    parser.add_argument("-d", "--device", required=True, help="Device IP or hostname")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", required=True, help="SSH password")
-    parser.add_argument(
-        "--device-type",
-        default="cisco_ios",
-        choices=list(ROUTE_COMMANDS.keys()),
-        help="Netmiko device type (default: cisco_ios)",
-    )
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument(
-        "--routes", metavar="FILE", help="JSON file with expected route entries"
-    )
-    parser.add_argument(
-        "--prefix", help="Single prefix to validate (e.g. 10.0.0.0/8)"
-    )
-    parser.add_argument("--next-hop", help="Expected next-hop IP for --prefix")
-    parser.add_argument(
-        "--interface", help="Expected egress interface for --prefix"
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=30,
-        help="SSH connection timeout in seconds (default: 30)",
-    )
-    return parser.parse_args()
+IOS_NEIGHBOR_RE = re.compile(
+    r"^(\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\S+\s+(\S+)",
+    re.MULTILINE,
+)
 
 
-def load_routes(args):
-    if args.routes:
-        try:
-            with open(args.routes) as fh:
-                routes = json.load(fh)
-        except (OSError, json.JSONDecodeError) as exc:
-            log.error("Cannot read routes file: %s", exc)
-            sys.exit(1)
-        if not isinstance(routes, list):
-            log.error("Routes file must contain a JSON array")
-            sys.exit(1)
-        return routes
-
-    if args.prefix:
-        entry = {"prefix": args.prefix}
-        if args.next_hop:
-            entry["next_hop"] = args.next_hop
-        if args.interface:
-            entry["interface"] = args.interface
-        return [entry]
-
-    log.error("Specify --routes FILE or --prefix")
-    sys.exit(1)
+def parse_bgp_neighbors(output: str, device_type: str) -> dict:
+    neighbors = {}
+    if device_type in ("cisco_ios", "cisco_ios_xe", "cisco_xr"):
+        for match in IOS_NEIGHBOR_RE.finditer(output):
+            neighbors[match.group(1)] = match.group(2)
+    elif device_type == "juniper_junos":
+        for line in output.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and re.match(r"\d{1,3}(?:\.\d{1,3}){3}", parts[0]):
+                neighbors[parts[0]] = parts[-1]
+    return neighbors
 
 
-def _interface_present(output, interface):
-    """Return True if interface appears in output, accounting for abbreviations."""
-    if interface.lower() in output.lower():
-        return True
-    abbrev = re.sub(r"([A-Za-z]{2})[A-Za-z]+", r"\1", interface)
-    return abbrev.lower() in output.lower()
+def is_established(state: str) -> bool:
+    return state.lower() in ("established", "estab")
 
 
-def check_route(output, prefix, next_hop=None, interface=None):
-    """Return (passed: bool, reason: str) for one route entry."""
-    network = prefix.split("/")[0]
-    if network not in output and prefix not in output:
-        return False, f"prefix {prefix} not found in routing table"
-
-    if next_hop and next_hop not in output:
-        return False, f"expected next-hop {next_hop} not found for {prefix}"
-
-    if interface and not _interface_present(output, interface):
-        return False, f"expected interface {interface} not found for {prefix}"
-
-    return True, "OK"
+def check_required(neighbors: dict, required: list) -> list:
+    failures = []
+    for ip in required:
+        state = neighbors.get(ip)
+        if state is None:
+            failures.append(f"{ip}: not present in BGP table")
+        elif not is_established(state):
+            failures.append(f"{ip}: state={state} (expected Established)")
+    return failures
 
 
-def validate_routes(connection, device_type, routes):
-    cmd_template = ROUTE_COMMANDS.get(device_type, "show ip route {network}")
-    results = []
-
-    for entry in routes:
-        prefix = entry.get("prefix", "").strip()
-        if not prefix:
-            log.warning("Skipping entry with missing 'prefix': %s", entry)
-            continue
-
-        network = prefix.split("/")[0]
-        cmd = cmd_template.format(network=network)
-        log.debug("Sending: %s", cmd)
-
-        try:
-            output = connection.send_command(cmd, read_timeout=30)
-        except Exception as exc:
-            results.append(
-                {"prefix": prefix, "passed": False, "reason": f"command error: {exc}"}
-            )
-            continue
-
-        passed, reason = check_route(
-            output,
-            prefix,
-            next_hop=entry.get("next_hop"),
-            interface=entry.get("interface"),
-        )
-        results.append({"prefix": prefix, "passed": passed, "reason": reason})
-
-    return results
+def diff_baseline(current: dict, baseline: dict) -> list:
+    diffs = []
+    for ip, old_state in baseline.items():
+        new_state = current.get(ip)
+        if new_state is None:
+            diffs.append(f"{ip}: disappeared (was {old_state})")
+        elif new_state.lower() != old_state.lower():
+            diffs.append(f"{ip}: {old_state} -> {new_state}")
+    for ip in current:
+        if ip not in baseline:
+            diffs.append(f"{ip}: new neighbor added (state={current[ip]})")
+    return diffs
 
 
-def main():
-    args = parse_args()
-    routes = load_routes(args)
-
+def fetch_bgp_neighbors(args) -> dict:
     device_params = {
         "device_type": args.device_type,
-        "host": args.device,
+        "host": args.host,
         "username": args.username,
         "password": args.password,
         "port": args.port,
-        "timeout": args.timeout,
+        "conn_timeout": 30,
     }
-
-    log.info("Connecting to %s (%s)", args.device, args.device_type)
+    command = SHOW_BGP_COMMANDS[args.device_type]
+    log.info("Connecting to %s as %s", args.host, args.username)
     try:
-        connection = ConnectHandler(**device_params)
+        with ConnectHandler(**device_params) as conn:
+            log.info("Fetching: %s", command)
+            output = conn.send_command(command, read_timeout=60)
     except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.device)
+        log.error("Authentication failed for %s", args.host)
         sys.exit(1)
     except NetmikoTimeoutException:
-        log.error("Connection timed out to %s", args.device)
-        sys.exit(1)
-    except Exception as exc:
-        log.error("Connection failed: %s", exc)
+        log.error("Connection timed out to %s", args.host)
         sys.exit(1)
 
-    try:
-        results = validate_routes(connection, args.device_type, routes)
-    finally:
-        connection.disconnect()
+    neighbors = parse_bgp_neighbors(output, args.device_type)
+    log.info("Parsed %d BGP neighbors", len(neighbors))
+    return neighbors
 
-    passed = [r for r in results if r["passed"]]
-    failed = [r for r in results if not r["passed"]]
 
-    print(f"\nRoute validation results — {args.device}")
-    print("-" * 52)
-    for r in results:
-        tag = "PASS" if r["passed"] else "FAIL"
-        print(f"  [{tag}] {r['prefix']:<22} {r['reason']}")
-    print("-" * 52)
-    print(f"  Total: {len(results)}   Passed: {len(passed)}   Failed: {len(failed)}\n")
+def main():
+    parser = argparse.ArgumentParser(description="Validate BGP neighbor states")
+    parser.add_argument("--host", required=True, help="Device IP or hostname")
+    parser.add_argument("--username", required=True)
+    parser.add_argument("--password", required=True)
+    parser.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        choices=list(SHOW_BGP_COMMANDS.keys()),
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument(
+        "--expected-neighbors",
+        metavar="FILE",
+        help="File with one neighbor IP per line; exits 1 if any not Established",
+    )
+    parser.add_argument(
+        "--save-baseline",
+        metavar="FILE",
+        help="Write current BGP state to JSON for later comparison",
+    )
+    parser.add_argument(
+        "--compare-baseline",
+        metavar="FILE",
+        help="Diff current state against a saved baseline JSON",
+    )
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
 
-    if failed:
-        log.warning("%d route(s) failed validation", len(failed))
-        sys.exit(2)
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    log.info("All %d route(s) validated successfully", len(passed))
+    neighbors = fetch_bgp_neighbors(args)
+    for ip, state in sorted(neighbors.items()):
+        log.info("  %-20s  %s", ip, state)
+
+    exit_code = 0
+
+    if args.save_baseline:
+        Path(args.save_baseline).write_text(json.dumps(neighbors, indent=2))
+        log.info("Baseline saved to %s", args.save_baseline)
+
+    if args.compare_baseline:
+        baseline = json.loads(Path(args.compare_baseline).read_text())
+        diffs = diff_baseline(neighbors, baseline)
+        if not diffs:
+            log.info("PASS: BGP state matches baseline (%d neighbors)", len(neighbors))
+        else:
+            log.error("FAIL: %d difference(s) from baseline:", len(diffs))
+            for d in diffs:
+                log.error("  %s", d)
+            exit_code = 1
+
+    if args.expected_neighbors:
+        required = [
+            line.strip()
+            for line in Path(args.expected_neighbors).read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        failures = check_required(neighbors, required)
+        if not failures:
+            log.info("PASS: All %d required neighbors are Established", len(required))
+        else:
+            log.error("FAIL: %d neighbor(s) not Established:", len(failures))
+            for f in failures:
+                log.error("  %s", f)
+            exit_code = 1
+
+    if not any([args.expected_neighbors, args.compare_baseline, args.save_baseline]):
+        not_up = {ip: st for ip, st in neighbors.items() if not is_established(st)}
+        if not_up:
+            log.warning("%d neighbor(s) not in Established state:", len(not_up))
+            for ip, st in sorted(not_up.items()):
+                log.warning("  %-20s  %s", ip, st)
+            exit_code = 1
+        else:
+            log.info("PASS: All %d neighbors Established", len(neighbors))
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
