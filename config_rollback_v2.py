@@ -1,190 +1,191 @@
 ```python
+#!/usr/bin/env python3
 """
-Failsafe Config Deploy with Auto-Rollback
+Interface Statistics Collector - Network Device Monitoring
 
-Pushes a configuration change to a network device and waits for operator
-confirmation within a configurable window. If confirmation is not received
-before the deadline (or is explicitly declined), the device is automatically
-restored to its pre-change running configuration.
-
-This implements the "commit confirmed" pattern common in production change
-management: changes go live immediately, but auto-revert unless an operator
-actively approves them — useful when SSH access itself might be disrupted by
-the change.
-
-Usage:
-    python config_rollback_v3.py -d 192.168.1.1 -u admin -p secret \\
-        -t cisco_ios --config-file changes.txt --confirm-timeout 90
-
-    python config_rollback_v3.py -d 10.0.0.1 -u admin -p secret \\
-        --config-file acl_update.txt --dry-run
+Collects interface statistics including errors, discards, and collisions to identify
+problematic interfaces. Useful for network health monitoring and troubleshooting.
 
 Prerequisites:
-    pip install netmiko
-    SSH access to target device with sufficient privilege to apply config.
+    - netmiko>=4.0.0
+    - Network device SSH access enabled
+    - Valid device credentials with read privileges
+
+Usage:
+    python interface_stats_collector.py --device 10.1.1.1 --user admin --device-type cisco_ios
+    python interface_stats_collector.py --device core1.example.com -u netadmin -f creds.txt --device-type arista_eos
+
+Examples:
+    # Interactive password prompt
+    python interface_stats_collector.py --device 192.168.1.1 --user admin --device-type cisco_ios
+
+    # Use password file
+    python interface_stats_collector.py --device 192.168.1.1 --user admin -f ~/.ssh/pass --device-type cisco_ios
+
+    # With custom error threshold
+    python interface_stats_collector.py --device 192.168.1.1 --user admin --device-type cisco_ios --threshold 5
 """
 
 import argparse
 import logging
 import sys
-import time
-
+from getpass import getpass
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko.exceptions import NetmikoException
+
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-def capture_running_config(conn):
-    log.info("Capturing pre-change running configuration")
-    output = conn.send_command("show running-config")
-    if not output:
-        raise RuntimeError("Empty response from 'show running-config'")
-    return output
+def get_credentials(args):
+    """Get credentials from command-line args or user input."""
+    username = args.user
 
-
-def load_config_lines(config_file):
-    with open(config_file) as fh:
-        lines = [
-            line.rstrip()
-            for line in fh
-            if line.strip() and not line.lstrip().startswith("!")
-        ]
-    if not lines:
-        raise ValueError(f"No config lines found in {config_file}")
-    return lines
-
-
-def apply_config(conn, lines):
-    log.info("Applying %d config line(s)", len(lines))
-    return conn.send_config_set(lines)
-
-
-def rollback_to_checkpoint(conn, checkpoint):
-    log.warning("Rolling back to pre-change configuration")
-    lines = [
-        line
-        for line in checkpoint.splitlines()
-        if line.strip()
-        and not line.startswith("!")
-        and not line.startswith("Building configuration")
-        and not line.startswith("Current configuration")
-    ]
-    conn.send_config_set(lines)
-    log.info("Rollback applied")
-
-
-def wait_for_confirmation(timeout_seconds):
-    """Prompt operator to confirm within the window. Returns True if confirmed."""
-    deadline = time.monotonic() + timeout_seconds
-    print(f"\n*** Change is live. Confirm to keep, or it auto-reverts in {timeout_seconds}s ***")
-    while time.monotonic() < deadline:
-        remaining = max(0, int(deadline - time.monotonic()))
+    if args.password_file:
         try:
-            answer = input(f"  [{remaining:3d}s] Confirm change? (yes/no): ").strip().lower()
-        except EOFError:
-            return False
-        if answer in ("yes", "y"):
-            return True
-        if answer in ("no", "n"):
-            log.info("Operator declined — initiating rollback")
-            return False
-        print("  Please enter 'yes' or 'no'.")
-    log.warning("Confirmation window expired — initiating rollback")
-    return False
+            with open(args.password_file, 'r') as f:
+                password = f.read().strip()
+        except FileNotFoundError:
+            logger.error(f"Password file not found: {args.password_file}")
+            sys.exit(1)
+    elif args.password:
+        password = args.password
+    else:
+        password = getpass(f"Password for {username}: ")
+
+    return username, password
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Deploy config with automatic rollback if not confirmed"
-    )
-    parser.add_argument("-d", "--device", required=True, help="Device hostname or IP")
-    parser.add_argument("-u", "--username", required=True, help="SSH username")
-    parser.add_argument("-p", "--password", required=True, help="SSH password")
-    parser.add_argument(
-        "-t", "--device-type",
-        default="cisco_ios",
-        help="Netmiko device type (default: cisco_ios)",
-    )
-    parser.add_argument("--enable-secret", help="Enable mode secret (if required)")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--config-file", required=True, help="File of config lines to push")
-    parser.add_argument(
-        "--confirm-timeout", type=int, default=60,
-        help="Seconds before auto-rollback (default: 60, min: 10)",
-    )
-    parser.add_argument("--session-log", help="Write raw session transcript to this file")
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Print config lines and exit without connecting",
-    )
-    args = parser.parse_args()
-    if args.confirm_timeout < 10:
-        parser.error("--confirm-timeout must be at least 10 seconds")
-    return args
+def collect_interface_stats(device_ip, device_type, username, password):
+    """Connect to device and collect interface statistics."""
+    try:
+        logger.info(f"Connecting to {device_ip}...")
+        device = ConnectHandler(
+            host=device_ip,
+            device_type=device_type,
+            username=username,
+            password=password,
+            timeout=15
+        )
+        logger.info(f"Connected to {device_ip}")
+
+        logger.info("Collecting interface statistics...")
+        if 'cisco' in device_type:
+            output = device.send_command('show interfaces')
+        elif 'arista' in device_type:
+            output = device.send_command('show interfaces')
+        else:
+            output = device.send_command('show interfaces')
+
+        device.disconnect()
+        return output
+
+    except NetmikoException as e:
+        logger.error(f"Connection failed: {e}")
+        sys.exit(1)
+
+
+def parse_interface_output(output):
+    """Parse interface output and extract error statistics."""
+    interfaces = {}
+    current_interface = None
+
+    for line in output.split('\n'):
+        if line and not line[0].isspace() and line.split():
+            current_interface = line.split()[0]
+            interfaces[current_interface] = {
+                'errors': 0,
+                'discards': 0,
+                'collisions': 0
+            }
+
+        elif current_interface and current_interface in interfaces:
+            line_lower = line.lower()
+
+            if 'input errors' in line_lower:
+                try:
+                    interfaces[current_interface]['errors'] = int(line.split()[0])
+                except (ValueError, IndexError):
+                    pass
+
+            elif 'input discards' in line_lower:
+                try:
+                    interfaces[current_interface]['discards'] = int(line.split()[0])
+                except (ValueError, IndexError):
+                    pass
+
+            elif 'collisions' in line_lower:
+                try:
+                    interfaces[current_interface]['collisions'] = int(line.split()[0])
+                except (ValueError, IndexError):
+                    pass
+
+    return interfaces
+
+
+def print_report(interfaces, threshold):
+    """Print formatted interface statistics report."""
+    problem_intfs = [
+        (name, stats) for name, stats in interfaces.items()
+        if stats['errors'] >= threshold or stats['discards'] >= threshold
+    ]
+
+    print("\n" + "=" * 70)
+    print("INTERFACE STATISTICS REPORT")
+    print("=" * 70)
+
+    if problem_intfs:
+        print(f"\nInterfaces exceeding threshold ({threshold}):\n")
+        print(f"{'Interface':<15} {'Errors':<12} {'Discards':<12} {'Collisions':<12}")
+        print("-" * 51)
+
+        for intf, stats in sorted(problem_intfs):
+            print(f"{intf:<15} {stats['errors']:<12} {stats['discards']:<12} {stats['collisions']:<12}")
+    else:
+        print(f"\nNo interfaces found with errors/discards >= {threshold}")
+
+    total = len(interfaces)
+    problem = len(problem_intfs)
+    print(f"\nTotal: {total} interfaces | Issues: {problem}\n")
+    print("=" * 70 + "\n")
 
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument('--device', required=True, help='Device IP or hostname')
+    parser.add_argument('--user', '-u', required=True, help='SSH username')
+    parser.add_argument('--password', '-p', help='SSH password (omit for prompt)')
+    parser.add_argument('--password-file', '-f', help='File containing password')
+    parser.add_argument('--device-type', required=True,
+                        choices=['cisco_ios', 'cisco_xe', 'cisco_nxos',
+                                'arista_eos', 'juniper_junos'],
+                        help='Device OS type')
+    parser.add_argument('--threshold', type=int, default=10,
+                        help='Minimum errors/discards to report (default: 10)')
 
-    if args.dry_run:
-        lines = load_config_lines(args.config_file)
-        print(f"DRY RUN — {len(lines)} line(s) would be applied to {args.device}:")
-        for line in lines:
-            print(f"  {line}")
+    args = parser.parse_args()
+
+    try:
+        username, password = get_credentials(args)
+        output = collect_interface_stats(
+            args.device, args.device_type, username, password
+        )
+
+        interfaces = parse_interface_output(output)
+        print_report(interfaces, args.threshold)
+
+    except KeyboardInterrupt:
+        logger.info("\nScript interrupted by user")
         sys.exit(0)
-
-    device_params = {
-        "device_type": args.device_type,
-        "host": args.device,
-        "username": args.username,
-        "password": args.password,
-        "secret": args.enable_secret or args.password,
-        "port": args.port,
-        "timeout": 30,
-        "session_log": args.session_log or None,
-    }
-
-    try:
-        lines = load_config_lines(args.config_file)
-    except (FileNotFoundError, ValueError) as exc:
-        log.error("%s", exc)
-        sys.exit(1)
-
-    try:
-        log.info("Connecting to %s (%s)", args.device, args.device_type)
-        with ConnectHandler(**device_params) as conn:
-            if args.enable_secret:
-                conn.enable()
-
-            checkpoint = capture_running_config(conn)
-            apply_config(conn, lines)
-
-            confirmed = wait_for_confirmation(args.confirm_timeout)
-
-            if confirmed:
-                log.info("Change confirmed — saving configuration on %s", args.device)
-                conn.save_config()
-                log.info("Done")
-            else:
-                rollback_to_checkpoint(conn, checkpoint)
-                conn.save_config()
-                log.info("Device restored to pre-change state on %s", args.device)
-                sys.exit(2)
-
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.device)
-        sys.exit(1)
-    except NetmikoTimeoutException:
-        log.error("Connection timed out to %s", args.device)
-        sys.exit(1)
-    except Exception as exc:
-        log.error("Unexpected error: %s", exc)
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
         sys.exit(1)
 
 
