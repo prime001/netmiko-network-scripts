@@ -1,241 +1,180 @@
-batch_port_bounce.py - Bounce multiple interfaces with pre/post state capture.
+```python
+#!/usr/bin/env python3
+"""
+Network Device Diagnostic Report Generator.
 
-Purpose:
-    Perform a bulk interface shutdown/no-shutdown cycle across one or more
-    Cisco IOS ports, capturing interface status, error counters, and CDP
-    neighbor state before and after each bounce to validate recovery.
-    Results are written as a structured JSON report.
-
-Usage:
-    python batch_port_bounce.py \
-        --host 10.0.0.1 --username admin --password secret \
-        --interfaces GigabitEthernet0/1,GigabitEthernet0/2 \
-        --hold-time 5 --recovery-timeout 60 --output report.json
-
-    # Capture state only (no actual bounce):
-    python batch_port_bounce.py --host 10.0.0.1 -u admin -p secret \
-        --interfaces Gi0/1 --dry-run
+Collects diagnostic information from network devices and generates
+timestamped reports including device version, uptime, CPU/memory usage,
+interface summary, and routing information for documentation and troubleshooting.
 
 Prerequisites:
-    pip install netmiko
-    Tested against Cisco IOS/IOS-XE. Commands used:
-        show ip interface brief interface <intf>
-        show interfaces <intf>
-        show cdp neighbors <intf> detail
+    - netmiko >= 4.0.0
+    - Device must be reachable via SSH (port 22 by default)
+    - Network device must support standard show commands
+
+Usage:
+    python3 device_diagnostics.py -d 192.168.1.1 -t cisco_ios -u admin -p password
+    python3 device_diagnostics.py -d core-router.example.com -t arista_eos -u admin
 """
 
 import argparse
 import json
 import logging
-import sys
-import time
-from datetime import datetime, timezone
+from datetime import datetime
+from pathlib import Path
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoTimeoutException, NetmikoAuthenticationException
 
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
+
+VENDOR_COMMANDS = {
+    'cisco_ios': {
+        'version': 'show version',
+        'interfaces': 'show interface summary',
+        'routing': 'show ip route summary',
+    },
+    'cisco_iosxe': {
+        'version': 'show version',
+        'interfaces': 'show interface summary',
+        'routing': 'show ip route summary',
+    },
+    'arista_eos': {
+        'version': 'show version',
+        'interfaces': 'show interface summary',
+        'routing': 'show ip route summary',
+    },
+    'juniper_junos': {
+        'version': 'show version',
+        'interfaces': 'show interfaces summary',
+        'routing': 'show route summary',
+    },
+}
 
 
-def _utcnow() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def collect_diagnostics(device_params):
+    """Collect diagnostic information from network device."""
+    try:
+        net_connect = ConnectHandler(**device_params)
+        logger.info(f"Connected to {device_params['host']}")
+    except (NetmikoTimeoutException, NetmikoAuthenticationException) as e:
+        logger.error(f"Connection failed to {device_params['host']}: {e}")
+        return None
 
-
-def parse_link_state(brief_output: str) -> tuple:
-    """Return (status, protocol) from 'show ip interface brief' output."""
-    for line in brief_output.splitlines():
-        parts = line.split()
-        if len(parts) >= 6 and not line.strip().lower().startswith("interface"):
-            return parts[4], parts[5]
-    return "unknown", "unknown"
-
-
-def parse_error_counters(intf_output: str) -> dict:
-    """Extract input/output error counts from 'show interfaces' output."""
-    in_errors = out_errors = 0
-    for line in intf_output.splitlines():
-        stripped = line.strip().lower()
-        if "input errors" in stripped:
-            try:
-                in_errors = int(stripped.split()[0])
-            except (ValueError, IndexError):
-                pass
-        elif "output errors" in stripped:
-            try:
-                out_errors = int(stripped.split()[0])
-            except (ValueError, IndexError):
-                pass
-    return {"input_errors": in_errors, "output_errors": out_errors}
-
-
-def get_interface_state(conn, interface: str) -> dict:
-    """Collect status, error counters, and CDP neighbor count for one interface."""
-    brief = conn.send_command(f"show ip interface brief interface {interface}")
-    status, protocol = parse_link_state(brief)
-
-    intf_detail = conn.send_command(f"show interfaces {interface}")
-    errors = parse_error_counters(intf_detail)
-
-    cdp_out = conn.send_command(f"show cdp neighbors {interface} detail")
-    cdp_neighbors = cdp_out.count("Device ID:")
-
-    return {
-        "status": status,
-        "protocol": protocol,
-        "cdp_neighbors": cdp_neighbors,
-        "timestamp": _utcnow(),
-        **errors,
+    diagnostics = {
+        'timestamp': datetime.now().isoformat(),
+        'host': device_params['host'],
+        'device_type': device_params['device_type'],
     }
 
+    device_type = device_params['device_type']
+    if device_type not in VENDOR_COMMANDS:
+        logger.error(f"Unsupported device type: {device_type}")
+        net_connect.disconnect()
+        return None
 
-def wait_for_link_up(conn, interface: str, timeout: int) -> bool:
-    """Poll until interface protocol is 'up' or timeout expires."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        brief = conn.send_command(f"show ip interface brief interface {interface}")
-        _, protocol = parse_link_state(brief)
-        if protocol == "up":
-            return True
-        time.sleep(3)
-    return False
+    try:
+        for key, cmd in VENDOR_COMMANDS[device_type].items():
+            try:
+                output = net_connect.send_command(cmd)
+                diagnostics[key] = output
+                logger.info(f"Collected {key} from {device_params['host']}")
+            except Exception as e:
+                logger.warning(f"Failed to collect {key}: {e}")
+                diagnostics[key] = f"Error: {str(e)}"
+    finally:
+        net_connect.disconnect()
+        logger.info(f"Disconnected from {device_params['host']}")
 
-
-def bounce_interface(conn, interface: str, hold_time: int, recovery_timeout: int) -> dict:
-    """Shut down an interface, pause, re-enable, then wait for recovery."""
-    log.info("  shutdown %s (holding %ds)", interface, hold_time)
-    conn.send_config_set([f"interface {interface}", "shutdown"])
-    time.sleep(hold_time)
-
-    log.info("  no shutdown %s (recovery timeout %ds)", interface, recovery_timeout)
-    conn.send_config_set([f"interface {interface}", "no shutdown"])
-
-    recovered = wait_for_link_up(conn, interface, recovery_timeout)
-    if not recovered:
-        log.warning("  %s did not come back up within %ds", interface, recovery_timeout)
-
-    return {
-        "hold_time_sec": hold_time,
-        "recovery_timeout_sec": recovery_timeout,
-        "recovered": recovered,
-    }
+    return diagnostics
 
 
-def main() -> None:
+def generate_report(diagnostics, output_dir):
+    """Generate timestamped text and JSON reports."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    timestamp = diagnostics['timestamp'].replace(':', '-').split('.')[0]
+    host = diagnostics['host'].replace('.', '_')
+
+    txt_file = output_path / f"{host}_diagnostics_{timestamp}.txt"
+    with open(txt_file, 'w') as f:
+        f.write("=" * 70 + "\n")
+        f.write("NETWORK DEVICE DIAGNOSTIC REPORT\n")
+        f.write("=" * 70 + "\n")
+        f.write(f"Device: {diagnostics['host']}\n")
+        f.write(f"Type: {diagnostics['device_type']}\n")
+        f.write(f"Timestamp: {diagnostics['timestamp']}\n")
+        f.write("=" * 70 + "\n")
+
+        for key, value in diagnostics.items():
+            if key not in ['timestamp', 'host', 'device_type']:
+                f.write(f"\n{key.upper()}\n")
+                f.write("-" * 70 + "\n")
+                f.write(f"{value}\n")
+
+    logger.info(f"Text report saved: {txt_file}")
+
+    json_file = output_path / f"{host}_diagnostics_{timestamp}.json"
+    with open(json_file, 'w') as f:
+        json.dump(diagnostics, f, indent=2)
+
+    logger.info(f"JSON report saved: {json_file}")
+    return str(txt_file), str(json_file)
+
+
+def main():
+    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Batch port bounce with pre/post state capture and JSON report"
+        description='Generate network device diagnostic reports',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--host", required=True, help="Device IP or hostname")
-    parser.add_argument("--username", "-u", required=True)
-    parser.add_argument("--password", "-p", required=True)
-    parser.add_argument(
-        "--device-type",
-        default="cisco_ios",
-        help="Netmiko device type (default: cisco_ios)",
-    )
-    parser.add_argument(
-        "--interfaces",
-        required=True,
-        help="Comma-separated interface names, e.g. Gi0/1,Gi0/2",
-    )
-    parser.add_argument(
-        "--hold-time",
-        type=int,
-        default=5,
-        metavar="SECS",
-        help="Seconds to hold the port down before re-enabling (default: 5)",
-    )
-    parser.add_argument(
-        "--recovery-timeout",
-        type=int,
-        default=60,
-        metavar="SECS",
-        help="Seconds to wait for link to recover after re-enable (default: 60)",
-    )
-    parser.add_argument(
-        "--output",
-        default=None,
-        metavar="FILE",
-        help="Write JSON report to FILE (default: stdout)",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Capture interface state only; skip the actual bounce",
-    )
+
+    parser.add_argument('-d', '--device', required=True,
+                        help='Device IP address or hostname')
+    parser.add_argument('-t', '--type', required=True, dest='device_type',
+                        help='Device type (cisco_ios, arista_eos, juniper_junos, etc.)')
+    parser.add_argument('-u', '--username', required=True,
+                        help='Username for device authentication')
+    parser.add_argument('-p', '--password', help='Password (prompted if not provided)')
+    parser.add_argument('-o', '--output', default='./reports',
+                        help='Output directory for reports (default: ./reports)')
+    parser.add_argument('--port', type=int, default=22,
+                        help='SSH port (default: 22)')
+    parser.add_argument('--timeout', type=int, default=30,
+                        help='Connection timeout in seconds (default: 30)')
+
     args = parser.parse_args()
 
-    interfaces = [i.strip() for i in args.interfaces.split(",") if i.strip()]
-    if not interfaces:
-        log.error("No interfaces provided via --interfaces")
-        sys.exit(1)
+    import getpass
+    password = args.password or getpass.getpass(f"Password for {args.username}: ")
 
-    try:
-        log.info("Connecting to %s", args.host)
-        conn = ConnectHandler(
-            device_type=args.device_type,
-            host=args.host,
-            username=args.username,
-            password=args.password,
-        )
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s", args.host)
-        sys.exit(1)
-    except NetmikoTimeoutException:
-        log.error("Connection timed out to %s", args.host)
-        sys.exit(1)
-
-    results = []
-    try:
-        for intf in interfaces:
-            log.info("Processing %s", intf)
-            entry = {"interface": intf, "pre": get_interface_state(conn, intf)}
-
-            if args.dry_run:
-                log.info("  dry-run: skipping bounce")
-            else:
-                entry["bounce"] = bounce_interface(
-                    conn, intf, args.hold_time, args.recovery_timeout
-                )
-                entry["post"] = get_interface_state(conn, intf)
-                outcome = "recovered" if entry["bounce"]["recovered"] else "FAILED"
-                log.info("  %s: %s", intf, outcome)
-
-            results.append(entry)
-    finally:
-        conn.disconnect()
-
-    bounced = len(results) if not args.dry_run else 0
-    recovered_count = sum(
-        1 for r in results if r.get("bounce", {}).get("recovered", False)
-    )
-
-    report = {
-        "host": args.host,
-        "generated_at": _utcnow(),
-        "dry_run": args.dry_run,
-        "summary": {
-            "total_interfaces": len(results),
-            "bounced": bounced,
-            "recovered": recovered_count,
-            "failed_recovery": bounced - recovered_count,
-        },
-        "interfaces": results,
+    device_params = {
+        'device_type': args.device_type,
+        'host': args.device,
+        'username': args.username,
+        'password': password,
+        'port': args.port,
+        'timeout': args.timeout,
     }
 
-    payload = json.dumps(report, indent=2)
-    if args.output:
-        with open(args.output, "w") as fh:
-            fh.write(payload)
-        log.info("Report written to %s", args.output)
+    logger.info(f"Starting diagnostic collection for {args.device}")
+    diagnostics = collect_diagnostics(device_params)
+
+    if diagnostics:
+        txt_file, json_file = generate_report(diagnostics, args.output)
+        logger.info(f"Diagnostic collection completed successfully")
+        logger.info(f"Reports: {txt_file} and {json_file}")
+        return 0
     else:
-        print(payload)
+        logger.error("Failed to collect diagnostics from device")
+        return 1
 
-    sys.exit(1 if report["summary"]["failed_recovery"] else 0)
 
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    exit(main())
+```
