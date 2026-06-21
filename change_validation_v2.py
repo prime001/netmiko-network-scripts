@@ -1,209 +1,182 @@
 ```python
+#!/usr/bin/env python3
 """
-bgp_state_checker.py - BGP Neighbor State Validator
+Interface Error Detector - Identifies problematic network interfaces.
 
 Purpose:
-    Connects to a router and validates BGP neighbor states. Designed as a
-    pre/post change validation tool to confirm all BGP sessions remain
-    established after network maintenance windows.
+    Connects to network devices and analyzes interface statistics to identify
+    ports with errors, discards, or other anomalies. Generates a report of
+    problematic interfaces that may indicate hardware or configuration issues.
 
 Usage:
-    # Show all current BGP neighbor states
-    python bgp_state_checker.py --host 192.168.1.1 --username admin --password secret
-
-    # Save pre-change baseline
-    python bgp_state_checker.py --host 192.168.1.1 --username admin \
-        --password secret --save-baseline /tmp/bgp_pre.json
-
-    # Validate post-change state against baseline
-    python bgp_state_checker.py --host 192.168.1.1 --username admin \
-        --password secret --compare-baseline /tmp/bgp_pre.json
-
-    # Assert specific neighbors are Established (exits non-zero on failure)
-    python bgp_state_checker.py --host 192.168.1.1 --username admin \
-        --password secret --expected-neighbors peers.txt
+    python interface_error_detector.py -d 192.168.1.1 -u admin -p password
+    python interface_error_detector.py -i devices.txt -u admin -p password
 
 Prerequisites:
-    pip install netmiko
-    Supported: cisco_ios, cisco_ios_xe, cisco_xr, juniper_junos
+    - netmiko library: pip install netmiko
+    - Network credentials with read access to devices
+    - SSH access on port 22
+
+Arguments:
+    --device/-d: Single device IP address
+    --input/-i: File with list of device IPs (one per line)
+    --username/-u: Device username
+    --password/-p: Device password
+    --device-type/-t: Netmiko device type (default: cisco_ios)
 """
 
-import argparse
-import json
 import logging
-import re
+import argparse
 import sys
-from pathlib import Path
-
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
-
-logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
-log = logging.getLogger(__name__)
-
-SHOW_BGP_COMMANDS = {
-    "cisco_ios": "show ip bgp summary",
-    "cisco_ios_xe": "show ip bgp summary",
-    "cisco_xr": "show bgp summary",
-    "juniper_junos": "show bgp summary",
-}
-
-IOS_NEIGHBOR_RE = re.compile(
-    r"^(\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\S+\s+(\S+)",
-    re.MULTILINE,
-)
+import os
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 
-def parse_bgp_neighbors(output: str, device_type: str) -> dict:
-    neighbors = {}
-    if device_type in ("cisco_ios", "cisco_ios_xe", "cisco_xr"):
-        for match in IOS_NEIGHBOR_RE.finditer(output):
-            neighbors[match.group(1)] = match.group(2)
-    elif device_type == "juniper_junos":
-        for line in output.splitlines():
-            parts = line.split()
-            if len(parts) >= 2 and re.match(r"\d{1,3}(?:\.\d{1,3}){3}", parts[0]):
-                neighbors[parts[0]] = parts[-1]
-    return neighbors
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 
-def is_established(state: str) -> bool:
-    return state.lower() in ("established", "estab")
-
-
-def check_required(neighbors: dict, required: list) -> list:
-    failures = []
-    for ip in required:
-        state = neighbors.get(ip)
-        if state is None:
-            failures.append(f"{ip}: not present in BGP table")
-        elif not is_established(state):
-            failures.append(f"{ip}: state={state} (expected Established)")
-    return failures
-
-
-def diff_baseline(current: dict, baseline: dict) -> list:
-    diffs = []
-    for ip, old_state in baseline.items():
-        new_state = current.get(ip)
-        if new_state is None:
-            diffs.append(f"{ip}: disappeared (was {old_state})")
-        elif new_state.lower() != old_state.lower():
-            diffs.append(f"{ip}: {old_state} -> {new_state}")
-    for ip in current:
-        if ip not in baseline:
-            diffs.append(f"{ip}: new neighbor added (state={current[ip]})")
-    return diffs
-
-
-def fetch_bgp_neighbors(args) -> dict:
-    device_params = {
-        "device_type": args.device_type,
-        "host": args.host,
-        "username": args.username,
-        "password": args.password,
-        "port": args.port,
-        "conn_timeout": 30,
-    }
-    command = SHOW_BGP_COMMANDS[args.device_type]
-    log.info("Connecting to %s as %s", args.host, args.username)
+def connect_device(host, username, password, device_type, port=22):
+    """Connect to network device via SSH."""
     try:
-        with ConnectHandler(**device_params) as conn:
-            log.info("Fetching: %s", command)
-            output = conn.send_command(command, read_timeout=60)
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s", args.host)
-        sys.exit(1)
-    except NetmikoTimeoutException:
-        log.error("Connection timed out to %s", args.host)
-        sys.exit(1)
+        device = ConnectHandler(
+            device_type=device_type,
+            host=host,
+            username=username,
+            password=password,
+            port=port,
+            timeout=20
+        )
+        logger.info(f"Connected to {host}")
+        return device
+    except (NetmikoAuthenticationException, NetmikoTimeoutException) as e:
+        logger.error(f"Failed to connect to {host}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error connecting to {host}: {e}")
+        return None
 
-    neighbors = parse_bgp_neighbors(output, args.device_type)
-    log.info("Parsed %d BGP neighbors", len(neighbors))
-    return neighbors
+
+def parse_cisco_interfaces(output):
+    """Parse 'show interface' output for error statistics."""
+    interfaces = {}
+    current_iface = None
+    
+    for line in output.split('\n'):
+        line = line.strip()
+        if line and line[0] in ('*', ' ') and ' is ' in line:
+            current_iface = line.split()[0].lstrip('*')
+            interfaces[current_iface] = {'errors': 0, 'discards': 0}
+        
+        if current_iface:
+            if 'input errors' in line.lower():
+                try:
+                    errors = int(line.split(',')[0].split()[0])
+                    interfaces[current_iface]['errors'] = errors
+                except (ValueError, IndexError):
+                    pass
+            if 'discards' in line.lower() and 'input' in line.lower():
+                try:
+                    parts = line.split(',')
+                    for part in parts:
+                        if 'discards' in part.lower():
+                            discards = int(part.split()[0])
+                            interfaces[current_iface]['discards'] = discards
+                            break
+                except (ValueError, IndexError):
+                    pass
+    
+    return {iface: stats for iface, stats in interfaces.items() 
+            if stats['errors'] > 0 or stats['discards'] > 0}
+
+
+def analyze_device(device, device_type):
+    """Gather interface statistics from device."""
+    try:
+        if 'cisco' in device_type.lower():
+            output = device.send_command('show interface')
+            return parse_cisco_interfaces(output)
+        logger.warning(f"Device type {device_type} not fully supported")
+        return {}
+    except Exception as e:
+        logger.error(f"Error analyzing device: {e}")
+        return {}
+
+
+def load_devices(filename):
+    """Load device IPs from file."""
+    try:
+        with open(filename, 'r') as f:
+            devices = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        logger.info(f"Loaded {len(devices)} devices from {filename}")
+        return devices
+    except FileNotFoundError:
+        logger.error(f"File not found: {filename}")
+        return []
+
+
+def print_report(results):
+    """Display interface error report."""
+    print("\n" + "="*70)
+    print("INTERFACE ERROR DETECTION REPORT")
+    print("="*70)
+    
+    total_problems = 0
+    for device, interfaces in results.items():
+        if interfaces:
+            print(f"\n{device}:")
+            print(f"{'Interface':<20} {'Errors':<15} {'Discards':<15}")
+            print("-"*70)
+            for iface, stats in interfaces.items():
+                print(f"{iface:<20} {stats['errors']:<15} {stats['discards']:<15}")
+                total_problems += 1
+        else:
+            print(f"\n{device}: No problematic interfaces")
+    
+    print("\n" + "="*70)
+    print(f"Total problematic interfaces: {total_problems}")
+    print("="*70 + "\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Validate BGP neighbor states")
-    parser.add_argument("--host", required=True, help="Device IP or hostname")
-    parser.add_argument("--username", required=True)
-    parser.add_argument("--password", required=True)
-    parser.add_argument(
-        "--device-type",
-        default="cisco_ios",
-        choices=list(SHOW_BGP_COMMANDS.keys()),
-        help="Netmiko device type (default: cisco_ios)",
+    parser = argparse.ArgumentParser(
+        description='Detect and report network interface errors and discards'
     )
-    parser.add_argument("--port", type=int, default=22)
-    parser.add_argument(
-        "--expected-neighbors",
-        metavar="FILE",
-        help="File with one neighbor IP per line; exits 1 if any not Established",
-    )
-    parser.add_argument(
-        "--save-baseline",
-        metavar="FILE",
-        help="Write current BGP state to JSON for later comparison",
-    )
-    parser.add_argument(
-        "--compare-baseline",
-        metavar="FILE",
-        help="Diff current state against a saved baseline JSON",
-    )
-    parser.add_argument("--debug", action="store_true")
+    parser.add_argument('-d', '--device', help='Single device IP address')
+    parser.add_argument('-i', '--input', help='File with device IPs (one per line)')
+    parser.add_argument('-u', '--username', required=True, help='Device username')
+    parser.add_argument('-p', '--password', help='Device password')
+    parser.add_argument('-t', '--device-type', default='cisco_ios', help='Device type for netmiko')
+    parser.add_argument('--port', type=int, default=22, help='SSH port (default: 22)')
+    
     args = parser.parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    neighbors = fetch_bgp_neighbors(args)
-    for ip, state in sorted(neighbors.items()):
-        log.info("  %-20s  %s", ip, state)
-
-    exit_code = 0
-
-    if args.save_baseline:
-        Path(args.save_baseline).write_text(json.dumps(neighbors, indent=2))
-        log.info("Baseline saved to %s", args.save_baseline)
-
-    if args.compare_baseline:
-        baseline = json.loads(Path(args.compare_baseline).read_text())
-        diffs = diff_baseline(neighbors, baseline)
-        if not diffs:
-            log.info("PASS: BGP state matches baseline (%d neighbors)", len(neighbors))
-        else:
-            log.error("FAIL: %d difference(s) from baseline:", len(diffs))
-            for d in diffs:
-                log.error("  %s", d)
-            exit_code = 1
-
-    if args.expected_neighbors:
-        required = [
-            line.strip()
-            for line in Path(args.expected_neighbors).read_text().splitlines()
-            if line.strip() and not line.startswith("#")
-        ]
-        failures = check_required(neighbors, required)
-        if not failures:
-            log.info("PASS: All %d required neighbors are Established", len(required))
-        else:
-            log.error("FAIL: %d neighbor(s) not Established:", len(failures))
-            for f in failures:
-                log.error("  %s", f)
-            exit_code = 1
-
-    if not any([args.expected_neighbors, args.compare_baseline, args.save_baseline]):
-        not_up = {ip: st for ip, st in neighbors.items() if not is_established(st)}
-        if not_up:
-            log.warning("%d neighbor(s) not in Established state:", len(not_up))
-            for ip, st in sorted(not_up.items()):
-                log.warning("  %-20s  %s", ip, st)
-            exit_code = 1
-        else:
-            log.info("PASS: All %d neighbors Established", len(neighbors))
-
-    sys.exit(exit_code)
+    
+    if not args.device and not args.input:
+        parser.error('Provide either --device or --input')
+    
+    password = args.password or os.environ.get('SSH_PASSWORD')
+    if not password:
+        parser.error('Password required (use -p or SSH_PASSWORD environment variable)')
+    
+    devices = [args.device] if args.device else load_devices(args.input)
+    if not devices:
+        logger.error('No devices to process')
+        sys.exit(1)
+    
+    results = {}
+    for host in devices:
+        device = connect_device(host, args.username, password, args.device_type, args.port)
+        if device:
+            try:
+                results[host] = analyze_device(device, args.device_type)
+            finally:
+                device.disconnect()
+                logger.info(f"Disconnected from {host}")
+    
+    print_report(results)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
 ```
