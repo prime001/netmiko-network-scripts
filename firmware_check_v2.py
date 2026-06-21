@@ -1,56 +1,75 @@
-firmware_compliance.py - Network Device Firmware Compliance Reporter
+firmware_compliance.py - Network device firmware compliance auditor.
 
-Purpose:
-    Compares running firmware versions on network devices against a required-version
-    policy file. Produces a per-device compliance report and optional CSV export.
-    Useful for audits, change-freeze enforcement, and CVE remediation tracking.
-
-Usage:
-    python firmware_compliance.py --host 192.168.1.1 --device-type cisco_ios \
-        --username admin --password secret --policy policy.yaml
-
-    python firmware_compliance.py --host-file hosts.txt --policy policy.yaml \
-        --output compliance_report.csv
-
-Policy file format (YAML):
-    cisco_ios:
-      required: "15.9(3)M6"
-    cisco_nxos:
-      required: "9.3(8)"
-    arista_eos:
-      required: "4.28.3M"
-
-hosts.txt format (one entry per line):
-    192.168.1.1:cisco_ios
-    192.168.1.2:cisco_nxos
+Connects to one or more network devices via SSH (netmiko), retrieves the
+running firmware/OS version, and compares it against a user-supplied policy
+that maps device platform to a minimum acceptable version string.
 
 Prerequisites:
     pip install netmiko pyyaml
+
+Usage:
+    # Single device check
+    python firmware_compliance.py --host 192.168.1.1 --device-type cisco_ios \
+        --username admin --password secret --policy policy.yaml
+
+    # Batch check from CSV (columns: host,device_type,username,password)
+    python firmware_compliance.py --inventory devices.csv --policy policy.yaml \
+        --output report.csv
+
+Policy file (YAML) example:
+    cisco_ios: "15.2"
+    cisco_nxos: "9.3"
+    cisco_xe: "17.3"
+    juniper_junos: "20.2"
+
+Exit codes:
+    0 - All devices compliant
+    1 - One or more devices non-compliant or unreachable
 """
 
 import argparse
 import csv
 import logging
+import re
 import sys
 from dataclasses import dataclass
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional
 
-import yaml
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 VERSION_COMMANDS = {
-    "cisco_ios": "show version | include Version",
-    "cisco_nxos": "show version | include NXOS",
-    "cisco_xr": "show version | include Version",
-    "juniper_junos": "show version | match Junos",
-    "arista_eos": "show version | include Software image version",
+    "cisco_ios": "show version",
+    "cisco_xe": "show version",
+    "cisco_nxos": "show version",
+    "cisco_xr": "show version",
+    "juniper_junos": "show version",
+    "arista_eos": "show version",
+    "hp_comware": "display version",
+}
+
+VERSION_PATTERNS = {
+    "cisco_ios": r"Cisco IOS Software.*Version\s+(\S+),",
+    "cisco_xe": r"Cisco IOS XE Software.*Version\s+(\S+)",
+    "cisco_nxos": r"NXOS:\s+version\s+(\S+)",
+    "cisco_xr": r"Cisco IOS XR Software.*Version\s+(\S+)",
+    "juniper_junos": r"Junos:\s+(\S+)",
+    "arista_eos": r"EOS version:\s+(\S+)",
+    "hp_comware": r"Software Version\s+(\S+)",
 }
 
 
@@ -58,180 +77,187 @@ VERSION_COMMANDS = {
 class DeviceResult:
     host: str
     device_type: str
-    running_version: Optional[str] = None
+    current_version: Optional[str] = None
     required_version: Optional[str] = None
-    status: str = "UNKNOWN"
+    compliant: Optional[bool] = None
     error: Optional[str] = None
 
 
-def get_running_version(host: str, device_type: str, username: str, password: str,
-                        port: int = 22, secret: str = "") -> Optional[str]:
-    cmd = VERSION_COMMANDS.get(device_type)
-    if not cmd:
-        raise ValueError(f"Unsupported device type: {device_type}")
-
-    device = {
-        "device_type": device_type,
-        "host": host,
-        "username": username,
-        "password": password,
-        "port": port,
-        "secret": secret or password,
-        "timeout": 30,
-    }
-    with ConnectHandler(**device) as conn:
-        output = conn.send_command(cmd)
-
-    version_line = output.strip().splitlines()[0] if output.strip() else ""
-    for delimiter in ("Version ", "version ", ": "):
-        if delimiter in version_line:
-            return version_line.split(delimiter)[-1].split()[0].rstrip(",")
-    return version_line or None
-
-
 def load_policy(policy_file: str) -> dict:
-    with open(policy_file) as f:
+    path = Path(policy_file)
+    if not path.exists():
+        logger.error("Policy file not found: %s", policy_file)
+        sys.exit(1)
+    if not HAS_YAML:
+        logger.error("pyyaml is required; pip install pyyaml")
+        sys.exit(1)
+    with open(path) as f:
         return yaml.safe_load(f) or {}
 
 
-def check_device(host: str, device_type: str, username: str, password: str,
-                 policy: dict, port: int = 22, secret: str = "") -> DeviceResult:
-    result = DeviceResult(host=host, device_type=device_type)
-    policy_entry = policy.get(device_type, {})
-    result.required_version = policy_entry.get("required")
+def load_inventory(csv_file: str) -> List[dict]:
+    path = Path(csv_file)
+    if not path.exists():
+        logger.error("Inventory file not found: %s", csv_file)
+        sys.exit(1)
+    with open(path, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def extract_version(output: str, device_type: str) -> Optional[str]:
+    pattern = VERSION_PATTERNS.get(device_type)
+    if not pattern:
+        return None
+    match = re.search(pattern, output, re.IGNORECASE)
+    return match.group(1).rstrip(",") if match else None
+
+
+def is_version_compliant(current: str, required: str) -> bool:
+    def normalize(v):
+        return [int(x) if x.isdigit() else x for x in re.split(r"[.()\-]", v) if x]
 
     try:
-        result.running_version = get_running_version(
-            host, device_type, username, password, port, secret
-        )
-    except NetmikoAuthenticationException:
-        result.status = "AUTH_FAILED"
-        result.error = "Authentication failed"
-        log.error("%s: authentication failed", host)
-        return result
-    except NetmikoTimeoutException:
-        result.status = "TIMEOUT"
-        result.error = "Connection timed out"
-        log.error("%s: connection timed out", host)
-        return result
-    except Exception as exc:
-        result.status = "ERROR"
-        result.error = str(exc)
-        log.error("%s: %s", host, exc)
+        return normalize(current) >= normalize(required)
+    except TypeError:
+        return current >= required
+
+
+def check_device(host: str, device_type: str, username: str, password: str,
+                 policy: dict, port: int = 22) -> DeviceResult:
+    result = DeviceResult(host=host, device_type=device_type)
+    result.required_version = policy.get(device_type)
+
+    command = VERSION_COMMANDS.get(device_type)
+    if not command:
+        result.error = f"Unsupported device type: {device_type}"
+        logger.warning("[%s] %s", host, result.error)
         return result
 
-    if not result.required_version:
-        result.status = "NO_POLICY"
-        log.warning("%s: no policy defined for %s", host, device_type)
-    elif result.running_version == result.required_version:
-        result.status = "COMPLIANT"
-        log.info("%s: COMPLIANT (%s)", host, result.running_version)
-    else:
-        result.status = "NON_COMPLIANT"
-        log.warning(
-            "%s: NON_COMPLIANT — running %s, required %s",
-            host, result.running_version, result.required_version,
-        )
+    logger.info("[%s] Connecting (%s)", host, device_type)
+    try:
+        with ConnectHandler(
+            device_type=device_type,
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            timeout=30,
+            session_timeout=60,
+        ) as conn:
+            output = conn.send_command(command, read_timeout=30)
+
+        result.current_version = extract_version(output, device_type)
+        if result.current_version is None:
+            result.error = "Could not parse version from output"
+            logger.warning("[%s] %s", host, result.error)
+        elif result.required_version:
+            result.compliant = is_version_compliant(
+                result.current_version, result.required_version
+            )
+            status = "COMPLIANT" if result.compliant else "NON-COMPLIANT"
+            logger.info(
+                "[%s] %s — current=%s required>=%s",
+                host, status, result.current_version, result.required_version,
+            )
+        else:
+            logger.info("[%s] version=%s (no policy defined for %s)",
+                        host, result.current_version, device_type)
+
+    except NetmikoAuthenticationException:
+        result.error = "Authentication failed"
+        logger.error("[%s] %s", host, result.error)
+    except NetmikoTimeoutException:
+        result.error = "Connection timed out"
+        logger.error("[%s] %s", host, result.error)
+    except Exception as exc:
+        result.error = str(exc)
+        logger.error("[%s] Unexpected error: %s", host, exc)
+
     return result
 
 
-def print_summary(results: list) -> None:
-    compliant = sum(1 for r in results if r.status == "COMPLIANT")
-    non_compliant = sum(1 for r in results if r.status == "NON_COMPLIANT")
-    errors = sum(1 for r in results if r.status in ("AUTH_FAILED", "TIMEOUT", "ERROR"))
-    no_policy = len(results) - compliant - non_compliant - errors
-
-    print(f"\n{'=' * 60}")
-    print("Firmware Compliance Summary")
-    print(f"{'=' * 60}")
-    print(f"  Total devices : {len(results)}")
-    print(f"  Compliant     : {compliant}")
-    print(f"  Non-compliant : {non_compliant}")
-    print(f"  Errors        : {errors}")
-    print(f"  No policy     : {no_policy}")
-    print(f"{'=' * 60}")
-
-    markers = {"COMPLIANT": "OK", "NON_COMPLIANT": "!!", "NO_POLICY": "--"}
-    for r in results:
-        marker = markers.get(r.status, "XX")
-        ver_info = f"{r.running_version or 'N/A'} (required: {r.required_version or 'N/A'})"
-        print(f"  [{marker}] {r.host:<20} {r.status:<14} {ver_info}")
-    print()
-
-
-def write_csv(results: list, path: str) -> None:
-    fields = ["host", "device_type", "running_version", "required_version", "status", "error"]
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
+def write_report(results: List[DeviceResult], output_file: str) -> None:
+    fieldnames = ["host", "device_type", "current_version",
+                  "required_version", "compliant", "error"]
+    with open(output_file, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for r in results:
             writer.writerow({
                 "host": r.host,
                 "device_type": r.device_type,
-                "running_version": r.running_version or "",
+                "current_version": r.current_version or "",
                 "required_version": r.required_version or "",
-                "status": r.status,
+                "compliant": "" if r.compliant is None else str(r.compliant),
                 "error": r.error or "",
             })
-    log.info("Report written to %s", path)
+    logger.info("Report written to %s", output_file)
 
 
-def parse_args():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Check network device firmware versions against a compliance policy."
+        description="Audit network device firmware compliance against a version policy.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--host", help="Single device IP or hostname")
-    group.add_argument("--host-file", help="File with one host:device_type per line")
-    parser.add_argument("--device-type", help="Netmiko device type (required with --host)")
-    parser.add_argument("--username", required=True)
-    parser.add_argument("--password", required=True)
-    parser.add_argument("--secret", default="", help="Enable secret")
-    parser.add_argument("--port", type=int, default=22)
-    parser.add_argument("--policy", required=True, help="YAML policy file")
-    parser.add_argument("--output", help="Write results to CSV file")
-    parser.add_argument("--debug", action="store_true")
-    return parser.parse_args()
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--host", help="Single device IP/hostname")
+    target.add_argument("--inventory", help="CSV file (columns: host,device_type,username,password)")
+
+    parser.add_argument("--device-type", default="cisco_ios",
+                        choices=list(VERSION_COMMANDS.keys()),
+                        help="Netmiko device type for single-host mode")
+    parser.add_argument("--username", help="SSH username (single-host mode)")
+    parser.add_argument("--password", help="SSH password (single-host mode)")
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument("--policy", required=True,
+                        help="YAML file mapping device_type to minimum required version")
+    parser.add_argument("--output", help="Write results to this CSV file")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    return parser
 
 
-if __name__ == "__main__":
-    args = parse_args()
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    if args.host and not args.device_type:
-        print("ERROR: --device-type is required when using --host", file=sys.stderr)
-        sys.exit(1)
-
     policy = load_policy(args.policy)
 
-    targets = []
+    devices = []
     if args.host:
-        targets = [(args.host, args.device_type)]
+        if not args.username or not args.password:
+            parser.error("--username and --password are required with --host")
+        devices.append({
+            "host": args.host,
+            "device_type": args.device_type,
+            "username": args.username,
+            "password": args.password,
+            "port": str(args.port),
+        })
     else:
-        with open(args.host_file) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split(":", 1)
-                if len(parts) != 2:
-                    log.warning("Skipping malformed line: %s", line)
-                    continue
-                targets.append((parts[0].strip(), parts[1].strip()))
+        devices = load_inventory(args.inventory)
 
     results = []
-    for host, device_type in targets:
+    for dev in devices:
         result = check_device(
-            host, device_type, args.username, args.password,
-            policy, args.port, args.secret,
+            host=dev["host"],
+            device_type=dev.get("device_type", "cisco_ios"),
+            username=dev["username"],
+            password=dev["password"],
+            policy=policy,
+            port=int(dev.get("port", args.port)),
         )
         results.append(result)
 
-    print_summary(results)
-
     if args.output:
-        write_csv(results, args.output)
+        write_report(results, args.output)
 
-    sys.exit(1 if any(r.status == "NON_COMPLIANT" for r in results) else 0)
+    non_compliant = sum(1 for r in results if r.compliant is False or r.error)
+    logger.info("Summary: %d checked, %d non-compliant/error", len(results), non_compliant)
+    return 1 if non_compliant else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
