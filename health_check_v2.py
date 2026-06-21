@@ -1,19 +1,20 @@
-```python
-"""
-interface_error_monitor.py — Interface Error Counter Monitor
+bgp_session_monitor.py - BGP neighbor session state checker using netmiko.
 
-Connects to a network device via SSH and audits interface error counters
-(CRC, runts, giants, input/output errors, drops). Flags any interface
-exceeding configurable thresholds and optionally writes JSON results for
-downstream monitoring integration.
+Purpose:
+    Connect to one or more Cisco IOS/IOS-XE/NX-OS devices and report the
+    state of all BGP neighbor sessions. Flags any session not in the
+    Established state and exits with code 1 if issues are found, making it
+    suitable for integration with monitoring systems (Nagios, Zabbix, etc.).
 
 Usage:
-    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret
-    python interface_error_monitor.py -d 10.0.0.1 -u admin -p secret \\
-        --device-type cisco_ios --crc-threshold 10 --output errors.json
+    python bgp_session_monitor.py -H 192.168.1.1 -u admin -p secret
+    python bgp_session_monitor.py -H 192.168.1.1 192.168.1.2 -u admin
+    python bgp_session_monitor.py -H 192.168.1.1 -u admin --vrf MGMT --json
 
 Prerequisites:
     pip install netmiko
+    SSH access to target device(s) with at least privilege level 1.
+    BGP must be configured on the device.
 """
 
 import argparse
@@ -21,202 +22,160 @@ import json
 import logging
 import re
 import sys
-from dataclasses import dataclass, field, asdict
-from typing import Optional
+from getpass import getpass
 
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-@dataclass
-class InterfaceErrors:
-    name: str
-    crc: int = 0
-    input_errors: int = 0
-    output_errors: int = 0
-    runts: int = 0
-    giants: int = 0
-    input_drops: int = 0
-    output_drops: int = 0
-    flagged: bool = False
-    flags: list = field(default_factory=list)
+def parse_bgp_summary(output):
+    """Parse 'show ip bgp summary' output into neighbor dicts.
 
-
-def parse_ios_interface_errors(output: str) -> list[InterfaceErrors]:
-    interfaces = []
-    current: Optional[InterfaceErrors] = None
-
-    intf_re = re.compile(r"^(\S+) is ")
-    crc_re = re.compile(r"(\d+) CRC")
-    input_err_re = re.compile(r"(\d+) input errors")
-    output_err_re = re.compile(r"(\d+) output errors")
-    runts_re = re.compile(r"(\d+) runts")
-    giants_re = re.compile(r"(\d+) giants")
-    in_drop_re = re.compile(r"(\d+) input drops", re.IGNORECASE)
-    out_drop_re = re.compile(r"(\d+) output drops", re.IGNORECASE)
-
+    In IOS BGP summary, established neighbors show a prefix count (integer)
+    in the State/PfxRcd column; non-established show the FSM state name.
+    """
+    neighbors = []
+    pattern = re.compile(
+        r"^(\d{1,3}(?:\.\d{1,3}){3})\s+"
+        r"(\d+)\s+"
+        r"(\d+)\s+"
+        r"\d+\s+\d+\s+\d+\s+\d+\s+"
+        r"(\S+)\s+"
+        r"(\S+)$"
+    )
     for line in output.splitlines():
-        m = intf_re.match(line)
-        if m:
-            if current:
-                interfaces.append(current)
-            current = InterfaceErrors(name=m.group(1))
-            continue
-        if current is None:
-            continue
-        for pattern, attr in [
-            (crc_re, "crc"),
-            (input_err_re, "input_errors"),
-            (output_err_re, "output_errors"),
-            (runts_re, "runts"),
-            (giants_re, "giants"),
-            (in_drop_re, "input_drops"),
-            (out_drop_re, "output_drops"),
-        ]:
-            hit = pattern.search(line)
-            if hit:
-                setattr(current, attr, int(hit.group(1)))
-
-    if current:
-        interfaces.append(current)
-    return interfaces
+        match = pattern.match(line.strip())
+        if match:
+            neighbor, version, asn, up_down, state_or_pfx = match.groups()
+            established = state_or_pfx.lstrip("(").rstrip(")").isdigit()
+            neighbors.append({
+                "neighbor": neighbor,
+                "as": int(asn),
+                "uptime": up_down,
+                "state": "Established" if established else state_or_pfx,
+                "prefixes_received": int(state_or_pfx) if established else None,
+                "established": established,
+            })
+    return neighbors
 
 
-def apply_thresholds(
-    interfaces: list[InterfaceErrors],
-    crc_thresh: int,
-    error_thresh: int,
-    drop_thresh: int,
-) -> list[InterfaceErrors]:
-    for intf in interfaces:
-        if intf.crc >= crc_thresh:
-            intf.flags.append(f"CRC={intf.crc} >= {crc_thresh}")
-        if intf.input_errors >= error_thresh:
-            intf.flags.append(f"input_errors={intf.input_errors} >= {error_thresh}")
-        if intf.output_errors >= error_thresh:
-            intf.flags.append(f"output_errors={intf.output_errors} >= {error_thresh}")
-        if intf.input_drops + intf.output_drops >= drop_thresh:
-            total = intf.input_drops + intf.output_drops
-            intf.flags.append(f"drops={total} >= {drop_thresh}")
-        intf.flagged = bool(intf.flags)
-    return interfaces
+def check_bgp_sessions(device_params, vrf=None):
+    """Connect to a device and return (neighbors, error_string)."""
+    host = device_params["host"]
+    cmd = "show ip bgp summary"
+    if vrf:
+        cmd = f"show ip bgp vrf {vrf} summary"
+
+    try:
+        logger.info("Connecting to %s", host)
+        with ConnectHandler(**device_params) as conn:
+            output = conn.send_command(cmd, read_timeout=30)
+        logger.info("Disconnected from %s", host)
+    except NetmikoAuthenticationException:
+        return None, f"Authentication failed for {host}"
+    except NetmikoTimeoutException:
+        return None, f"Connection timed out for {host}"
+    except Exception as exc:
+        logger.error("Unexpected error on %s: %s", host, exc)
+        return None, str(exc)
+
+    if any(marker in output for marker in ("% Invalid", "% BGP not active", "not running")):
+        return [], None
+
+    return parse_bgp_summary(output), None
 
 
-def check_device(
-    host: str,
-    username: str,
-    password: str,
-    device_type: str,
-    port: int,
-    crc_thresh: int,
-    error_thresh: int,
-    drop_thresh: int,
-) -> list[InterfaceErrors]:
-    device = {
-        "device_type": device_type,
-        "host": host,
-        "username": username,
-        "password": password,
-        "port": port,
-    }
-    log.info("Connecting to %s (%s)", host, device_type)
-    with ConnectHandler(**device) as conn:
-        output = conn.send_command("show interfaces", read_timeout=60)
-    log.info("Parsing interface error counters")
-    interfaces = parse_ios_interface_errors(output)
-    return apply_thresholds(interfaces, crc_thresh, error_thresh, drop_thresh)
+def render_text(host, neighbors, error):
+    """Print a human-readable report for one device."""
+    if error:
+        print(f"[ERROR] {host}: {error}")
+        return
+
+    if not neighbors:
+        print(f"[INFO]  {host}: BGP not active or no neighbors configured")
+        return
+
+    down = [n for n in neighbors if not n["established"]]
+    tag = "OK  " if not down else "WARN"
+    print(f"[{tag}] {host}: {len(neighbors) - len(down)}/{len(neighbors)} sessions established")
+
+    for n in neighbors:
+        pfx = f"pfx={n['prefixes_received']}" if n["established"] else f"state={n['state']}"
+        alert = "" if n["established"] else "  <-- DOWN"
+        print(f"       {n['neighbor']:<18s}  AS {n['as']:<8d}  uptime={n['uptime']:<12s}  {pfx}{alert}")
 
 
-def print_report(host: str, interfaces: list[InterfaceErrors]) -> int:
-    flagged = [i for i in interfaces if i.flagged]
-    print(f"\nInterface Error Report — {host}")
-    print(f"  Checked : {len(interfaces)} interfaces")
-    print(f"  Flagged : {len(flagged)}\n")
-    if not flagged:
-        print("  All interfaces within thresholds.")
-        return 0
-    for intf in flagged:
-        print(f"  [WARN] {intf.name}")
-        for flag in intf.flags:
-            print(f"         {flag}")
-    return 1
-
-
-def build_parser() -> argparse.ArgumentParser:
+def build_parser():
     p = argparse.ArgumentParser(
-        description="Audit interface error counters on a network device."
+        description="Check BGP neighbor session states via SSH/netmiko.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("-d", "--device", required=True, help="Device IP or hostname")
-    p.add_argument("-u", "--username", required=True)
-    p.add_argument("-p", "--password", required=True)
-    p.add_argument(
-        "--device-type", default="cisco_ios",
-        help="Netmiko device type (default: cisco_ios)"
-    )
-    p.add_argument("--port", type=int, default=22)
-    p.add_argument(
-        "--crc-threshold", type=int, default=5,
-        help="CRC errors per interface to flag (default: 5)"
-    )
-    p.add_argument(
-        "--error-threshold", type=int, default=10,
-        help="Input/output errors per interface to flag (default: 10)"
-    )
-    p.add_argument(
-        "--drop-threshold", type=int, default=100,
-        help="Combined drops per interface to flag (default: 100)"
-    )
-    p.add_argument(
-        "--output", metavar="FILE",
-        help="Write JSON results to FILE"
-    )
-    p.add_argument("--verbose", action="store_true")
+    p.add_argument("-H", "--hosts", nargs="+", required=True, metavar="HOST",
+                   help="Device IP address(es) or hostname(s)")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", default=None,
+                   help="SSH password (prompted securely if omitted)")
+    p.add_argument("--enable-secret", default=None, metavar="SECRET",
+                   help="Enable/privilege secret if required")
+    p.add_argument("--device-type", default="cisco_ios",
+                   choices=["cisco_ios", "cisco_xe", "cisco_nxos"],
+                   help="Netmiko device type (default: cisco_ios)")
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("--timeout", type=int, default=15,
+                   help="Connection timeout in seconds (default: 15)")
+    p.add_argument("--vrf", default=None,
+                   help="BGP VRF name (omit for global routing table)")
+    p.add_argument("--json", action="store_true", dest="use_json",
+                   help="Emit results as JSON instead of plain text")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="Enable debug-level SSH logging")
     return p
 
 
-if __name__ == "__main__":
+def main():
     args = build_parser().parse_args()
+
     if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger().setLevel(logging.INFO)
 
-    try:
-        results = check_device(
-            host=args.device,
-            username=args.username,
-            password=args.password,
-            device_type=args.device_type,
-            port=args.port,
-            crc_thresh=args.crc_threshold,
-            error_thresh=args.error_threshold,
-            drop_thresh=args.drop_threshold,
-        )
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s", args.device)
-        sys.exit(2)
-    except NetmikoTimeoutException:
-        log.error("Connection timed out to %s", args.device)
-        sys.exit(2)
-    except Exception as exc:
-        log.error("Unexpected error: %s", exc)
-        sys.exit(2)
+    password = args.password or getpass(f"Password for {args.username}@{args.hosts[0]}: ")
 
-    exit_code = print_report(args.device, results)
+    all_results = {}
+    exit_code = 0
 
-    if args.output:
-        payload = {
-            "device": args.device,
-            "interfaces": [asdict(i) for i in results],
+    for host in args.hosts:
+        device_params = {
+            "device_type": args.device_type,
+            "host": host,
+            "username": args.username,
+            "password": password,
+            "port": args.port,
+            "conn_timeout": args.timeout,
         }
-        with open(args.output, "w") as fh:
-            json.dump(payload, fh, indent=2)
-        log.info("Results written to %s", args.output)
+        if args.enable_secret:
+            device_params["secret"] = args.enable_secret
+
+        neighbors, error = check_bgp_sessions(device_params, vrf=args.vrf)
+
+        if error or (neighbors and any(not n["established"] for n in neighbors)):
+            exit_code = 1
+
+        if args.use_json:
+            all_results[host] = {"error": error, "neighbors": neighbors or []}
+        else:
+            render_text(host, neighbors, error)
+
+    if args.use_json:
+        print(json.dumps(all_results, indent=2))
 
     sys.exit(exit_code)
-```
+
+
+if __name__ == "__main__":
+    main()
