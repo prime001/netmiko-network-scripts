@@ -1,204 +1,191 @@
 ```python
 """
-mac_locator.py - MAC Address Table Lookup Tool
+interface_error_monitor.py — Netmiko Interface Error Rate Monitor
 
-Connects to one or more switches and searches the MAC address table for a given
-MAC address or OUI prefix. Useful for locating end-hosts, tracking down rogue
-devices, and auditing port-to-host mappings across a fleet.
+Purpose:
+    Polls a device's interface error counters twice, separated by a configurable
+    interval, then reports per-interface error rates (errors/sec). Flags any
+    interface whose input errors, output errors, or CRC count exceeds a threshold.
+    Useful for diagnosing CRC storms, duplex mismatches, or flapping links without
+    requiring SNMP infrastructure.
 
 Usage:
-    python mac_locator.py --host 192.168.1.1 --username admin --password secret \\
-        --mac aa:bb:cc:dd:ee:ff
-
-    python mac_locator.py --host 192.168.1.1 --username admin --password secret \\
-        --mac aa:bb:cc --partial
-
-    python mac_locator.py --hosts-file switches.txt --username admin \\
-        --password secret --mac aa:bb:cc:dd:ee:ff
-
-    Hosts file format: one entry per line as "host [device_type]"
-    Lines beginning with # are ignored.
+    python interface_error_monitor.py --host 192.168.1.1 --username admin \
+        --device-type cisco_ios --interval 60 --threshold 1.0
 
 Prerequisites:
     pip install netmiko
+    Supported platforms: Cisco IOS/IOS-XE/NX-OS, Arista EOS, Juniper JunOS
 """
 
 import argparse
+import getpass
 import logging
 import re
 import sys
-from pathlib import Path
+import time
 
-from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-VENDOR_COMMANDS = {
-    "cisco_ios": "show mac address-table",
-    "cisco_nxos": "show mac address-table",
-    "cisco_xe": "show mac address-table",
-    "arista_eos": "show mac address-table",
-    "juniper_junos": "show ethernet-switching table",
-    "hp_comware": "display mac-address",
-    "hp_procurve": "show mac-address",
+SHOW_COMMANDS = {
+    "cisco_ios": "show interfaces",
+    "cisco_xe": "show interfaces",
+    "cisco_nxos": "show interface",
+    "arista_eos": "show interfaces",
+    "juniper_junos": "show interfaces detail",
 }
 
-_MAC_SEPARATORS = re.compile(r"[:\-\.]")
+_PATTERNS = {
+    "interface": re.compile(r"^(\S+) is (?:up|down|administratively down)", re.MULTILINE),
+    "input_errors": re.compile(r"(\d+) input errors", re.IGNORECASE),
+    "output_errors": re.compile(r"(\d+) output errors", re.IGNORECASE),
+    "crc": re.compile(r"(\d+) CRC", re.IGNORECASE),
+}
 
 
-def normalize_mac(mac: str) -> str:
-    return _MAC_SEPARATORS.sub("", mac).lower()
+def _extract(pattern: re.Pattern, text: str) -> int:
+    m = pattern.search(text)
+    return int(m.group(1)) if m else 0
 
 
-def search_mac_in_output(output: str, target: str, partial: bool) -> list:
-    matches = []
-    for line in output.splitlines():
-        stripped = line.strip()
-        if not stripped:
+def parse_counters(raw: str) -> dict:
+    """Parse show interfaces output into {iface: {metric: count}} structure."""
+    counters = {}
+    blocks = re.split(r"(?=^\S)", raw, flags=re.MULTILINE)
+    for block in blocks:
+        m = _PATTERNS["interface"].search(block)
+        if not m:
             continue
-        if target in normalize_mac(stripped):
-            if partial or len(target) == 12:
-                matches.append(stripped)
-    return matches
+        iface = m.group(1)
+        counters[iface] = {
+            "input_errors": _extract(_PATTERNS["input_errors"], block),
+            "output_errors": _extract(_PATTERNS["output_errors"], block),
+            "crc": _extract(_PATTERNS["crc"], block),
+        }
+    return counters
 
 
-def lookup_mac(host, device_type, username, password, target_mac,
-               partial, port=22, secret=""):
-    result = {"host": host, "matches": [], "error": None}
-    command = VENDOR_COMMANDS.get(device_type, "show mac address-table")
-
-    params = {
-        "device_type": device_type,
-        "host": host,
-        "username": username,
-        "password": password,
-        "port": port,
-        "secret": secret,
-        "timeout": 15,
-    }
-
-    try:
-        logger.info("Connecting to %s (%s)", host, device_type)
-        with ConnectHandler(**params) as conn:
-            if secret:
-                conn.enable()
-            output = conn.send_command(command, read_timeout=20)
-        result["matches"] = search_mac_in_output(output, target_mac, partial)
-        logger.info("%s: %d match(es)", host, len(result["matches"]))
-    except NetmikoAuthenticationException:
-        result["error"] = "authentication failed"
-        logger.error("%s: authentication failed", host)
-    except NetmikoTimeoutException:
-        result["error"] = "connection timed out"
-        logger.error("%s: timed out", host)
-    except Exception as exc:
-        result["error"] = str(exc)
-        logger.error("%s: %s", host, exc)
-
-    return result
+def compute_rates(before: dict, after: dict, elapsed: float) -> list[tuple]:
+    """Return (iface, metric, rate, delta) for every counter that increased."""
+    rows = []
+    for iface, post in after.items():
+        pre = before.get(iface, {})
+        for metric in ("input_errors", "output_errors", "crc"):
+            delta = post.get(metric, 0) - pre.get(metric, 0)
+            if delta > 0:
+                rows.append((iface, metric, delta / elapsed, delta))
+    return rows
 
 
-def load_hosts(args):
-    hosts = []
-    if args.host:
-        hosts.append({"host": args.host, "device_type": args.device_type})
-    else:
-        path = Path(args.hosts_file)
-        if not path.exists():
-            logger.error("Hosts file not found: %s", args.hosts_file)
-            sys.exit(1)
-        for line in path.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            hosts.append({
-                "host": parts[0],
-                "device_type": parts[1] if len(parts) > 1 else args.device_type,
-            })
-    return hosts
+def collect(conn, device_type: str) -> dict:
+    cmd = SHOW_COMMANDS.get(device_type, "show interfaces")
+    log.debug("Sending: %s", cmd)
+    return parse_counters(conn.send_command(cmd))
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Search MAC address tables across one or more switches.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Monitor per-interface error rates on a network device via Netmiko."
     )
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("--host", help="Single device IP or hostname")
-    target.add_argument("--hosts-file", metavar="FILE",
-                        help="File listing hosts, one per line (host [device_type])")
-    parser.add_argument("--device-type", default="cisco_ios",
-                        choices=list(VENDOR_COMMANDS.keys()),
-                        help="Netmiko device type")
-    parser.add_argument("--username", required=True)
-    parser.add_argument("--password", required=True)
-    parser.add_argument("--secret", default="", help="Enable/privilege secret")
-    parser.add_argument("--port", type=int, default=22)
-    parser.add_argument("--mac", required=True,
-                        help="MAC address or OUI to find (any separator format)")
-    parser.add_argument("--partial", action="store_true",
-                        help="Match MAC as a substring (e.g. OUI-only search)")
-    parser.add_argument("--debug", action="store_true",
-                        help="Enable debug logging")
-    return parser.parse_args()
+    p.add_argument("--host", required=True, help="Device hostname or IP address")
+    p.add_argument("--username", required=True, help="SSH username")
+    p.add_argument("--password", help="SSH password (prompted if omitted)")
+    p.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        choices=list(SHOW_COMMANDS),
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument("--timeout", type=int, default=30, help="SSH timeout in seconds")
+    p.add_argument("--enable-secret", help="Enable secret for privilege escalation")
+    p.add_argument(
+        "--interval",
+        type=int,
+        default=60,
+        help="Seconds between the two counter polls (default: 60)",
+    )
+    p.add_argument(
+        "--threshold",
+        type=float,
+        default=1.0,
+        help="Flag interfaces with error rate >= this value (errors/sec, default: 1.0)",
+    )
+    p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    return p
 
 
-def main():
-    args = parse_args()
+def main() -> None:
+    args = build_parser().parse_args()
+
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+    if not args.password:
+        args.password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
 
-    target_mac = normalize_mac(args.mac)
-    if not args.partial and len(target_mac) != 12:
-        logger.error(
-            "MAC '%s' normalizes to %d hex chars; use --partial for prefix searches",
-            args.mac, len(target_mac),
-        )
+    device_params = {
+        "device_type": args.device_type,
+        "host": args.host,
+        "username": args.username,
+        "password": args.password,
+        "port": args.port,
+        "timeout": args.timeout,
+    }
+    if args.enable_secret:
+        device_params["secret"] = args.enable_secret
+
+    log.info("Connecting to %s (%s)", args.host, args.device_type)
+    try:
+        conn = ConnectHandler(**device_params)
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s@%s", args.username, args.host)
+        sys.exit(1)
+    except NetmikoTimeoutException:
+        log.error("Connection timed out to %s", args.host)
         sys.exit(1)
 
-    hosts = load_hosts(args)
-    if not hosts:
-        logger.error("No hosts to query.")
-        sys.exit(1)
+    try:
+        log.info("Baseline sample...")
+        baseline = collect(conn, args.device_type)
+        log.info("Captured %d interfaces. Waiting %ds...", len(baseline), args.interval)
+        t0 = time.monotonic()
+        time.sleep(args.interval)
+        elapsed = time.monotonic() - t0
+        log.info("Second sample...")
+        sample = collect(conn, args.device_type)
+    finally:
+        conn.disconnect()
 
-    found_on = []
-    errors = []
+    rates = compute_rates(baseline, sample, elapsed)
 
-    for entry in hosts:
-        result = lookup_mac(
-            host=entry["host"],
-            device_type=entry["device_type"],
-            username=args.username,
-            password=args.password,
-            target_mac=target_mac,
-            partial=args.partial,
-            port=args.port,
-            secret=args.secret,
-        )
-        if result["error"]:
-            errors.append(result["host"])
-            print(f"[ERROR]     {result['host']}: {result['error']}")
-        elif result["matches"]:
-            found_on.append(result["host"])
-            print(f"[FOUND]     {result['host']}:")
-            for line in result["matches"]:
-                print(f"            {line}")
-        else:
-            print(f"[NOT FOUND] {result['host']}")
+    if not rates:
+        log.info("No errors detected on any interface over the %ds window.", args.interval)
+        return
 
-    print(
-        f"\nSummary: searched {len(hosts)} device(s), "
-        f"found on {len(found_on)}, "
-        f"{len(errors)} error(s)."
+    flagged = [r for r in rates if r[2] >= args.threshold]
+    log.info(
+        "%d counter(s) with errors; %d at/above threshold (%.2f/sec)",
+        len(rates),
+        len(flagged),
+        args.threshold,
     )
-    sys.exit(0 if found_on else 1)
+
+    header = f"\n{'Interface':<32} {'Metric':<16} {'Errors/sec':>12} {'Delta':>8}"
+    print(header)
+    print("-" * 70)
+    for iface, metric, rate, delta in sorted(rates, key=lambda r: -r[2]):
+        flag = "  <-- ALERT" if rate >= args.threshold else ""
+        print(f"{iface:<32} {metric:<16} {rate:>12.3f} {delta:>8}{flag}")
+
+    if flagged:
+        sys.exit(2)
 
 
 if __name__ == "__main__":
