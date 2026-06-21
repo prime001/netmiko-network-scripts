@@ -1,213 +1,206 @@
-mac_address_tracker.py - Locate a MAC address across network switches.
+vlan_provision.py - VLAN Provisioning Tool
 
 Purpose:
-    Search one or more switches for a specific MAC address, reporting the
-    device, VLAN, and interface where the endpoint is connected. Useful for
-    troubleshooting connectivity issues, auditing endpoint locations, and
-    identifying rogue or unknown devices on the network.
+    Provision or remove a VLAN across multiple Cisco IOS/IOS-XE switches
+    simultaneously, optionally adding it to trunk interface allowed lists.
+    Verifies each change after applying and produces a per-device summary.
 
 Usage:
-    # Single device
-    python mac_address_tracker.py --host 192.168.1.1 --username admin \
-        --password secret --mac 00:1a:2b:3c:4d:5e
+    python vlan_provision.py --hosts 10.0.0.1 10.0.0.2 --vlan-id 100 \
+        --vlan-name CORP_DATA --username admin --password secret
 
-    # Multiple devices from file (one IP/hostname per line)
-    python mac_address_tracker.py --hosts-file switches.txt --username admin \
-        --password secret --mac 001a.2b3c.4d5e --device-type cisco_ios
+    python vlan_provision.py --hosts-file switches.txt --vlan-id 200 \
+        --vlan-name VOICE --trunk-ports GigabitEthernet0/1 GigabitEthernet0/2
+
+    python vlan_provision.py --hosts 10.0.0.1 --vlan-id 100 --remove \
+        --trunk-ports GigabitEthernet0/1
 
 Prerequisites:
     pip install netmiko
-    SSH must be enabled on target devices.
-    Supported device types: cisco_ios, cisco_ios_xe, cisco_nxos
+    SSH access with privilege 15 (or enable password) on each target switch.
+    Cisco IOS or IOS-XE; adjust --device-type for other platforms.
 """
 
 import argparse
+import getpass
 import logging
-import re
 import sys
-from pathlib import Path
+from typing import List, Optional
 
-from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-def normalize_mac(mac: str) -> str:
-    """Return lowercase 12-hex-char string, raising ValueError on bad input."""
-    cleaned = re.sub(r"[:\.\-]", "", mac).lower()
-    if len(cleaned) != 12 or not re.fullmatch(r"[0-9a-f]{12}", cleaned):
-        raise ValueError(f"Invalid MAC address: {mac!r}")
-    return cleaned
-
-
-def to_cisco_dotted(mac: str) -> str:
-    """Convert normalized MAC to Cisco dotted quad (xxxx.xxxx.xxxx)."""
-    m = normalize_mac(mac)
-    return f"{m[0:4]}.{m[4:8]}.{m[8:12]}"
-
-
-def parse_mac_table(output: str, target_mac: str) -> list:
-    """
-    Extract rows matching target_mac from show mac address-table output.
-    Returns list of dicts with keys: vlan, mac, interface.
-    Handles IOS (DYNAMIC/STATIC column) and NX-OS (age column) formats.
-    """
-    target_norm = normalize_mac(target_mac)
-    results = []
-    # IOS:   10  0050.7966.6800  DYNAMIC     Gi0/1
-    # NX-OS: 10    0050.7966.6800   dynamic    Eth1/1
-    pattern = re.compile(
-        r"^\s*(\d+)\s+([\da-fA-F]{4}\.[\da-fA-F]{4}\.[\da-fA-F]{4})"
-        r"\s+\S+\s+(\S+)",
-        re.MULTILINE,
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Provision or remove a VLAN across multiple Cisco switches."
     )
-    for match in pattern.finditer(output):
-        vlan, mac_field, interface = match.groups()
-        if normalize_mac(mac_field) == target_norm:
-            results.append({"vlan": vlan, "mac": mac_field, "interface": interface})
-    return results
+    host_group = parser.add_mutually_exclusive_group(required=True)
+    host_group.add_argument("--hosts", nargs="+", metavar="IP", help="Target switch IPs")
+    host_group.add_argument("--hosts-file", metavar="FILE", help="File with one IP per line")
+    parser.add_argument("--vlan-id", type=int, required=True, help="VLAN ID (1-4094)")
+    parser.add_argument("--vlan-name", help="VLAN name (required when provisioning)")
+    parser.add_argument(
+        "--trunk-ports",
+        nargs="*",
+        metavar="INTF",
+        help="Trunk interfaces to add/remove the VLAN from (e.g. GigabitEthernet0/1)",
+    )
+    parser.add_argument("--remove", action="store_true", help="Remove the VLAN instead of adding it")
+    parser.add_argument("--username", required=True)
+    parser.add_argument("--password", help="SSH password (prompted if omitted)")
+    parser.add_argument("--enable-secret", help="Enable secret (prompted if omitted)")
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument("--timeout", type=int, default=30)
+    parser.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    return parser.parse_args()
 
 
-def search_device(host: str, username: str, password: str, device_type: str,
-                  target_mac: str, port: int = 22) -> dict:
-    """Connect to one device and return MAC search results."""
-    result = {"host": host, "status": "error", "matches": [], "error": None}
-    params = {
-        "device_type": device_type,
-        "host": host,
-        "username": username,
-        "password": password,
-        "port": port,
-        "timeout": 30,
-        "banner_timeout": 15,
-    }
+def load_hosts(args: argparse.Namespace) -> List[str]:
+    if args.hosts:
+        return args.hosts
+    with open(args.hosts_file) as fh:
+        return [line.strip() for line in fh if line.strip() and not line.startswith("#")]
+
+
+def build_vlan_commands(vlan_id: int, vlan_name: Optional[str], remove: bool) -> List[str]:
+    if remove:
+        return [f"no vlan {vlan_id}"]
+    cmds = [f"vlan {vlan_id}"]
+    if vlan_name:
+        cmds.append(f" name {vlan_name}")
+    return cmds
+
+
+def build_trunk_commands(vlan_id: int, trunk_ports: List[str], remove: bool) -> List[str]:
+    action = "remove" if remove else "add"
+    cmds = []
+    for port in trunk_ports:
+        cmds += [
+            f"interface {port}",
+            f" switchport trunk allowed vlan {action} {vlan_id}",
+        ]
+    return cmds
+
+
+def vlan_exists(conn, vlan_id: int) -> bool:
+    output = conn.send_command(f"show vlan id {vlan_id}")
+    return str(vlan_id) in output and "not found" not in output.lower()
+
+
+def provision_device(
+    host: str,
+    vlan_id: int,
+    vlan_name: Optional[str],
+    trunk_ports: List[str],
+    remove: bool,
+    device_params: dict,
+) -> dict:
+    result = {"host": host, "status": "unknown", "message": ""}
     try:
-        logger.info("Connecting to %s", host)
-        with ConnectHandler(**params) as conn:
-            cisco_mac = to_cisco_dotted(target_mac)
-            # Targeted lookup first — faster and less output to parse
-            output = conn.send_command(
-                f"show mac address-table address {cisco_mac}",
-                read_timeout=30,
-            )
-            matches = parse_mac_table(output, target_mac)
-            if not matches:
-                # Fallback for platforms that don't support address filter
-                logger.debug("Targeted lookup empty on %s, scanning full table", host)
-                output = conn.send_command(
-                    "show mac address-table", read_timeout=60
-                )
-                matches = parse_mac_table(output, target_mac)
-            result["status"] = "success"
-            result["matches"] = matches
+        log.info("Connecting to %s", host)
+        with ConnectHandler(**{**device_params, "host": host}) as conn:
+            conn.enable()
+
+            cmds = build_vlan_commands(vlan_id, vlan_name, remove)
+            if trunk_ports:
+                cmds += build_trunk_commands(vlan_id, trunk_ports, remove)
+
+            output = conn.send_config_set(cmds)
+            log.debug("Config output for %s:\n%s", host, output)
+
+            conn.save_config()
+
+            exists = vlan_exists(conn, vlan_id)
+            if remove:
+                ok = not exists
+                msg = "VLAN removed and verified" if ok else "VLAN still present after removal"
+            else:
+                ok = exists
+                msg = "VLAN provisioned and verified" if ok else "VLAN not found after provisioning"
+
+            result["status"] = "ok" if ok else "error"
+            result["message"] = msg
+
     except NetmikoAuthenticationException:
-        result["error"] = "authentication failed"
-        logger.error("Auth failed: %s", host)
+        result["status"] = "error"
+        result["message"] = "Authentication failed"
+        log.error("Auth failed on %s", host)
     except NetmikoTimeoutException:
-        result["error"] = "connection timed out"
-        logger.error("Timeout: %s", host)
+        result["status"] = "error"
+        result["message"] = "Connection timed out"
+        log.error("Timeout on %s", host)
     except Exception as exc:
-        result["error"] = str(exc)
-        logger.error("Error on %s: %s", host, exc)
+        result["status"] = "error"
+        result["message"] = str(exc)
+        log.error("Error on %s: %s", host, exc)
+
     return result
 
 
-def load_hosts_file(path: str) -> list:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"Hosts file not found: {path}")
-    return [
-        line.strip()
-        for line in p.read_text().splitlines()
-        if line.strip() and not line.startswith("#")
-    ]
+def main() -> int:
+    args = parse_args()
 
+    if not args.remove and not args.vlan_name:
+        print("error: --vlan-name is required when provisioning a VLAN", file=sys.stderr)
+        return 1
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Locate a MAC address across one or more network switches",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Exit codes: 0=found, 1=error, 2=not found on any device",
-    )
-    host_group = parser.add_mutually_exclusive_group(required=True)
-    host_group.add_argument("--host", help="Single switch IP or hostname")
-    host_group.add_argument(
-        "--hosts-file", metavar="FILE", help="File containing one host per line"
-    )
-    parser.add_argument("--username", required=True, help="SSH username")
-    parser.add_argument("--password", required=True, help="SSH password")
-    parser.add_argument(
-        "--mac", required=True,
-        help="MAC address to locate (accepts xx:xx:xx:xx:xx:xx, xxxx.xxxx.xxxx, etc.)",
-    )
-    parser.add_argument(
-        "--device-type", default="cisco_ios",
-        choices=["cisco_ios", "cisco_ios_xe", "cisco_nxos"],
-        help="Netmiko device type (default: cisco_ios)",
-    )
-    parser.add_argument(
-        "--port", type=int, default=22, help="SSH port (default: 22)"
-    )
-    parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Enable debug logging"
-    )
-    args = parser.parse_args()
+    if not 1 <= args.vlan_id <= 4094:
+        print("error: VLAN ID must be between 1 and 4094", file=sys.stderr)
+        return 1
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+    password = args.password or getpass.getpass("SSH password: ")
+    enable_secret = args.enable_secret or getpass.getpass("Enable secret (Enter to skip): ") or None
 
-    try:
-        normalize_mac(args.mac)
-    except ValueError as exc:
-        parser.error(str(exc))
+    device_params = {
+        "device_type": args.device_type,
+        "username": args.username,
+        "password": password,
+        "port": args.port,
+        "timeout": args.timeout,
+    }
+    if enable_secret:
+        device_params["secret"] = enable_secret
 
-    try:
-        hosts = [args.host] if args.host else load_hosts_file(args.hosts_file)
-    except FileNotFoundError as exc:
-        parser.error(str(exc))
-
+    hosts = load_hosts(args)
     if not hosts:
-        logger.error("No hosts to search")
-        sys.exit(1)
+        print("error: no hosts provided", file=sys.stderr)
+        return 1
 
-    logger.info("Searching for MAC %s on %d device(s)", args.mac, len(hosts))
+    action = "Removing" if args.remove else "Provisioning"
+    vlan_label = f"{args.vlan_id}" + (f" ({args.vlan_name})" if args.vlan_name else "")
+    log.info("%s VLAN %s on %d device(s)", action, vlan_label, len(hosts))
 
-    found = False
-    errors = 0
+    results = []
     for host in hosts:
-        result = search_device(
+        r = provision_device(
             host=host,
-            username=args.username,
-            password=args.password,
-            device_type=args.device_type,
-            target_mac=args.mac,
-            port=args.port,
+            vlan_id=args.vlan_id,
+            vlan_name=args.vlan_name,
+            trunk_ports=args.trunk_ports or [],
+            remove=args.remove,
+            device_params=device_params,
         )
-        if result["status"] == "error":
-            print(f"[ERROR]     {host}: {result['error']}")
-            errors += 1
-            continue
-        if result["matches"]:
-            found = True
-            for m in result["matches"]:
-                print(
-                    f"[FOUND]     {host} | VLAN {m['vlan']:>4} | "
-                    f"{m['interface']:<20} | {m['mac']}"
-                )
-        else:
-            print(f"[NOT FOUND] {host}")
+        results.append(r)
+        icon = "OK" if r["status"] == "ok" else "FAIL"
+        log.info("[%s] %s — %s", icon, host, r["message"])
 
-    if errors and not found:
-        sys.exit(1)
-    if not found:
-        logger.info("MAC %s not present on any queried device", args.mac)
-        sys.exit(2)
+    ok_count = sum(1 for r in results if r["status"] == "ok")
+    fail_count = len(results) - ok_count
+    print(f"\nResult: {ok_count}/{len(results)} succeeded, {fail_count} failed")
+    return 0 if fail_count == 0 else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
