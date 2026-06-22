@@ -1,236 +1,226 @@
-#!/usr/bin/env python3
+```python
 """
-bgp_session_monitor.py - BGP Neighbor State Monitor
+Device Configuration Snapshot and Change Tracker
 
-Purpose:
-    Connect to routers via SSH, collect BGP neighbor summaries, parse with
-    inline TextFSM templates, and report session states, prefix counts, and
-    uptime. Sessions that are not Established are flagged for immediate action.
+Captures and saves device running configurations with timestamps, enabling
+change detection and rollback capability. Supports multiple device types
+and saves diffs between snapshots.
 
 Usage:
-    # Single device
-    python bgp_session_monitor.py -d 192.168.1.1 -u admin -p secret
+    # Capture snapshot
+    python config_snapshot.py -i 192.168.1.1 -u admin -p password \
+        -t cisco_ios --snapshot
 
-    # Multiple devices from file (one IP/hostname per line, # for comments)
-    python bgp_session_monitor.py -f routers.txt -u admin -p secret
-
-    # Specify platform and export CSV
-    python bgp_session_monitor.py -d 10.0.0.1 -u admin -p secret \
-        -t cisco_nxos --csv bgp_report.csv
+    # Compare snapshots
+    python config_snapshot.py -i 192.168.1.1 -u admin -p password \
+        -t cisco_ios --compare
 
 Prerequisites:
-    pip install netmiko textfsm
+    - netmiko
+    - paramiko
+    - Device must be reachable via SSH
+    - User must have read access to running config
+
+Supported device types:
+    - cisco_ios
+    - cisco_xe
+    - cisco_nxos
+    - arista_eos
+    - juniper_junos
 """
 
 import argparse
-import csv
-import io
+import json
 import logging
 import sys
-from dataclasses import dataclass
-from typing import List, Optional
-
-import textfsm
+import os
+from datetime import datetime
+from pathlib import Path
+from difflib import unified_diff
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
-log = logging.getLogger(__name__)
-
-# IOS/IOS-XE/NX-OS BGP summary shares the same column layout
-BGP_SUMMARY_TEMPLATE = r"""Value NEIGHBOR (\S+)
-Value AS (\d+)
-Value MSG_RCVD (\d+)
-Value MSG_SENT (\d+)
-Value TBL_VER (\d+)
-Value IN_Q (\d+)
-Value OUT_Q (\d+)
-Value UP_DOWN (\S+)
-Value STATE_PFXRCD (\S+)
-
-Start
-  ^Neighbor -> BGPTable
-
-BGPTable
-  ^${NEIGHBOR}\s+\d\s+${AS}\s+${MSG_RCVD}\s+${MSG_SENT}\s+${TBL_VER}\s+${IN_Q}\s+${OUT_Q}\s+${UP_DOWN}\s+${STATE_PFXRCD} -> Record
-  ^. -> Continue
-
-"""
-
-BGP_COMMANDS = {
-    "cisco_ios": "show bgp summary",
-    "cisco_xe": "show bgp summary",
-    "cisco_nxos": "show bgp summary",
-    "arista_eos": "show bgp summary",
-    "juniper_junos": "show bgp summary",
-}
+logger = logging.getLogger(__name__)
 
 
-@dataclass
-class BGPSession:
-    device: str
-    neighbor: str
-    remote_as: str
-    up_down: str
-    state_or_prefixes: str
-    msg_rcvd: str = ""
-    msg_sent: str = ""
+class ConfigSnapshot:
+    def __init__(self, ip, device_type, snapshot_dir='config_snapshots'):
+        self.ip = ip
+        self.device_type = device_type
+        self.snapshot_dir = Path(snapshot_dir)
+        self.snapshot_dir.mkdir(exist_ok=True)
+        self.device_snapshot_dir = self.snapshot_dir / ip
+        self.device_snapshot_dir.mkdir(exist_ok=True)
 
-    @property
-    def is_established(self) -> bool:
-        return self.state_or_prefixes.isdigit()
-
-    @property
-    def state(self) -> str:
-        return "Established" if self.is_established else self.state_or_prefixes
-
-    @property
-    def prefix_count(self) -> Optional[int]:
-        return int(self.state_or_prefixes) if self.is_established else None
-
-
-def parse_bgp_output(device_ip: str, raw: str) -> List[BGPSession]:
-    fsm = textfsm.TextFSM(io.StringIO(BGP_SUMMARY_TEMPLATE))
-    rows = fsm.ParseText(raw)
-    sessions = []
-    for row in rows:
-        neighbor, remote_as, msg_rcvd, msg_sent, _, _, _, up_down, state_pfx = row
-        sessions.append(BGPSession(
-            device=device_ip,
-            neighbor=neighbor,
-            remote_as=remote_as,
-            up_down=up_down,
-            state_or_prefixes=state_pfx,
-            msg_rcvd=msg_rcvd,
-            msg_sent=msg_sent,
-        ))
-    return sessions
-
-
-def collect_device(host: str, username: str, password: str, device_type: str) -> List[BGPSession]:
-    params = {
-        "device_type": device_type,
-        "host": host,
-        "username": username,
-        "password": password,
-        "timeout": 30,
-        "session_log": None,
-    }
-    command = BGP_COMMANDS.get(device_type, "show bgp summary")
-    try:
-        log.info("Connecting to %s (%s)", host, device_type)
-        with ConnectHandler(**params) as conn:
-            output = conn.send_command(command, read_timeout=60)
-        sessions = parse_bgp_output(host, output)
-        log.info("%s: found %d BGP neighbors", host, len(sessions))
-        return sessions
-    except NetmikoTimeoutException:
-        log.error("Timeout connecting to %s", host)
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed on %s", host)
-    except Exception as exc:
-        log.error("Error on %s: %s", host, exc)
-    return []
-
-
-def print_report(sessions: List[BGPSession]) -> None:
-    if not sessions:
-        print("No BGP data collected.")
-        return
-
-    fmt = "{:<20} {:<18} {:<9} {:<14} {:<15} {:<10}"
-    header = fmt.format("Device", "Neighbor", "Peer AS", "State", "Up/Down", "Prefixes")
-    sep = "=" * len(header)
-    print(f"\n{sep}\nBGP SESSION REPORT\n{sep}")
-    print(header)
-    print("-" * len(header))
-
-    down_sessions = []
-    for s in sorted(sessions, key=lambda x: (x.device, x.neighbor)):
-        pfx = str(s.prefix_count) if s.prefix_count is not None else "-"
-        line = fmt.format(s.device, s.neighbor, s.remote_as, s.state, s.up_down, pfx)
-        if not s.is_established:
-            line += "  <-- DOWN"
-            down_sessions.append(s)
-        print(line)
-
-    established = sum(1 for s in sessions if s.is_established)
-    print(sep)
-    print(f"Total: {len(sessions)}  |  Established: {established}  |  Down: {len(down_sessions)}")
-    if down_sessions:
-        print(f"\nWARNING: {len(down_sessions)} session(s) not established:")
-        for s in down_sessions:
-            print(f"  {s.device}  {s.neighbor}  state={s.state}  updown={s.up_down}")
-
-
-def write_csv(sessions: List[BGPSession], path: str) -> None:
-    fields = ["device", "neighbor", "remote_as", "state", "prefixes", "up_down", "msg_rcvd", "msg_sent"]
-    with open(path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fields)
-        writer.writeheader()
-        for s in sessions:
-            writer.writerow({
-                "device": s.device,
-                "neighbor": s.neighbor,
-                "remote_as": s.remote_as,
-                "state": s.state,
-                "prefixes": s.prefix_count if s.prefix_count is not None else "",
-                "up_down": s.up_down,
-                "msg_rcvd": s.msg_rcvd,
-                "msg_sent": s.msg_sent,
-            })
-    log.info("CSV report written to %s", path)
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="BGP neighbor state monitor — netmiko + TextFSM"
-    )
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("-d", "--device", help="Single device IP or hostname")
-    target.add_argument("-f", "--file", help="File listing device IPs (one per line)")
-    parser.add_argument("-u", "--username", required=True)
-    parser.add_argument("-p", "--password", required=True)
-    parser.add_argument(
-        "-t", "--type", dest="device_type", default="cisco_ios",
-        choices=list(BGP_COMMANDS.keys()),
-        help="Netmiko device type (default: cisco_ios)",
-    )
-    parser.add_argument("--csv", dest="csv_path", metavar="FILE", help="Export results to CSV")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
-    args = parser.parse_args()
-
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    if args.device:
-        hosts = [args.device]
-    else:
+    def _get_config(self, credentials):
+        """Retrieve running configuration from device."""
         try:
-            with open(args.file) as fh:
-                hosts = [l.strip() for l in fh if l.strip() and not l.startswith("#")]
-        except FileNotFoundError:
-            log.error("Device file not found: %s", args.file)
-            return 1
-        if not hosts:
-            log.error("No devices found in %s", args.file)
-            return 1
+            logger.info(f"Connecting to {self.ip}...")
+            net_connect = ConnectHandler(
+                device_type=self.device_type,
+                host=self.ip,
+                **credentials,
+                timeout=30
+            )
+            
+            logger.info("Retrieving running configuration...")
+            config = net_connect.send_command('show running-config')
+            net_connect.disconnect()
+            return config
+            
+        except Exception as e:
+            logger.error(f"Failed to retrieve config: {e}")
+            raise
 
-    all_sessions: List[BGPSession] = []
-    for host in hosts:
-        all_sessions.extend(collect_device(host, args.username, args.password, args.device_type))
+    def capture_snapshot(self, credentials):
+        """Capture and save current device configuration."""
+        config = self._get_config(credentials)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = self.device_snapshot_dir / f'config_{timestamp}.txt'
+        
+        with open(filename, 'w') as f:
+            f.write(config)
+        
+        # Save metadata
+        metadata_file = self.device_snapshot_dir / 'snapshots.json'
+        metadata = {}
+        
+        if metadata_file.exists():
+            with open(metadata_file, 'r') as f:
+                metadata = json.load(f)
+        
+        metadata[timestamp] = {
+            'filename': filename.name,
+            'timestamp': datetime.now().isoformat(),
+            'device': self.ip,
+            'lines': len(config.split('\n'))
+        }
+        
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        logger.info(f"Snapshot saved to {filename}")
+        logger.info(f"Configuration contains {len(config.split(chr(10)))} lines")
+        return filename
 
-    print_report(all_sessions)
+    def compare_snapshots(self):
+        """Compare latest two snapshots and show diff."""
+        metadata_file = self.device_snapshot_dir / 'snapshots.json'
+        
+        if not metadata_file.exists():
+            logger.error("No snapshots found for this device")
+            return
+        
+        with open(metadata_file, 'r') as f:
+            metadata = json.load(f)
+        
+        if len(metadata) < 2:
+            logger.warning("Need at least 2 snapshots to compare")
+            return
+        
+        # Get two most recent snapshots
+        sorted_keys = sorted(metadata.keys())
+        latest_ts = sorted_keys[-1]
+        previous_ts = sorted_keys[-2]
+        
+        latest_file = self.device_snapshot_dir / metadata[latest_ts]['filename']
+        previous_file = self.device_snapshot_dir / metadata[previous_ts]['filename']
+        
+        with open(previous_file, 'r') as f:
+            previous_config = f.readlines()
+        with open(latest_file, 'r') as f:
+            latest_config = f.readlines()
+        
+        # Generate diff
+        diff = list(unified_diff(
+            previous_config,
+            latest_config,
+            fromfile=f"Config from {previous_ts}",
+            tofile=f"Config from {latest_ts}",
+            lineterm=''
+        ))
+        
+        if diff:
+            print("\n=== Configuration Changes ===")
+            print(f"Device: {self.ip}")
+            print(f"From: {metadata[previous_ts]['timestamp']}")
+            print(f"To:   {metadata[latest_ts]['timestamp']}\n")
+            
+            for line in diff:
+                print(line.rstrip())
+        else:
+            print(f"\nNo changes detected between {previous_ts} and {latest_ts}")
 
-    if args.csv_path and all_sessions:
-        write_csv(all_sessions, args.csv_path)
+    def list_snapshots(self):
+        """List all saved snapshots for device."""
+        metadata_file = self.device_snapshot_dir / 'snapshots.json'
+        
+        if not metadata_file.exists():
+            logger.info("No snapshots found for this device")
+            return
+        
+        with open(metadata_file, 'r') as f:
+            metadata = json.load(f)
+        
+        print(f"\n=== Snapshots for {self.ip} ===")
+        for ts in sorted(metadata.keys()):
+            info = metadata[ts]
+            print(f"{ts}: {info['lines']} lines ({info['timestamp']})")
 
-    return 1 if any(not s.is_established for s in all_sessions) else 0
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Capture and compare device configuration snapshots'
+    )
+    parser.add_argument('-i', '--ip', required=True, help='Device IP or hostname')
+    parser.add_argument('-u', '--username', required=True, help='SSH username')
+    parser.add_argument('-p', '--password', required=True, help='SSH password')
+    parser.add_argument(
+        '-t', '--device-type',
+        default='cisco_ios',
+        choices=['cisco_ios', 'cisco_xe', 'cisco_nxos', 'arista_eos', 'juniper_junos'],
+        help='Device type'
+    )
+    parser.add_argument('-P', '--port', type=int, default=22, help='SSH port')
+    parser.add_argument('-d', '--snapshot-dir', default='config_snapshots',
+                        help='Snapshot directory')
+    
+    action_group = parser.add_mutually_exclusive_group(required=True)
+    action_group.add_argument('--snapshot', action='store_true',
+                              help='Capture new snapshot')
+    action_group.add_argument('--compare', action='store_true',
+                              help='Compare latest snapshots')
+    action_group.add_argument('--list', action='store_true',
+                              help='List all snapshots')
+    
+    args = parser.parse_args()
+    
+    credentials = {
+        'username': args.username,
+        'password': args.password,
+        'port': args.port
+    }
+    
+    snapshot = ConfigSnapshot(args.ip, args.device_type, args.snapshot_dir)
+    
+    try:
+        if args.snapshot:
+            snapshot.capture_snapshot(credentials)
+        elif args.compare:
+            snapshot.compare_snapshots()
+        elif args.list:
+            snapshot.list_snapshots()
+    except KeyboardInterrupt:
+        logger.info("Operation cancelled by user")
+        sys.exit(0)
+    except Exception as e:
+        logger.error(f"Operation failed: {e}")
+        sys.exit(1)
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == '__main__':
+    main()
+```
