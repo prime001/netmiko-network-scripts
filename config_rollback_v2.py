@@ -1,194 +1,196 @@
-```python
 #!/usr/bin/env python3
 """
-Interface Statistics Collector - Network Device Monitoring
+config_backup.py - Network device configuration backup and drift detection
 
-Collects interface statistics including errors, discards, and collisions to identify
-problematic interfaces. Useful for network health monitoring and troubleshooting.
-
-Prerequisites:
-    - netmiko>=4.0.0
-    - Network device SSH access enabled
-    - Valid device credentials with read privileges
+Purpose:
+    Archives running configurations from network devices to timestamped files
+    and detects configuration drift by comparing against the most recent backup.
+    Useful for compliance auditing, change tracking, and pre/post-change snapshots.
 
 Usage:
-    python interface_stats_collector.py --device 10.1.1.1 --user admin --device-type cisco_ios
-    python interface_stats_collector.py --device core1.example.com -u netadmin -f creds.txt --device-type arista_eos
+    # Single device backup
+    python config_backup.py --host 10.0.0.1 --username admin --password secret
 
-Examples:
-    # Interactive password prompt
-    python interface_stats_collector.py --device 192.168.1.1 --user admin --device-type cisco_ios
+    # Bulk backup from inventory file (one IP/hostname per line, # for comments)
+    python config_backup.py --inventory hosts.txt --username admin --password secret
 
-    # Use password file
-    python interface_stats_collector.py --device 192.168.1.1 --user admin -f ~/.ssh/pass --device-type cisco_ios
+    # Show unified diff against previous backup (also saves new backup)
+    python config_backup.py --host 10.0.0.1 --diff
 
-    # With custom error threshold
-    python interface_stats_collector.py --device 192.168.1.1 --user admin --device-type cisco_ios --threshold 5
+    # Use environment variables for credentials
+    NET_USER=admin NET_PASS=secret python config_backup.py --host 10.0.0.1
+
+Prerequisites:
+    pip install netmiko
 """
 
 import argparse
+import difflib
 import logging
+import os
 import sys
-from getpass import getpass
-from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoException
+from datetime import datetime
+from pathlib import Path
 
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
+
+SHOW_RUN = {
+    "cisco_ios": "show running-config",
+    "cisco_xe": "show running-config",
+    "cisco_nxos": "show running-config",
+    "arista_eos": "show running-config",
+    "juniper_junos": "show configuration | display set",
+}
 
 
-def get_credentials(args):
-    """Get credentials from command-line args or user input."""
-    username = args.user
+def fetch_config(host, username, password, device_type, port):
+    params = {
+        "device_type": device_type,
+        "host": host,
+        "username": username,
+        "password": password,
+        "port": port,
+    }
+    command = SHOW_RUN.get(device_type, "show running-config")
+    log.info("Connecting to %s (%s)", host, device_type)
+    with ConnectHandler(**params) as conn:
+        return conn.send_command(command, read_timeout=60)
 
-    if args.password_file:
-        try:
-            with open(args.password_file, 'r') as f:
-                password = f.read().strip()
-        except FileNotFoundError:
-            logger.error(f"Password file not found: {args.password_file}")
-            sys.exit(1)
-    elif args.password:
-        password = args.password
+
+def save_backup(host, config, output_dir):
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = Path(output_dir) / host
+    dest.mkdir(parents=True, exist_ok=True)
+    path = dest / f"{ts}_running.cfg"
+    path.write_text(config)
+    log.info("Saved %s", path)
+    return path
+
+
+def latest_backup(host, output_dir):
+    device_dir = Path(output_dir) / host
+    if not device_dir.exists():
+        return None
+    candidates = sorted(device_dir.glob("*_running.cfg"))
+    return candidates[-1] if candidates else None
+
+
+def print_drift(host, current_config, output_dir):
+    prev_path = latest_backup(host, output_dir)
+    if prev_path is None:
+        log.warning("[%s] No prior backup found; skipping diff", host)
+        return
+
+    prev_lines = prev_path.read_text().splitlines(keepends=True)
+    curr_lines = current_config.splitlines(keepends=True)
+    diff = list(difflib.unified_diff(
+        prev_lines,
+        curr_lines,
+        fromfile=str(prev_path),
+        tofile=f"{host} (live)",
+    ))
+
+    if diff:
+        print(f"\n--- Config drift on {host} ({len(diff)} diff lines) ---")
+        sys.stdout.writelines(diff)
     else:
-        password = getpass(f"Password for {username}: ")
-
-    return username, password
+        print(f"[{host}] No drift detected since {prev_path.name}")
 
 
-def collect_interface_stats(device_ip, device_type, username, password):
-    """Connect to device and collect interface statistics."""
+def backup_device(host, username, password, device_type, port, output_dir, show_diff):
     try:
-        logger.info(f"Connecting to {device_ip}...")
-        device = ConnectHandler(
-            host=device_ip,
-            device_type=device_type,
-            username=username,
-            password=password,
-            timeout=15
-        )
-        logger.info(f"Connected to {device_ip}")
+        config = fetch_config(host, username, password, device_type, port)
+    except NetmikoAuthenticationException:
+        log.error("[%s] Authentication failed", host)
+        return False
+    except NetmikoTimeoutException:
+        log.error("[%s] Connection timed out", host)
+        return False
+    except Exception as exc:
+        log.error("[%s] %s", host, exc)
+        return False
 
-        logger.info("Collecting interface statistics...")
-        if 'cisco' in device_type:
-            output = device.send_command('show interfaces')
-        elif 'arista' in device_type:
-            output = device.send_command('show interfaces')
-        else:
-            output = device.send_command('show interfaces')
+    if show_diff:
+        print_drift(host, config, output_dir)
 
-        device.disconnect()
-        return output
-
-    except NetmikoException as e:
-        logger.error(f"Connection failed: {e}")
-        sys.exit(1)
-
-
-def parse_interface_output(output):
-    """Parse interface output and extract error statistics."""
-    interfaces = {}
-    current_interface = None
-
-    for line in output.split('\n'):
-        if line and not line[0].isspace() and line.split():
-            current_interface = line.split()[0]
-            interfaces[current_interface] = {
-                'errors': 0,
-                'discards': 0,
-                'collisions': 0
-            }
-
-        elif current_interface and current_interface in interfaces:
-            line_lower = line.lower()
-
-            if 'input errors' in line_lower:
-                try:
-                    interfaces[current_interface]['errors'] = int(line.split()[0])
-                except (ValueError, IndexError):
-                    pass
-
-            elif 'input discards' in line_lower:
-                try:
-                    interfaces[current_interface]['discards'] = int(line.split()[0])
-                except (ValueError, IndexError):
-                    pass
-
-            elif 'collisions' in line_lower:
-                try:
-                    interfaces[current_interface]['collisions'] = int(line.split()[0])
-                except (ValueError, IndexError):
-                    pass
-
-    return interfaces
-
-
-def print_report(interfaces, threshold):
-    """Print formatted interface statistics report."""
-    problem_intfs = [
-        (name, stats) for name, stats in interfaces.items()
-        if stats['errors'] >= threshold or stats['discards'] >= threshold
-    ]
-
-    print("\n" + "=" * 70)
-    print("INTERFACE STATISTICS REPORT")
-    print("=" * 70)
-
-    if problem_intfs:
-        print(f"\nInterfaces exceeding threshold ({threshold}):\n")
-        print(f"{'Interface':<15} {'Errors':<12} {'Discards':<12} {'Collisions':<12}")
-        print("-" * 51)
-
-        for intf, stats in sorted(problem_intfs):
-            print(f"{intf:<15} {stats['errors']:<12} {stats['discards']:<12} {stats['collisions']:<12}")
-    else:
-        print(f"\nNo interfaces found with errors/discards >= {threshold}")
-
-    total = len(interfaces)
-    problem = len(problem_intfs)
-    print(f"\nTotal: {total} interfaces | Issues: {problem}\n")
-    print("=" * 70 + "\n")
+    save_backup(host, config, output_dir)
+    return True
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description="Backup network device running configs and detect configuration drift"
     )
-    parser.add_argument('--device', required=True, help='Device IP or hostname')
-    parser.add_argument('--user', '-u', required=True, help='SSH username')
-    parser.add_argument('--password', '-p', help='SSH password (omit for prompt)')
-    parser.add_argument('--password-file', '-f', help='File containing password')
-    parser.add_argument('--device-type', required=True,
-                        choices=['cisco_ios', 'cisco_xe', 'cisco_nxos',
-                                'arista_eos', 'juniper_junos'],
-                        help='Device OS type')
-    parser.add_argument('--threshold', type=int, default=10,
-                        help='Minimum errors/discards to report (default: 10)')
-
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--host", help="Single device IP or hostname")
+    group.add_argument("--inventory", help="Inventory file with one host per line")
+    parser.add_argument("--username", default=os.environ.get("NET_USER"))
+    parser.add_argument("--password", default=os.environ.get("NET_PASS"))
+    parser.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        choices=list(SHOW_RUN.keys()),
+        help="Netmiko device type (default: cisco_ios)",
+    )
+    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    parser.add_argument(
+        "--output-dir",
+        default="config_backups",
+        help="Root directory for backup storage (default: config_backups)",
+    )
+    parser.add_argument(
+        "--diff",
+        action="store_true",
+        help="Print unified diff against most recent backup before saving new one",
+    )
     args = parser.parse_args()
 
-    try:
-        username, password = get_credentials(args)
-        output = collect_interface_stats(
-            args.device, args.device_type, username, password
+    if not args.username or not args.password:
+        parser.error(
+            "Credentials required via --username/--password or NET_USER/NET_PASS env vars"
         )
 
-        interfaces = parse_interface_output(output)
-        print_report(interfaces, args.threshold)
+    if args.host:
+        hosts = [args.host]
+    else:
+        p = Path(args.inventory)
+        if not p.exists():
+            parser.error(f"Inventory file not found: {args.inventory}")
+        hosts = [
+            ln.strip()
+            for ln in p.read_text().splitlines()
+            if ln.strip() and not ln.startswith("#")
+        ]
+        if not hosts:
+            parser.error("Inventory file contains no valid hosts")
 
-    except KeyboardInterrupt:
-        logger.info("\nScript interrupted by user")
-        sys.exit(0)
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        sys.exit(1)
+    succeeded, failed = 0, 0
+    for host in hosts:
+        ok = backup_device(
+            host,
+            args.username,
+            args.password,
+            args.device_type,
+            args.port,
+            args.output_dir,
+            args.diff,
+        )
+        if ok:
+            succeeded += 1
+        else:
+            failed += 1
+
+    log.info("Complete: %d succeeded, %d failed", succeeded, failed)
+    sys.exit(1 if failed else 0)
 
 
 if __name__ == "__main__":
     main()
-```
