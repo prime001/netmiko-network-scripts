@@ -1,180 +1,185 @@
-```python
-#!/usr/bin/env python3
-"""
-Network Device Diagnostic Report Generator.
-
-Collects diagnostic information from network devices and generates
-timestamped reports including device version, uptime, CPU/memory usage,
-interface summary, and routing information for documentation and troubleshooting.
-
-Prerequisites:
-    - netmiko >= 4.0.0
-    - Device must be reachable via SSH (port 22 by default)
-    - Network device must support standard show commands
+Interface Error Counter Monitor
+================================
+Connects to a Cisco IOS/IOS-XE device via SSH and polls interface error
+counters (input errors, output errors, CRC, runts, giants, resets). Reports
+any interface whose worst counter meets or exceeds a configurable threshold.
+Supports one-shot mode or continuous polling with a configurable interval.
 
 Usage:
-    python3 device_diagnostics.py -d 192.168.1.1 -t cisco_ios -u admin -p password
-    python3 device_diagnostics.py -d core-router.example.com -t arista_eos -u admin
+    python interface_error_monitor.py -H 192.168.1.1 -u admin -p secret
+    python interface_error_monitor.py -H 192.168.1.1 -u admin -p secret \
+        --threshold 100 --interval 60 --count 10
+    python interface_error_monitor.py -H 192.168.1.1 -u admin -p secret \
+        --interface GigabitEthernet0/1
+
+Prerequisites:
+    pip install netmiko
 """
 
-import argparse
-import json
-import logging
-from datetime import datetime
-from pathlib import Path
-from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoTimeoutException, NetmikoAuthenticationException
+from __future__ import annotations
 
+import argparse
+import logging
+import re
+import sys
+import time
+
+from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s",
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-VENDOR_COMMANDS = {
-    'cisco_ios': {
-        'version': 'show version',
-        'interfaces': 'show interface summary',
-        'routing': 'show ip route summary',
-    },
-    'cisco_iosxe': {
-        'version': 'show version',
-        'interfaces': 'show interface summary',
-        'routing': 'show ip route summary',
-    },
-    'arista_eos': {
-        'version': 'show version',
-        'interfaces': 'show interface summary',
-        'routing': 'show ip route summary',
-    },
-    'juniper_junos': {
-        'version': 'show version',
-        'interfaces': 'show interfaces summary',
-        'routing': 'show route summary',
-    },
+_INTF_HEADER = re.compile(r"^(\S+) is (up|down|administratively down)", re.MULTILINE)
+_COUNTERS = {
+    "input_errors": re.compile(r"(\d+) input errors"),
+    "output_errors": re.compile(r"(\d+) output errors"),
+    "crc": re.compile(r"(\d+) CRC"),
+    "runts": re.compile(r"(\d+) runts"),
+    "giants": re.compile(r"(\d+) giants"),
+    "resets": re.compile(r"(\d+) interface resets"),
 }
 
 
-def collect_diagnostics(device_params):
-    """Collect diagnostic information from network device."""
-    try:
-        net_connect = ConnectHandler(**device_params)
-        logger.info(f"Connected to {device_params['host']}")
-    except (NetmikoTimeoutException, NetmikoAuthenticationException) as e:
-        logger.error(f"Connection failed to {device_params['host']}: {e}")
-        return None
-
-    diagnostics = {
-        'timestamp': datetime.now().isoformat(),
-        'host': device_params['host'],
-        'device_type': device_params['device_type'],
-    }
-
-    device_type = device_params['device_type']
-    if device_type not in VENDOR_COMMANDS:
-        logger.error(f"Unsupported device type: {device_type}")
-        net_connect.disconnect()
-        return None
-
-    try:
-        for key, cmd in VENDOR_COMMANDS[device_type].items():
-            try:
-                output = net_connect.send_command(cmd)
-                diagnostics[key] = output
-                logger.info(f"Collected {key} from {device_params['host']}")
-            except Exception as e:
-                logger.warning(f"Failed to collect {key}: {e}")
-                diagnostics[key] = f"Error: {str(e)}"
-    finally:
-        net_connect.disconnect()
-        logger.info(f"Disconnected from {device_params['host']}")
-
-    return diagnostics
+def parse_interfaces(output: str) -> list[dict]:
+    """Split 'show interfaces' output into per-interface dicts with error counters."""
+    interfaces = []
+    for block in re.split(r"\n(?=\S)", output):
+        m = _INTF_HEADER.match(block)
+        if not m:
+            continue
+        entry: dict = {"name": m.group(1), "status": m.group(2)}
+        for key, pattern in _COUNTERS.items():
+            hit = pattern.search(block)
+            entry[key] = int(hit.group(1)) if hit else 0
+        interfaces.append(entry)
+    return interfaces
 
 
-def generate_report(diagnostics, output_dir):
-    """Generate timestamped text and JSON reports."""
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    timestamp = diagnostics['timestamp'].replace(':', '-').split('.')[0]
-    host = diagnostics['host'].replace('.', '_')
-
-    txt_file = output_path / f"{host}_diagnostics_{timestamp}.txt"
-    with open(txt_file, 'w') as f:
-        f.write("=" * 70 + "\n")
-        f.write("NETWORK DEVICE DIAGNOSTIC REPORT\n")
-        f.write("=" * 70 + "\n")
-        f.write(f"Device: {diagnostics['host']}\n")
-        f.write(f"Type: {diagnostics['device_type']}\n")
-        f.write(f"Timestamp: {diagnostics['timestamp']}\n")
-        f.write("=" * 70 + "\n")
-
-        for key, value in diagnostics.items():
-            if key not in ['timestamp', 'host', 'device_type']:
-                f.write(f"\n{key.upper()}\n")
-                f.write("-" * 70 + "\n")
-                f.write(f"{value}\n")
-
-    logger.info(f"Text report saved: {txt_file}")
-
-    json_file = output_path / f"{host}_diagnostics_{timestamp}.json"
-    with open(json_file, 'w') as f:
-        json.dump(diagnostics, f, indent=2)
-
-    logger.info(f"JSON report saved: {json_file}")
-    return str(txt_file), str(json_file)
+def flagged_interfaces(interfaces: list[dict], threshold: int) -> list[dict]:
+    """Return interfaces where any error counter meets or exceeds threshold."""
+    result = []
+    for intf in interfaces:
+        counters = {k: v for k, v in intf.items() if k not in ("name", "status")}
+        worst = max(counters, key=lambda k: counters[k])
+        if counters[worst] >= threshold:
+            result.append({**intf, "worst": worst, "worst_value": counters[worst]})
+    return result
 
 
-def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description='Generate network device diagnostic reports',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+def print_report(flagged: list[dict], threshold: int) -> None:
+    if not flagged:
+        log.info("No interfaces exceed threshold of %d", threshold)
+        return
+    header = f"{'Interface':<32} {'Status':<22} {'Worst Counter':<18} {'Value':>8}"
+    print(f"\n{header}")
+    print("-" * len(header))
+    for intf in sorted(flagged, key=lambda x: x["worst_value"], reverse=True):
+        print(
+            f"{intf['name']:<32} {intf['status']:<22} "
+            f"{intf['worst']:<18} {intf['worst_value']:>8}"
+        )
+    print()
+
+
+def poll(conn, threshold: int, interface: str | None) -> None:
+    cmd = f"show interfaces {interface}" if interface else "show interfaces"
+    output = conn.send_command(cmd, read_timeout=60)
+    interfaces = parse_interfaces(output)
+    if not interfaces:
+        log.warning("No interfaces parsed from output — check device type or command")
+        return
+    log.info("Checked %d interface(s)", len(interfaces))
+    print_report(flagged_interfaces(interfaces, threshold), threshold)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Monitor Cisco interface error counters and alert on threshold breaches."
     )
+    p.add_argument("-H", "--host", required=True, help="Device IP or hostname")
+    p.add_argument("-u", "--username", required=True, help="SSH username")
+    p.add_argument("-p", "--password", required=True, help="SSH password")
+    p.add_argument("--secret", default="", help="Enable secret (if required)")
+    p.add_argument(
+        "--device-type", default="cisco_ios", help="Netmiko device type (default: cisco_ios)"
+    )
+    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
+    p.add_argument(
+        "--threshold",
+        type=int,
+        default=50,
+        help="Alert when any error counter reaches this value (default: 50)",
+    )
+    p.add_argument(
+        "--interval",
+        type=int,
+        default=0,
+        help="Polling interval in seconds; 0 = run once (default: 0)",
+    )
+    p.add_argument(
+        "--count",
+        type=int,
+        default=0,
+        help="Max poll cycles; 0 = unlimited — only applies when --interval > 0 (default: 0)",
+    )
+    p.add_argument(
+        "--interface",
+        default=None,
+        help="Scope to a single interface name (e.g. GigabitEthernet0/1)",
+    )
+    p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    return p
 
-    parser.add_argument('-d', '--device', required=True,
-                        help='Device IP address or hostname')
-    parser.add_argument('-t', '--type', required=True, dest='device_type',
-                        help='Device type (cisco_ios, arista_eos, juniper_junos, etc.)')
-    parser.add_argument('-u', '--username', required=True,
-                        help='Username for device authentication')
-    parser.add_argument('-p', '--password', help='Password (prompted if not provided)')
-    parser.add_argument('-o', '--output', default='./reports',
-                        help='Output directory for reports (default: ./reports)')
-    parser.add_argument('--port', type=int, default=22,
-                        help='SSH port (default: 22)')
-    parser.add_argument('--timeout', type=int, default=30,
-                        help='Connection timeout in seconds (default: 30)')
 
+if __name__ == "__main__":
+    parser = build_parser()
     args = parser.parse_args()
 
-    import getpass
-    password = args.password or getpass.getpass(f"Password for {args.username}: ")
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    device_params = {
-        'device_type': args.device_type,
-        'host': args.device,
-        'username': args.username,
-        'password': password,
-        'port': args.port,
-        'timeout': args.timeout,
+    device = {
+        "device_type": args.device_type,
+        "host": args.host,
+        "username": args.username,
+        "password": args.password,
+        "secret": args.secret,
+        "port": args.port,
     }
 
-    logger.info(f"Starting diagnostic collection for {args.device}")
-    diagnostics = collect_diagnostics(device_params)
+    try:
+        log.info("Connecting to %s", args.host)
+        conn = ConnectHandler(**device)
+        if args.secret:
+            conn.enable()
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s", args.host)
+        sys.exit(1)
+    except NetmikoTimeoutException:
+        log.error("Connection timed out reaching %s", args.host)
+        sys.exit(1)
+    except Exception as exc:
+        log.error("Connection error: %s", exc)
+        sys.exit(1)
 
-    if diagnostics:
-        txt_file, json_file = generate_report(diagnostics, args.output)
-        logger.info(f"Diagnostic collection completed successfully")
-        logger.info(f"Reports: {txt_file} and {json_file}")
-        return 0
-    else:
-        logger.error("Failed to collect diagnostics from device")
-        return 1
-
-
-if __name__ == '__main__':
-    exit(main())
-```
+    try:
+        if args.interval == 0:
+            poll(conn, args.threshold, args.interface)
+        else:
+            cycle = 0
+            while True:
+                cycle += 1
+                log.info("Poll cycle %d", cycle)
+                poll(conn, args.threshold, args.interface)
+                if args.count and cycle >= args.count:
+                    break
+                time.sleep(args.interval)
+    except KeyboardInterrupt:
+        log.info("Stopped by user")
+    finally:
+        conn.disconnect()
+        log.info("Disconnected from %s", args.host)
