@@ -1,193 +1,200 @@
-```python
-"""
-interface_error_monitor.py — Netmiko Interface Error Rate Monitor
+arp_table_collector.py — Collect and search ARP tables across network devices.
 
 Purpose:
-    Polls a device's interface error counters twice, separated by a configurable
-    interval, then reports per-interface error rates (errors/sec). Flags any
-    interface whose input errors, output errors, or CRC count exceeds a threshold.
-    Useful for diagnosing CRC storms, duplex mismatches, or flapping links without
-    requiring SNMP infrastructure.
+    Connects to one or more routers or Layer-3 switches via SSH and retrieves
+    their ARP tables. Results can be filtered by IP or MAC address and exported
+    to CSV for IP-to-MAC inventory or endpoint troubleshooting.
 
 Usage:
-    python interface_error_monitor.py --host 192.168.1.1 --username admin \
-        --device-type cisco_ios --interval 60 --threshold 1.0
+    # Full ARP table from one device
+    python arp_table_collector.py --host 192.168.1.1 --username admin --password s3cr3t
+
+    # Search for an IP across a fleet (one host per line in devices.txt)
+    python arp_table_collector.py --hosts-file devices.txt --username admin \\
+        --password s3cr3t --search-ip 10.0.0.50
+
+    # Filter by partial MAC and write results to CSV
+    python arp_table_collector.py --host 192.168.1.1 --username admin --password s3cr3t \\
+        --search-mac "00:1a:2b" --output arp_results.csv
+
+    Hosts file format (one per line):
+        192.168.1.1 cisco_ios
+        10.0.0.1 cisco_nxos
+        172.16.0.1              # defaults to --device-type if no type given
 
 Prerequisites:
     pip install netmiko
-    Supported platforms: Cisco IOS/IOS-XE/NX-OS, Arista EOS, Juniper JunOS
 """
 
 import argparse
-import getpass
+import csv
 import logging
 import re
 import sys
-import time
+from getpass import getpass
 
 from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
 logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-SHOW_COMMANDS = {
-    "cisco_ios": "show interfaces",
-    "cisco_xe": "show interfaces",
-    "cisco_nxos": "show interface",
-    "arista_eos": "show interfaces",
-    "juniper_junos": "show interfaces detail",
+_CISCO_ARP_RE = re.compile(
+    r"Internet\s+(\d+\.\d+\.\d+\.\d+)\s+\S+\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+(\S+)",
+    re.IGNORECASE,
+)
+_JUNOS_ARP_RE = re.compile(
+    r"([0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2})"
+    r"\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)",
+    re.IGNORECASE,
+)
+
+PLATFORM_CONFIG = {
+    "cisco_ios":  {"command": "show ip arp",       "parser": "cisco"},
+    "cisco_nxos": {"command": "show ip arp",       "parser": "cisco"},
+    "cisco_xr":   {"command": "show arp",          "parser": "cisco"},
+    "juniper_junos": {"command": "show arp no-resolve", "parser": "junos"},
 }
 
-_PATTERNS = {
-    "interface": re.compile(r"^(\S+) is (?:up|down|administratively down)", re.MULTILINE),
-    "input_errors": re.compile(r"(\d+) input errors", re.IGNORECASE),
-    "output_errors": re.compile(r"(\d+) output errors", re.IGNORECASE),
-    "crc": re.compile(r"(\d+) CRC", re.IGNORECASE),
-}
+
+def _normalize_mac(raw: str) -> str:
+    digits = re.sub(r"[^0-9a-fA-F]", "", raw)
+    return ":".join(digits[i:i + 2] for i in range(0, 12, 2)).lower()
 
 
-def _extract(pattern: re.Pattern, text: str) -> int:
-    m = pattern.search(text)
-    return int(m.group(1)) if m else 0
+def _parse_cisco(output: str) -> list[dict]:
+    return [
+        {"ip": m.group(1), "mac": _normalize_mac(m.group(2)), "interface": m.group(3)}
+        for m in _CISCO_ARP_RE.finditer(output)
+    ]
 
 
-def parse_counters(raw: str) -> dict:
-    """Parse show interfaces output into {iface: {metric: count}} structure."""
-    counters = {}
-    blocks = re.split(r"(?=^\S)", raw, flags=re.MULTILINE)
-    for block in blocks:
-        m = _PATTERNS["interface"].search(block)
-        if not m:
-            continue
-        iface = m.group(1)
-        counters[iface] = {
-            "input_errors": _extract(_PATTERNS["input_errors"], block),
-            "output_errors": _extract(_PATTERNS["output_errors"], block),
-            "crc": _extract(_PATTERNS["crc"], block),
-        }
-    return counters
+def _parse_junos(output: str) -> list[dict]:
+    return [
+        {"ip": m.group(2), "mac": _normalize_mac(m.group(1)), "interface": m.group(3)}
+        for m in _JUNOS_ARP_RE.finditer(output)
+    ]
 
 
-def compute_rates(before: dict, after: dict, elapsed: float) -> list[tuple]:
-    """Return (iface, metric, rate, delta) for every counter that increased."""
-    rows = []
-    for iface, post in after.items():
-        pre = before.get(iface, {})
-        for metric in ("input_errors", "output_errors", "crc"):
-            delta = post.get(metric, 0) - pre.get(metric, 0)
-            if delta > 0:
-                rows.append((iface, metric, delta / elapsed, delta))
-    return rows
+def collect_arp(host: str, username: str, password: str, device_type: str) -> list[dict]:
+    if device_type not in PLATFORM_CONFIG:
+        log.warning("Unsupported device type '%s' for %s — skipping", device_type, host)
+        return []
+
+    cfg = PLATFORM_CONFIG[device_type]
+    try:
+        with ConnectHandler(
+            device_type=device_type,
+            host=host,
+            username=username,
+            password=password,
+            timeout=30,
+        ) as conn:
+            log.info("Connected to %s (%s)", host, device_type)
+            output = conn.send_command(cfg["command"])
+
+        entries = _parse_cisco(output) if cfg["parser"] == "cisco" else _parse_junos(output)
+        for e in entries:
+            e["device"] = host
+        log.info("  %d entries from %s", len(entries), host)
+        return entries
+
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s", host)
+    except NetmikoTimeoutException:
+        log.error("Connection timed out for %s", host)
+    except Exception as exc:
+        log.error("Unexpected error on %s: %s", host, exc)
+    return []
 
 
-def collect(conn, device_type: str) -> dict:
-    cmd = SHOW_COMMANDS.get(device_type, "show interfaces")
-    log.debug("Sending: %s", cmd)
-    return parse_counters(conn.send_command(cmd))
+def filter_entries(
+    entries: list[dict],
+    search_ip: str | None,
+    search_mac: str | None,
+) -> list[dict]:
+    if search_ip:
+        entries = [e for e in entries if e["ip"] == search_ip]
+    if search_mac:
+        needle = re.sub(r"[^0-9a-fA-F]", "", search_mac).lower()
+        entries = [e for e in entries if needle in e["mac"].replace(":", "")]
+    return entries
+
+
+def load_hosts(path: str, default_type: str) -> list[tuple[str, str]]:
+    hosts = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            hosts.append((parts[0], parts[1] if len(parts) > 1 else default_type))
+    return hosts
+
+
+def write_csv(entries: list[dict], path: str) -> None:
+    with open(path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["device", "ip", "mac", "interface"])
+        writer.writeheader()
+        writer.writerows(entries)
+    log.info("Results written to %s", path)
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Monitor per-interface error rates on a network device via Netmiko."
+        description="Collect ARP tables from network devices via SSH.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--host", required=True, help="Device hostname or IP address")
-    p.add_argument("--username", required=True, help="SSH username")
+    target = p.add_mutually_exclusive_group(required=True)
+    target.add_argument("--host", help="Single device IP or hostname")
+    target.add_argument("--hosts-file", metavar="FILE",
+                        help="File with one host per line (host [device_type])")
+    p.add_argument("--username", required=True)
     p.add_argument("--password", help="SSH password (prompted if omitted)")
-    p.add_argument(
-        "--device-type",
-        default="cisco_ios",
-        choices=list(SHOW_COMMANDS),
-        help="Netmiko device type (default: cisco_ios)",
-    )
-    p.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    p.add_argument("--timeout", type=int, default=30, help="SSH timeout in seconds")
-    p.add_argument("--enable-secret", help="Enable secret for privilege escalation")
-    p.add_argument(
-        "--interval",
-        type=int,
-        default=60,
-        help="Seconds between the two counter polls (default: 60)",
-    )
-    p.add_argument(
-        "--threshold",
-        type=float,
-        default=1.0,
-        help="Flag interfaces with error rate >= this value (errors/sec, default: 1.0)",
-    )
-    p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    p.add_argument("--device-type", default="cisco_ios",
+                   choices=list(PLATFORM_CONFIG),
+                   help="Netmiko device type (default: cisco_ios)")
+    p.add_argument("--search-ip", metavar="IP",
+                   help="Return only entries matching this IP address")
+    p.add_argument("--search-mac", metavar="MAC",
+                   help="Return entries whose MAC contains this substring (any notation)")
+    p.add_argument("--output", metavar="FILE",
+                   help="Write results to CSV")
     return p
 
 
-def main() -> None:
-    args = build_parser().parse_args()
-
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-    if not args.password:
-        args.password = getpass.getpass(f"Password for {args.username}@{args.host}: ")
-
-    device_params = {
-        "device_type": args.device_type,
-        "host": args.host,
-        "username": args.username,
-        "password": args.password,
-        "port": args.port,
-        "timeout": args.timeout,
-    }
-    if args.enable_secret:
-        device_params["secret"] = args.enable_secret
-
-    log.info("Connecting to %s (%s)", args.host, args.device_type)
-    try:
-        conn = ConnectHandler(**device_params)
-    except NetmikoAuthenticationException:
-        log.error("Authentication failed for %s@%s", args.username, args.host)
-        sys.exit(1)
-    except NetmikoTimeoutException:
-        log.error("Connection timed out to %s", args.host)
-        sys.exit(1)
-
-    try:
-        log.info("Baseline sample...")
-        baseline = collect(conn, args.device_type)
-        log.info("Captured %d interfaces. Waiting %ds...", len(baseline), args.interval)
-        t0 = time.monotonic()
-        time.sleep(args.interval)
-        elapsed = time.monotonic() - t0
-        log.info("Second sample...")
-        sample = collect(conn, args.device_type)
-    finally:
-        conn.disconnect()
-
-    rates = compute_rates(baseline, sample, elapsed)
-
-    if not rates:
-        log.info("No errors detected on any interface over the %ds window.", args.interval)
-        return
-
-    flagged = [r for r in rates if r[2] >= args.threshold]
-    log.info(
-        "%d counter(s) with errors; %d at/above threshold (%.2f/sec)",
-        len(rates),
-        len(flagged),
-        args.threshold,
-    )
-
-    header = f"\n{'Interface':<32} {'Metric':<16} {'Errors/sec':>12} {'Delta':>8}"
-    print(header)
-    print("-" * 70)
-    for iface, metric, rate, delta in sorted(rates, key=lambda r: -r[2]):
-        flag = "  <-- ALERT" if rate >= args.threshold else ""
-        print(f"{iface:<32} {metric:<16} {rate:>12.3f} {delta:>8}{flag}")
-
-    if flagged:
-        sys.exit(2)
-
-
 if __name__ == "__main__":
-    main()
-```
+    args = build_parser().parse_args()
+    password = args.password or getpass(f"Password for {args.username}: ")
+
+    if args.host:
+        targets = [(args.host, args.device_type)]
+    else:
+        try:
+            targets = load_hosts(args.hosts_file, args.device_type)
+        except FileNotFoundError:
+            log.error("Hosts file not found: %s", args.hosts_file)
+            sys.exit(1)
+
+    all_entries: list[dict] = []
+    for host, dtype in targets:
+        all_entries.extend(collect_arp(host, args.username, password, dtype))
+
+    results = filter_entries(all_entries, args.search_ip, args.search_mac)
+
+    if not results:
+        log.info("No matching ARP entries found.")
+        sys.exit(0)
+
+    print(f"\n{'Device':<20} {'IP Address':<18} {'MAC Address':<20} Interface")
+    print("-" * 76)
+    for e in results:
+        print(f"{e['device']:<20} {e['ip']:<18} {e['mac']:<20} {e['interface']}")
+    print(f"\nTotal: {len(results)} entr{'y' if len(results) == 1 else 'ies'}")
+
+    if args.output:
+        write_csv(results, args.output)
