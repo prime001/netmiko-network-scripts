@@ -1,36 +1,30 @@
-#!/usr/bin/env python3
+```python
 """
-config_backup.py - Network device configuration backup and drift detection
+interface_error_monitor.py — Network interface error counter monitor.
 
 Purpose:
-    Archives running configurations from network devices to timestamped files
-    and detects configuration drift by comparing against the most recent backup.
-    Useful for compliance auditing, change tracking, and pre/post-change snapshots.
+    Connects to Cisco IOS/IOS-XE devices via SSH and collects per-interface
+    error statistics: input errors, output errors, CRC, runts, giants, and drops.
+    Flags any interface whose combined error count exceeds a configurable threshold.
+
+    With --poll 2, takes two snapshots separated by --interval seconds and reports
+    the *delta*, catching actively-degrading links rather than stale historic counters.
 
 Usage:
-    # Single device backup
-    python config_backup.py --host 10.0.0.1 --username admin --password secret
-
-    # Bulk backup from inventory file (one IP/hostname per line, # for comments)
-    python config_backup.py --inventory hosts.txt --username admin --password secret
-
-    # Show unified diff against previous backup (also saves new backup)
-    python config_backup.py --host 10.0.0.1 --diff
-
-    # Use environment variables for credentials
-    NET_USER=admin NET_PASS=secret python config_backup.py --host 10.0.0.1
+    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret
+    python interface_error_monitor.py -d 192.168.1.1 -u admin -p secret \\
+        --poll 2 --interval 60 --threshold 10 --output errors.json
 
 Prerequisites:
     pip install netmiko
 """
 
 import argparse
-import difflib
+import json
 import logging
-import os
-import sys
-from datetime import datetime
-from pathlib import Path
+import re
+import time
+from dataclasses import asdict, dataclass
 
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
@@ -42,155 +36,194 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-SHOW_RUN = {
-    "cisco_ios": "show running-config",
-    "cisco_xe": "show running-config",
-    "cisco_nxos": "show running-config",
-    "arista_eos": "show running-config",
-    "juniper_junos": "show configuration | display set",
-}
+
+@dataclass
+class InterfaceErrors:
+    name: str
+    input_errors: int = 0
+    output_errors: int = 0
+    crc: int = 0
+    input_drops: int = 0
+    output_drops: int = 0
+    runts: int = 0
+    giants: int = 0
 
 
-def fetch_config(host, username, password, device_type, port):
-    params = {
-        "device_type": device_type,
-        "host": host,
-        "username": username,
-        "password": password,
-        "port": port,
-    }
-    command = SHOW_RUN.get(device_type, "show running-config")
-    log.info("Connecting to %s (%s)", host, device_type)
-    with ConnectHandler(**params) as conn:
-        return conn.send_command(command, read_timeout=60)
+def parse_interface_errors(output: str) -> dict[str, InterfaceErrors]:
+    """Parse 'show interfaces' output into per-interface error counters."""
+    interfaces: dict[str, InterfaceErrors] = {}
+    current: InterfaceErrors | None = None
+
+    for line in output.splitlines():
+        iface_match = re.match(r"^(\S+) is (?:up|down|administratively down)", line)
+        if iface_match:
+            current = InterfaceErrors(name=iface_match.group(1))
+            interfaces[current.name] = current
+            continue
+
+        if current is None:
+            continue
+
+        if m := re.search(r"(\d+) input errors", line):
+            current.input_errors = int(m.group(1))
+        if m := re.search(r"(\d+) CRC", line):
+            current.crc = int(m.group(1))
+        if m := re.search(r"(\d+) output errors", line):
+            current.output_errors = int(m.group(1))
+        if m := re.search(r"(\d+) input drops", line):
+            current.input_drops = int(m.group(1))
+        if m := re.search(r"(\d+) output drops", line):
+            current.output_drops = int(m.group(1))
+        if m := re.search(r"(\d+) runts", line):
+            current.runts = int(m.group(1))
+        if m := re.search(r"(\d+) giants", line):
+            current.giants = int(m.group(1))
+
+    return interfaces
 
 
-def save_backup(host, config, output_dir):
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dest = Path(output_dir) / host
-    dest.mkdir(parents=True, exist_ok=True)
-    path = dest / f"{ts}_running.cfg"
-    path.write_text(config)
-    log.info("Saved %s", path)
-    return path
-
-
-def latest_backup(host, output_dir):
-    device_dir = Path(output_dir) / host
-    if not device_dir.exists():
-        return None
-    candidates = sorted(device_dir.glob("*_running.cfg"))
-    return candidates[-1] if candidates else None
-
-
-def print_drift(host, current_config, output_dir):
-    prev_path = latest_backup(host, output_dir)
-    if prev_path is None:
-        log.warning("[%s] No prior backup found; skipping diff", host)
-        return
-
-    prev_lines = prev_path.read_text().splitlines(keepends=True)
-    curr_lines = current_config.splitlines(keepends=True)
-    diff = list(difflib.unified_diff(
-        prev_lines,
-        curr_lines,
-        fromfile=str(prev_path),
-        tofile=f"{host} (live)",
-    ))
-
-    if diff:
-        print(f"\n--- Config drift on {host} ({len(diff)} diff lines) ---")
-        sys.stdout.writelines(diff)
-    else:
-        print(f"[{host}] No drift detected since {prev_path.name}")
-
-
-def backup_device(host, username, password, device_type, port, output_dir, show_diff):
-    try:
-        config = fetch_config(host, username, password, device_type, port)
-    except NetmikoAuthenticationException:
-        log.error("[%s] Authentication failed", host)
-        return False
-    except NetmikoTimeoutException:
-        log.error("[%s] Connection timed out", host)
-        return False
-    except Exception as exc:
-        log.error("[%s] %s", host, exc)
-        return False
-
-    if show_diff:
-        print_drift(host, config, output_dir)
-
-    save_backup(host, config, output_dir)
-    return True
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Backup network device running configs and detect configuration drift"
+def total_errors(iface: InterfaceErrors) -> int:
+    return (
+        iface.input_errors + iface.output_errors + iface.crc
+        + iface.input_drops + iface.output_drops + iface.runts + iface.giants
     )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--host", help="Single device IP or hostname")
-    group.add_argument("--inventory", help="Inventory file with one host per line")
-    parser.add_argument("--username", default=os.environ.get("NET_USER"))
-    parser.add_argument("--password", default=os.environ.get("NET_PASS"))
+
+
+def compute_delta(first: InterfaceErrors, second: InterfaceErrors) -> InterfaceErrors:
+    return InterfaceErrors(
+        name=first.name,
+        input_errors=second.input_errors - first.input_errors,
+        output_errors=second.output_errors - first.output_errors,
+        crc=second.crc - first.crc,
+        input_drops=second.input_drops - first.input_drops,
+        output_drops=second.output_drops - first.output_drops,
+        runts=second.runts - first.runts,
+        giants=second.giants - first.giants,
+    )
+
+
+def check_device(
+    host: str,
+    username: str,
+    password: str,
+    device_type: str = "cisco_ios",
+    poll_count: int = 1,
+    poll_interval: int = 60,
+    threshold: int = 0,
+) -> dict:
+    result: dict = {"host": host, "polls": [], "flagged": [], "error": None}
+
+    try:
+        log.info("Connecting to %s", host)
+        with ConnectHandler(
+            device_type=device_type, host=host,
+            username=username, password=password,
+        ) as conn:
+            polls: list[dict[str, InterfaceErrors]] = []
+
+            for i in range(poll_count):
+                if i > 0:
+                    log.info("Waiting %ds before poll %d/%d", poll_interval, i + 1, poll_count)
+                    time.sleep(poll_interval)
+                log.info("Poll %d/%d on %s", i + 1, poll_count, host)
+                snap = parse_interface_errors(conn.send_command("show interfaces"))
+                polls.append(snap)
+                result["polls"].append({k: asdict(v) for k, v in snap.items()})
+
+            if len(polls) == 2:
+                evaluated = {
+                    name: compute_delta(polls[0][name], polls[1][name])
+                    for name in polls[0]
+                    if name in polls[1]
+                }
+                log.info("Using %ds error deltas", poll_interval)
+            else:
+                evaluated = polls[0]
+
+            for name, iface in evaluated.items():
+                tot = total_errors(iface)
+                if tot > threshold:
+                    result["flagged"].append(asdict(iface))
+                    log.warning(
+                        "%-30s total=%d  in_err=%d  crc=%d  out_err=%d  drops=%d/%d",
+                        name, tot, iface.input_errors, iface.crc, iface.output_errors,
+                        iface.input_drops, iface.output_drops,
+                    )
+
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed for %s", host)
+        result["error"] = "authentication_failed"
+    except NetmikoTimeoutException:
+        log.error("Connection timed out for %s", host)
+        result["error"] = "timeout"
+    except Exception as exc:
+        log.error("Unexpected error on %s: %s", host, exc)
+        result["error"] = str(exc)
+
+    return result
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Monitor network interface error counters via SSH using netmiko."
+    )
+    parser.add_argument("-d", "--device", required=True, help="Device hostname or IP")
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
     parser.add_argument(
-        "--device-type",
-        default="cisco_ios",
-        choices=list(SHOW_RUN.keys()),
+        "--device-type", default="cisco_ios",
         help="Netmiko device type (default: cisco_ios)",
     )
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
     parser.add_argument(
-        "--output-dir",
-        default="config_backups",
-        help="Root directory for backup storage (default: config_backups)",
+        "--poll", type=int, default=1, choices=[1, 2],
+        help="Poll count: 1=absolute counters, 2=delta over --interval seconds",
     )
     parser.add_argument(
-        "--diff",
-        action="store_true",
-        help="Print unified diff against most recent backup before saving new one",
+        "--interval", type=int, default=60,
+        help="Seconds between polls when --poll 2 (default: 60)",
     )
-    args = parser.parse_args()
-
-    if not args.username or not args.password:
-        parser.error(
-            "Credentials required via --username/--password or NET_USER/NET_PASS env vars"
-        )
-
-    if args.host:
-        hosts = [args.host]
-    else:
-        p = Path(args.inventory)
-        if not p.exists():
-            parser.error(f"Inventory file not found: {args.inventory}")
-        hosts = [
-            ln.strip()
-            for ln in p.read_text().splitlines()
-            if ln.strip() and not ln.startswith("#")
-        ]
-        if not hosts:
-            parser.error("Inventory file contains no valid hosts")
-
-    succeeded, failed = 0, 0
-    for host in hosts:
-        ok = backup_device(
-            host,
-            args.username,
-            args.password,
-            args.device_type,
-            args.port,
-            args.output_dir,
-            args.diff,
-        )
-        if ok:
-            succeeded += 1
-        else:
-            failed += 1
-
-    log.info("Complete: %d succeeded, %d failed", succeeded, failed)
-    sys.exit(1 if failed else 0)
+    parser.add_argument(
+        "--threshold", type=int, default=0,
+        help="Flag interfaces with combined error count above this value (default: 0)",
+    )
+    parser.add_argument("--output", metavar="FILE", help="Write JSON results to FILE")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    return parser
 
 
 if __name__ == "__main__":
-    main()
+    args = build_parser().parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    result = check_device(
+        host=args.device,
+        username=args.username,
+        password=args.password,
+        device_type=args.device_type,
+        poll_count=args.poll,
+        poll_interval=args.interval,
+        threshold=args.threshold,
+    )
+
+    flagged = result.get("flagged", [])
+    if result.get("error"):
+        print(f"ERROR: {result['error']}")
+    elif flagged:
+        print(f"\n{len(flagged)} interface(s) exceeded threshold ({args.threshold}):")
+        for iface in flagged:
+            tot = (iface["input_errors"] + iface["output_errors"] + iface["crc"]
+                   + iface["input_drops"] + iface["output_drops"]
+                   + iface["runts"] + iface["giants"])
+            print(f"  {iface['name']:<30} total={tot:>6}  "
+                  f"in_err={iface['input_errors']}  crc={iface['crc']}  "
+                  f"out_err={iface['output_errors']}")
+    else:
+        print(f"All interfaces within threshold ({args.threshold}).")
+
+    if args.output:
+        with open(args.output, "w") as fh:
+            json.dump(result, fh, indent=2)
+        log.info("Results written to %s", args.output)
+```
