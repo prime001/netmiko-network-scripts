@@ -1,182 +1,211 @@
 ```python
-#!/usr/bin/env python3
 """
-Interface Error Detector - Identifies problematic network interfaces.
+Interface Error Monitor - netmiko-based network device interface analyzer.
 
 Purpose:
-    Connects to network devices and analyzes interface statistics to identify
-    ports with errors, discards, or other anomalies. Generates a report of
-    problematic interfaces that may indicate hardware or configuration issues.
+    Monitors network device interfaces for errors, discards, and CRC failures.
+    Generates alerts when error thresholds are exceeded. Useful for detecting
+    interface health issues before they impact production traffic.
 
 Usage:
-    python interface_error_detector.py -d 192.168.1.1 -u admin -p password
-    python interface_error_detector.py -i devices.txt -u admin -p password
+    python interface_error_monitor.py --host 192.168.1.1 --device-type cisco_ios \
+        --username admin --password secret --error-threshold 100 --output report.txt
 
 Prerequisites:
-    - netmiko library: pip install netmiko
-    - Network credentials with read access to devices
-    - SSH access on port 22
+    - netmiko library installed (pip install netmiko)
+    - Device must be reachable and have SSH enabled
+    - Credentials with read access to device
+    - Device must support "show interfaces" command (Cisco IOS/XE, NX-OS, etc.)
 
-Arguments:
-    --device/-d: Single device IP address
-    --input/-i: File with list of device IPs (one per line)
-    --username/-u: Device username
-    --password/-p: Device password
-    --device-type/-t: Netmiko device type (default: cisco_ios)
+Author: Network Engineering Portfolio
 """
 
-import logging
 import argparse
+import logging
 import sys
-import os
+from datetime import datetime
 from netmiko import ConnectHandler
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko.ssh_exception import NetMikoTimeoutException, SSHException
 
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+def setup_logging(log_file=None):
+    """Configure logging for the script."""
+    log_format = '%(asctime)s - %(levelname)s - %(message)s'
+    handlers = [logging.StreamHandler(sys.stdout)]
+    
+    if log_file:
+        handlers.append(logging.FileHandler(log_file))
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format=log_format,
+        handlers=handlers
+    )
+    return logging.getLogger(__name__)
 
 
-def connect_device(host, username, password, device_type, port=22):
-    """Connect to network device via SSH."""
+def connect_to_device(host, device_type, username, password, timeout=30):
+    """Establish SSH connection to network device."""
     try:
         device = ConnectHandler(
             device_type=device_type,
             host=host,
             username=username,
             password=password,
-            port=port,
-            timeout=20
+            timeout=timeout
         )
-        logger.info(f"Connected to {host}")
+        logging.info(f"Successfully connected to {host}")
         return device
-    except (NetmikoAuthenticationException, NetmikoTimeoutException) as e:
-        logger.error(f"Failed to connect to {host}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error connecting to {host}: {e}")
+    except (NetMikoTimeoutException, SSHException) as e:
+        logging.error(f"Failed to connect to {host}: {e}")
         return None
 
 
-def parse_cisco_interfaces(output):
-    """Parse 'show interface' output for error statistics."""
+def parse_interface_stats(output):
+    """Parse interface error statistics from device output."""
     interfaces = {}
-    current_iface = None
+    current_interface = None
     
     for line in output.split('\n'):
         line = line.strip()
-        if line and line[0] in ('*', ' ') and ' is ' in line:
-            current_iface = line.split()[0].lstrip('*')
-            interfaces[current_iface] = {'errors': 0, 'discards': 0}
         
-        if current_iface:
-            if 'input errors' in line.lower():
-                try:
-                    errors = int(line.split(',')[0].split()[0])
-                    interfaces[current_iface]['errors'] = errors
-                except (ValueError, IndexError):
-                    pass
-            if 'discards' in line.lower() and 'input' in line.lower():
-                try:
-                    parts = line.split(',')
-                    for part in parts:
-                        if 'discards' in part.lower():
-                            discards = int(part.split()[0])
-                            interfaces[current_iface]['discards'] = discards
-                            break
-                except (ValueError, IndexError):
-                    pass
+        if any(line.startswith(prefix) for prefix in 
+               ('Ethernet', 'FastEthernet', 'GigabitEthernet', 'Port-channel', 'Vlan')):
+            current_interface = line.split()[0]
+            interfaces[current_interface] = {
+                'input_errors': 0,
+                'output_errors': 0,
+                'crc': 0
+            }
+        
+        if current_interface and 'input errors' in line.lower():
+            try:
+                value = int(line.split(',')[0].split()[-1])
+                interfaces[current_interface]['input_errors'] = value
+            except (ValueError, IndexError):
+                pass
+        
+        if current_interface and 'output errors' in line.lower():
+            try:
+                value = int(line.split(',')[0].split()[-1])
+                interfaces[current_interface]['output_errors'] = value
+            except (ValueError, IndexError):
+                pass
+        
+        if current_interface and 'crc' in line.lower():
+            try:
+                value = int(line.split()[-1])
+                interfaces[current_interface]['crc'] = value
+            except (ValueError, IndexError):
+                pass
     
-    return {iface: stats for iface, stats in interfaces.items() 
-            if stats['errors'] > 0 or stats['discards'] > 0}
+    return interfaces
 
 
-def analyze_device(device, device_type):
-    """Gather interface statistics from device."""
-    try:
-        if 'cisco' in device_type.lower():
-            output = device.send_command('show interface')
-            return parse_cisco_interfaces(output)
-        logger.warning(f"Device type {device_type} not fully supported")
-        return {}
-    except Exception as e:
-        logger.error(f"Error analyzing device: {e}")
-        return {}
-
-
-def load_devices(filename):
-    """Load device IPs from file."""
-    try:
-        with open(filename, 'r') as f:
-            devices = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-        logger.info(f"Loaded {len(devices)} devices from {filename}")
-        return devices
-    except FileNotFoundError:
-        logger.error(f"File not found: {filename}")
-        return []
-
-
-def print_report(results):
-    """Display interface error report."""
-    print("\n" + "="*70)
-    print("INTERFACE ERROR DETECTION REPORT")
-    print("="*70)
+def check_error_thresholds(interfaces, threshold):
+    """Identify interfaces exceeding error thresholds."""
+    problem_interfaces = {}
     
-    total_problems = 0
-    for device, interfaces in results.items():
-        if interfaces:
-            print(f"\n{device}:")
-            print(f"{'Interface':<20} {'Errors':<15} {'Discards':<15}")
-            print("-"*70)
-            for iface, stats in interfaces.items():
-                print(f"{iface:<20} {stats['errors']:<15} {stats['discards']:<15}")
-                total_problems += 1
-        else:
-            print(f"\n{device}: No problematic interfaces")
+    for interface, stats in interfaces.items():
+        if (stats['input_errors'] > threshold or 
+            stats['output_errors'] > threshold or 
+            stats['crc'] > threshold):
+            problem_interfaces[interface] = stats
     
-    print("\n" + "="*70)
-    print(f"Total problematic interfaces: {total_problems}")
-    print("="*70 + "\n")
+    return problem_interfaces
+
+
+def generate_report(device_info, interfaces, problem_interfaces, output_file=None):
+    """Generate formatted report of interface status."""
+    report = []
+    report.append(f"\n{'='*70}")
+    report.append(f"Interface Error Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    report.append(f"Device: {device_info['host']}")
+    report.append(f"{'='*70}\n")
+    
+    if problem_interfaces:
+        report.append(f"ALERT: {len(problem_interfaces)} interface(s) with errors:\n")
+        for interface, stats in problem_interfaces.items():
+            report.append(f"  {interface}:")
+            report.append(f"    Input Errors:  {stats['input_errors']}")
+            report.append(f"    Output Errors: {stats['output_errors']}")
+            report.append(f"    CRC Errors:    {stats['crc']}")
+            report.append("")
+    else:
+        report.append("All monitored interfaces are healthy.\n")
+    
+    report.append(f"Total interfaces monitored: {len(interfaces)}")
+    report.append(f"{'='*70}\n")
+    
+    report_text = '\n'.join(report)
+    print(report_text)
+    
+    if output_file:
+        try:
+            with open(output_file, 'w') as f:
+                f.write(report_text)
+            logging.info(f"Report written to {output_file}")
+        except IOError as e:
+            logging.error(f"Failed to write report: {e}")
 
 
 def main():
+    """Main execution function."""
     parser = argparse.ArgumentParser(
-        description='Detect and report network interface errors and discards'
+        description='Monitor network device interfaces for errors',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Example: %(prog)s --host 192.168.1.1 --device-type cisco_ios '
+               '--username admin --password secret'
     )
-    parser.add_argument('-d', '--device', help='Single device IP address')
-    parser.add_argument('-i', '--input', help='File with device IPs (one per line)')
-    parser.add_argument('-u', '--username', required=True, help='Device username')
-    parser.add_argument('-p', '--password', help='Device password')
-    parser.add_argument('-t', '--device-type', default='cisco_ios', help='Device type for netmiko')
-    parser.add_argument('--port', type=int, default=22, help='SSH port (default: 22)')
+    
+    parser.add_argument('--host', required=True, help='Device IP address')
+    parser.add_argument('--device-type', required=True,
+                        help='netmiko device type (cisco_ios, cisco_xe, arista_eos, etc.)')
+    parser.add_argument('--username', required=True, help='SSH username')
+    parser.add_argument('--password', required=True, help='SSH password')
+    parser.add_argument('--error-threshold', type=int, default=100,
+                        help='Error count threshold for alerting (default: 100)')
+    parser.add_argument('--output', help='Output report file path')
+    parser.add_argument('--timeout', type=int, default=30,
+                        help='Connection timeout in seconds (default: 30)')
     
     args = parser.parse_args()
     
-    if not args.device and not args.input:
-        parser.error('Provide either --device or --input')
+    log_file = args.output.replace('.txt', '.log') if args.output else None
+    logger = setup_logging(log_file)
     
-    password = args.password or os.environ.get('SSH_PASSWORD')
-    if not password:
-        parser.error('Password required (use -p or SSH_PASSWORD environment variable)')
+    device = connect_to_device(
+        args.host,
+        args.device_type,
+        args.username,
+        args.password,
+        args.timeout
+    )
     
-    devices = [args.device] if args.device else load_devices(args.input)
-    if not devices:
-        logger.error('No devices to process')
+    if not device:
         sys.exit(1)
     
-    results = {}
-    for host in devices:
-        device = connect_device(host, args.username, password, args.device_type, args.port)
-        if device:
-            try:
-                results[host] = analyze_device(device, args.device_type)
-            finally:
-                device.disconnect()
-                logger.info(f"Disconnected from {host}")
+    try:
+        logging.info("Gathering interface statistics...")
+        output = device.send_command('show interfaces')
+        
+        interfaces = parse_interface_stats(output)
+        problem_interfaces = check_error_thresholds(interfaces, args.error_threshold)
+        
+        device_info = {'host': args.host}
+        generate_report(device_info, interfaces, problem_interfaces, args.output)
+        
+        sys.exit(1 if problem_interfaces else 0)
     
-    print_report(results)
+    except Exception as e:
+        logging.error(f"Error during execution: {e}")
+        sys.exit(1)
+    
+    finally:
+        device.disconnect()
+        logging.info("Disconnected from device")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
 ```
