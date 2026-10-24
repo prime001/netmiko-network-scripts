@@ -1,0 +1,195 @@
+```python
+"""
+Interface Statistics Collector
+
+Collects interface statistics from network devices using netmiko and generates
+a summary report of interface utilization, errors, and performance metrics.
+
+Usage:
+    python interface_statistics_collector.py -d 192.168.1.1 -u admin -p password
+    python interface_statistics_collector.py -d 192.168.1.1 -u admin -p password -o report.txt
+
+Prerequisites:
+    - netmiko installed (pip install netmiko)
+    - SSH access to target devices with read permissions
+    - Device must support 'show interfaces' command
+
+Supported Devices:
+    - Cisco IOS/IOS-XE, NX-OS
+    - Arista EOS
+    - Juniper Junos
+"""
+
+import argparse
+import logging
+import sys
+from datetime import datetime
+from netmiko import ConnectHandler, NetmikoTimeoutException, NetmikoAuthenticationException
+
+
+def setup_logging(verbose=False):
+    """Configure logging for the script."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+    return logging.getLogger(__name__)
+
+
+def parse_interfaces(output):
+    """Parse interface statistics from command output."""
+    interfaces = []
+    lines = output.split('\n')
+    current = None
+    
+    for line in lines:
+        if 'is up' in line or 'is down' in line:
+            parts = line.split()
+            if parts:
+                current = {'name': parts[0], 'status': 'up' if 'is up' in line else 'down'}
+                interfaces.append(current)
+        
+        if current and 'packets input' in line:
+            current['input_data'] = line.strip()
+        elif current and 'errors' in line.lower():
+            current['errors'] = line.strip()
+    
+    return interfaces
+
+
+def collect_statistics(host, device_type, username, password, port=22, timeout=10):
+    """
+    Connect to device and collect interface statistics.
+    
+    Returns:
+        List of interface dictionaries with statistics
+    """
+    device_params = {
+        'device_type': device_type,
+        'host': host,
+        'username': username,
+        'password': password,
+        'port': port,
+        'timeout': timeout,
+        'global_delay_factor': 2,
+    }
+    
+    logger = logging.getLogger(__name__)
+    
+    try:
+        logger.info(f"Connecting to {host} ({device_type})")
+        
+        with ConnectHandler(**device_params) as net_connect:
+            logger.info(f"Successfully connected to {host}")
+            
+            # Select command based on device type
+            if 'juniper' in device_type:
+                command = 'show interfaces terse'
+            else:
+                command = 'show interfaces'
+            
+            logger.debug(f"Executing: {command}")
+            output = net_connect.send_command(command, use_textfsm=False)
+            interfaces = parse_interfaces(output)
+            
+            logger.info(f"Collected statistics from {len(interfaces)} interfaces")
+            return interfaces
+    
+    except NetmikoAuthenticationException:
+        logger.error(f"Authentication failed for {host}")
+        sys.exit(1)
+    except NetmikoTimeoutException:
+        logger.error(f"Connection timeout for {host}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Error connecting to {host}: {str(e)}")
+        sys.exit(1)
+
+
+def generate_report(host, interfaces, device_type):
+    """Format interface statistics into a readable report."""
+    report = []
+    report.append("=" * 80)
+    report.append(f"Interface Statistics Report - {host}")
+    report.append(f"Device Type: {device_type}")
+    report.append(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    report.append("=" * 80)
+    report.append("")
+    
+    if not interfaces:
+        report.append("No interfaces found.")
+        return "\n".join(report)
+    
+    up_count = sum(1 for i in interfaces if i.get('status') == 'up')
+    down_count = sum(1 for i in interfaces if i.get('status') == 'down')
+    
+    report.append(f"Summary: {len(interfaces)} interfaces total")
+    report.append(f"  Up: {up_count}, Down: {down_count}")
+    report.append("")
+    report.append(f"{'Interface':<20} {'Status':<10} {'Details':<50}")
+    report.append("-" * 80)
+    
+    for intf in interfaces:
+        name = intf.get('name', 'N/A')[:20]
+        status = intf.get('status', 'Unknown')[:10]
+        details = (intf.get('errors') or intf.get('input_data') or 'N/A')[:50]
+        report.append(f"{name:<20} {status:<10} {details:<50}")
+    
+    report.append("=" * 80)
+    return "\n".join(report)
+
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description='Collect interface statistics from network devices',
+        epilog='Example: python interface_statistics_collector.py -d 192.168.1.1 -u admin -p password'
+    )
+    
+    parser.add_argument('-d', '--device', required=True, help='Device IP or hostname')
+    parser.add_argument('-u', '--username', required=True, help='SSH username')
+    parser.add_argument('-p', '--password', required=True, help='SSH password')
+    parser.add_argument('-t', '--device-type', default='cisco_ios', help='Device type (default: cisco_ios)')
+    parser.add_argument('--port', type=int, default=22, help='SSH port (default: 22)')
+    parser.add_argument('--timeout', type=int, default=10, help='Connection timeout in seconds')
+    parser.add_argument('-o', '--output', help='Save report to file')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging')
+    
+    args = parser.parse_args()
+    setup_logging(args.verbose)
+    
+    logger = logging.getLogger(__name__)
+    logger.info("Starting interface statistics collection")
+    
+    # Collect statistics
+    interfaces = collect_statistics(
+        host=args.device,
+        device_type=args.device_type,
+        username=args.username,
+        password=args.password,
+        port=args.port,
+        timeout=args.timeout
+    )
+    
+    # Generate and display report
+    report = generate_report(args.device, interfaces, args.device_type)
+    print(report)
+    
+    # Save to file if requested
+    if args.output:
+        try:
+            with open(args.output, 'w') as f:
+                f.write(report)
+            logger.info(f"Report saved to {args.output}")
+        except IOError as e:
+            logger.error(f"Failed to write report: {str(e)}")
+            sys.exit(1)
+    
+    logger.info("Collection completed successfully")
+
+
+if __name__ == "__main__":
+    main()
+```
