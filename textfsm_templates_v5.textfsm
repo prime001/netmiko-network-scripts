@@ -1,0 +1,204 @@
+The write is being blocked by permissions. Here's the complete script — output only, as requested:
+
+```
+"""
+mac_finder.py - Locate a MAC or IP address across network switches via Netmiko.
+
+Purpose:
+    Connects to one or more Cisco switches and searches the MAC address table
+    (and optionally the ARP table) to identify which port a host is connected to.
+    Useful for troubleshooting, asset tracking, and security investigations.
+
+Usage:
+    # Find a MAC on a single switch
+    python mac_finder.py --host 192.168.1.1 -u admin -p secret \
+        --target-mac 00:1a:2b:3c:4d:5e
+
+    # Resolve an IP to its MAC via ARP, then locate it
+    python mac_finder.py --host 192.168.1.1 -u admin -p secret \
+        --target-ip 10.0.0.50
+
+    # Search multiple switches listed in a file (one IP per line, # = comment)
+    python mac_finder.py --host-file switches.txt -u admin -p secret \
+        --target-mac aabb.cc11.2233
+
+Prerequisites:
+    pip install netmiko
+    Tested platforms: cisco_ios, cisco_xe, cisco_nxos
+"""
+
+import argparse
+import logging
+import re
+import sys
+from pathlib import Path
+
+from netmiko import ConnectHandler
+from netmiko.exceptions import (
+    NetmikoAuthenticationException,
+    NetmikoTimeoutException,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+
+def normalize_mac(mac: str) -> str:
+    digits = re.sub(r"[^0-9a-fA-F]", "", mac)
+    if len(digits) != 12:
+        raise ValueError(f"Invalid MAC address: {mac!r}")
+    return ":".join(digits[i : i + 2].lower() for i in range(0, 12, 2))
+
+
+def mac_variants(mac: str) -> list:
+    """Return colon, dash, and Cisco dot-quad representations."""
+    d = re.sub(r"[^0-9a-fA-F]", "", mac).lower()
+    return [
+        ":".join(d[i : i + 2] for i in range(0, 12, 2)),
+        "-".join(d[i : i + 2] for i in range(0, 12, 2)),
+        ".".join(d[i : i + 4] for i in range(0, 12, 4)),
+    ]
+
+
+def resolve_arp(conn, ip):
+    output = conn.send_command("show ip arp")
+    for line in output.splitlines():
+        if ip not in line:
+            continue
+        for token in line.split():
+            digits = re.sub(r"[^0-9a-fA-F]", "", token)
+            if len(digits) == 12:
+                return normalize_mac(token)
+    return None
+
+
+def search_mac_table(conn, mac_norm):
+    variants = mac_variants(mac_norm)
+    output = conn.send_command("show mac address-table")
+    results = []
+    for line in output.splitlines():
+        if any(v in line.lower() for v in variants):
+            parts = line.split()
+            if len(parts) >= 3:
+                results.append({"host": conn.host, "raw": line.strip()})
+    return results
+
+
+def load_host_file(path):
+    return [
+        ln.strip()
+        for ln in Path(path).read_text().splitlines()
+        if ln.strip() and not ln.startswith("#")
+    ]
+
+
+def build_device(host, args):
+    return {
+        "device_type": args.device_type,
+        "host": host,
+        "username": args.username,
+        "password": args.password,
+        "conn_timeout": 15,
+    }
+
+
+def process_host(host, args):
+    try:
+        with ConnectHandler(**build_device(host, args)) as conn:
+            prompt = conn.find_prompt().strip("#> ")
+            log.info("Connected to %s (%s)", prompt, host)
+
+            mac = args.target_mac
+            if args.target_ip:
+                mac = resolve_arp(conn, args.target_ip)
+                if mac is None:
+                    log.warning("  %s not found in ARP table on %s", args.target_ip, prompt)
+                    return []
+                log.info("  %s resolved to %s", args.target_ip, mac)
+
+            norm = normalize_mac(mac)
+            hits = search_mac_table(conn, norm)
+            if not hits:
+                log.info("  %s not found on %s", norm, prompt)
+            return hits
+
+    except NetmikoAuthenticationException:
+        log.error("Authentication failed: %s", host)
+    except NetmikoTimeoutException:
+        log.error("Connection timed out: %s", host)
+    except ValueError as exc:
+        log.error("MAC parse error: %s", exc)
+    except Exception as exc:
+        log.error("Unexpected error on %s: %s", host, exc)
+    return []
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Find which switch port a MAC or IP address is connected to"
+    )
+    host_grp = parser.add_mutually_exclusive_group(required=True)
+    host_grp.add_argument("--host", help="Single switch IP or hostname")
+    host_grp.add_argument(
+        "--host-file",
+        metavar="FILE",
+        help="File listing switch IPs, one per line",
+    )
+
+    parser.add_argument("-u", "--username", required=True, help="SSH username")
+    parser.add_argument("-p", "--password", required=True, help="SSH password")
+    parser.add_argument(
+        "--device-type",
+        default="cisco_ios",
+        choices=["cisco_ios", "cisco_xe", "cisco_nxos"],
+        help="Netmiko device type (default: cisco_ios)",
+    )
+
+    tgt = parser.add_mutually_exclusive_group(required=True)
+    tgt.add_argument("--target-mac", metavar="MAC", help="MAC address to find")
+    tgt.add_argument(
+        "--target-ip",
+        metavar="IP",
+        help="IP address: resolve via ARP then locate",
+    )
+
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    hosts = [args.host] if args.host else load_host_file(args.host_file)
+    if not hosts:
+        log.error("No hosts to query")
+        sys.exit(1)
+
+    all_hits = []
+    for host in hosts:
+        all_hits.extend(process_host(host, args))
+
+    if all_hits:
+        print("\n--- Results ---")
+        for hit in all_hits:
+            print(f"[{hit['host']}] {hit['raw']}")
+        print(f"\n{len(all_hits)} match(es) found across {len(hosts)} switch(es)")
+    else:
+        print("Target not found on any queried switch.")
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**`mac_finder.py`** — a MAC/IP locator that searches the switching fabric. Key design choices:
+
+- Accepts a MAC in any common format (colon, dash, Cisco dot-quad) and normalizes it, then generates all three variants for table matching
+- `--target-ip` mode does an ARP lookup first, then traces the resolved MAC — the typical workflow when you only know an IP
+- `--host-file` lets you sweep an entire campus by listing switch IPs in a text file
+- Uses `ConnectHandler` as a context manager so sessions are always closed cleanly
+- Exit code 2 when the target isn't found, making it scriptable in pipelines
